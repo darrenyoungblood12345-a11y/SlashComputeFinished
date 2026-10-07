@@ -209,3 +209,19 @@ on the shell served from a scratch home â†’ repeat until a hunt finds nothing â†
   user's call (their live pool runs from that bundle).
 - Not done: the LLMs tab's Send button still sits ~27px below the fold at the default window (needs a
   structural change); a GPU share change still applies at the next Start (the hint says so; README aligned).
+
+# LLMs tab: Unload, Serve switch and Remove per model (2026-10-07, branch feat/llm-model-controls)
+
+Plan: /Users/darren/.claude/plans/great-this-project-is-cheerful-koala.md. Baseline: 184 passed
+(tests/inference, test_web_inference.py, test_web.py).
+
+- [ ] Coordinator: `disabled`/`removed` statuses, guarded resurrection paths, `_check_model`, `mgr.unload`,
+      `set_serving`, `remove_model`, routes `/models/{unload,serving,remove}`, DELETE = remove without Trash, status fields
+- [ ] Node: `remove_model` command (Trash user copies, delete app copies, all shards, rescan + report),
+      `--trash-removed` gate from the launcher (LAN modes only), start/stop leak fix, skip dotfiles
+- [ ] UI: per-model rows (state tag, Unload / Stop serving / Serve / Remove / Add back / Remove again),
+      stable render keys + in-place patch, confirm, pipeline card, chat select + why box, admin gating
+- [ ] Docs: troubleshooting LLMs tab
+- [ ] Tests: model controls suite, node runtime, auth matrix, DOM harness
+- [ ] Review workflow + fixes; race tests looped; full suite
+- [ ] Scratch pool in the browser; rebuild DMG; install; verify in /Applications/compute.app
