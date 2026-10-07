@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import logging
@@ -56,7 +57,7 @@ def scan_models(dirs: list[str]) -> list[dict]:
     for d in dirs:
         root = Path(d).expanduser()
         for f in sorted(root.glob("*.gguf")) if root.is_dir() else []:
-            if f.name in seen or not is_first_shard_or_single(f.name):
+            if f.name in seen or f.name.startswith(".") or not is_first_shard_or_single(f.name):
                 continue
             try:
                 parts = shard_paths(f)
@@ -66,6 +67,69 @@ def scan_models(dirs: list[str]) -> list[dict]:
                 continue
             seen.add(f.name)
             out.append({"name": f.name, "size": sum(p.stat().st_size for p in parts), "headers": headers})
+    return out
+
+
+def move_to_trash(path: Path) -> None:
+    """Move a file to the macOS Trash, as Finder does (Put Back works). Raises OSError when it can't;
+    a file in someone's own models folder is never deleted instead."""
+    try:
+        import objc
+        from Foundation import NSURL, NSFileManager
+    except ImportError as e:
+        raise OSError(errno.ENOTSUP, "the Trash is not available on this Mac") from e
+    with objc.autorelease_pool():
+        url = NSURL.fileURLWithPath_(str(path))
+        ok, _, err = NSFileManager.defaultManager().trashItemAtURL_resultingItemURL_error_(url, None, None)
+        if not ok:
+            raise OSError(errno.EIO, str(err.localizedDescription()) if err is not None else "not moved to the Trash")
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve() or (a.is_dir() and b.is_dir() and os.path.samefile(a, b))
+    except OSError:
+        return False
+
+
+def remove_model_files(name: str, models_dir: str, download_dir: str, trash: bool) -> dict:
+    """Remove every shard of a model from this Mac: the app's copies in ``download_dir`` (and a partial
+    download) are deleted; copies in the user's own ``models_dir`` go to the Trash when ``trash``, else stay.
+    When both are one folder it is the user's: Trash, never delete. Tries every file, then raises one
+    OSError naming the files that failed (names only: the coordinator shows it to the pool)."""
+    from slashcompute.inference.gguf import plain_gguf, shard_paths
+
+    if not plain_gguf(name):
+        raise ValueError(f"not a model file name: {name!r}")
+    user, app = Path(models_dir).expanduser(), Path(download_dir).expanduser()
+    out: dict[str, list[str]] = {"trashed": [], "deleted": [], "kept": []}
+    failed = []
+
+    def why(f: Path, e: OSError) -> str:
+        return f"{f.name}: {(e.strerror or type(e).__name__).replace(str(f.parent) + os.sep, '')}"
+
+    if not _same_dir(user, app):
+        for f in [*shard_paths(app / name), app / f".{name}.part"]:
+            try:
+                f.unlink()
+                out["deleted"].append(f.name)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                failed.append(why(f, e))
+    for f in shard_paths(user / name):
+        if not f.is_file():
+            continue
+        if not trash:
+            out["kept"].append(f.name)
+            continue
+        try:
+            move_to_trash(f)
+            out["trashed"].append(f.name)
+        except OSError as e:
+            failed.append(why(f, e))
+    if failed:
+        raise OSError("; ".join(failed))   # no errno: str() is then exactly this text
     return out
 
 
@@ -342,6 +406,9 @@ class Agent:
             except Exception:
                 self.in_use.pop(pid, None)
                 raise
+            if pid not in self.in_use:   # stopped while starting: the stop found nothing to stop yet
+                await self.engine.stop_worker(pid)
+                raise EngineError("stopped while loading", pipeline_broken=False)
             if self.transport == "relay":
                 self.local_rpc[pid] = res["endpoint"]
                 return {"endpoint": f"relay:{self.node_id}"}
@@ -352,11 +419,16 @@ class Agent:
             try:
                 if self.transport == "relay":
                     p = await self._relay_head_spec(p)
-                return await self.engine.start_head(pid, p)
+                res = await self.engine.start_head(pid, p)
             except Exception:
                 self.in_use.pop(pid, None)
                 await self._close_proxies(pid)
                 raise
+            if pid not in self.in_use:   # stopped while loading (Unload, Stop serving): don't leave it running
+                await self.engine.stop_head(pid)
+                await self._close_proxies(pid)
+                raise EngineError("stopped while loading", pipeline_broken=False)
+            return res
         if kind in ("stop_worker", "stop_head"):
             await (self.engine.stop_worker if kind == "stop_worker" else self.engine.stop_head)(pid)
             self.in_use.pop(pid, None)
@@ -387,6 +459,8 @@ class Agent:
             return {"results": await self.latency_fn(p["peers"])}
         if kind == "download_model":
             return await self.download_model(p)
+        if kind == "remove_model":
+            return await self.remove_model(p)
         raise ValueError(f"unknown command {kind}")
 
     async def _relay_head_spec(self, p: dict) -> dict:
@@ -426,6 +500,23 @@ class Agent:
             log.warning("stream for %s failed: %s", p["job_id"], e)
         finally:
             await body.aclose()  # cancel_job: stop the engine (llama-server) generating for nobody
+
+    async def remove_model(self, p: dict) -> dict:
+        """The model was removed from the pool: delete the app's copy, and move one in this Mac's models
+        folder to the Trash only when the pool asked for it and this Mac allows it (--trash-removed)."""
+        trash = bool(p.get("trash")) and self.cfg.trash_removed
+        try:
+            res = await asyncio.to_thread(remove_model_files, p.get("filename"), self.cfg.models_dir,
+                                          self.cfg.download_dir, trash)
+            log.info("removed %s: %s", p.get("filename"), res)
+            return res
+        finally:   # report what is on disk now, whatever happened: a stale list would keep the model listed
+            self.gguf_files = await asyncio.to_thread(scan_models, self.cfg.model_dirs)
+            try:
+                await self._post("/nodes/models", {"files": self.gguf_files})
+            except httpx.HTTPError as e:
+                log.warning("could not report models after removing %s: %s", p.get("filename"), e)
+            self.write_status()
 
     def _existing(self, filename: str, size: Optional[int], sha256: Optional[str]) -> Optional[Path]:
         for d in self.cfg.model_dirs:

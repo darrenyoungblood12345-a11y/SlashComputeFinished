@@ -523,10 +523,13 @@ class Launcher:
 
     def inference_argv(self, url: str, settings: LauncherSettings) -> list[str]:
         s = settings.clamp()
+        # LAN pools may move a removed model's copy in the models folder to the Trash; a public pool's
+        # coordinator is a stranger's, so there the node keeps its files
         return [
             self.python, "-m", "slashcompute.inference.node", "start",
             "--url", url, "--home", str(self.home), "--models-dir", s.models_dir,
             "--memory-gb", str(s.inference_memory_gb), "--head" if s.inference_head else "--no-head",
+            *(["--trash-removed"] if s.mode in ("host", "join") else []),
         ]
 
     @property

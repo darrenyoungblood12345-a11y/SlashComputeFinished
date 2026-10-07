@@ -42,6 +42,8 @@ class NodeConfig:
     assumed_prompt_score: float = 0.3
     session_token: str = ""                           # owner's /compute session: earnings go to them
     inference_token: str = ""                         # shared secret when the coordinator requires one
+    # a model removed from the pool: move a copy in models_dir to the Trash (LAN pools), or keep it (public pools)
+    trash_removed: bool = False
     commitment: Commitment = field(default_factory=Commitment)
 
     @property

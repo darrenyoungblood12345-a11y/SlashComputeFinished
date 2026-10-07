@@ -9,7 +9,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS models (
   id TEXT PRIMARY KEY,                 -- GGUF file name (first shard)
   sha256 TEXT, size_bytes INTEGER, arch TEXT, moe INTEGER,
-  status TEXT NOT NULL DEFAULT 'pending',   -- pending | ready | rejected
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending | ready | rejected | disabled (not served) | removed
   status_reason TEXT,
   layer_source TEXT,                   -- node:<id> | synthetic
   layout_json TEXT, flops_json TEXT,

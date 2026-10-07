@@ -58,8 +58,9 @@ for link in "$RES"/python/bin/*; do
 done
 
 SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-# the worker sandbox profile ships inside the package; a missing one would stop training agents
-"$PY" -c "import slashcompute.launcher.main, slashcompute.inference.node.agent, mlx.core, webview
+# the worker sandbox profile ships inside the package; a missing one would stop training agents.
+# objc/Foundation (PyObjC): the LLM node moves models removed from the pool to the Trash with it.
+"$PY" -c "import slashcompute.launcher.main, slashcompute.inference.node.agent, mlx.core, webview, objc, Foundation
 from slashcompute.agent.sandbox import profile_path
 assert profile_path().is_file(), profile_path()" \
   || { echo "bundled Python cannot import the app" >&2; exit 1; }

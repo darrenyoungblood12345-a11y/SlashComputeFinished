@@ -2,6 +2,8 @@
 
 A model becomes ``ready`` as soon as any node reports a GGUF whose header parses. There is no
 price table: speed estimates come from bytes read per token, credits from parameter counts.
+The LLMs tab can stop serving a model (``disabled``) or remove it (``removed``, a tombstone the row
+stays as, so replies still draining can be credited): node reports never change either back.
 """
 
 from __future__ import annotations
@@ -18,10 +20,11 @@ from slashcompute.inference.coordinator import nodes
 from slashcompute.inference.coordinator.db import tx
 from slashcompute.inference.coordinator.layers import ModelLayout, build_layout
 from slashcompute.inference.flops import ModelFlops
-from slashcompute.inference.gguf import GGUFHeader
+from slashcompute.inference.gguf import GGUFHeader, plain_gguf  # noqa: F401 - re-exported
 
 log = logging.getLogger(__name__)
 _SHARD = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
+SETTLED = ("ready", "disabled", "removed")   # statuses a node's report never changes
 
 
 def first_shard_name(filename: str) -> str:
@@ -52,11 +55,24 @@ def reject(conn: sqlite3.Connection, model_id: str, reason: str) -> None:
     with tx(conn):
         conn.execute("INSERT OR IGNORE INTO models (id, created_at) VALUES (?, ?)", (model_id, time.time()))
         conn.execute("UPDATE models SET status='rejected', status_reason=?, updated_at=? WHERE id=? "
-                     "AND status != 'ready'", (reason, time.time(), model_id))
+                     f"AND status NOT IN ({','.join('?' * len(SETTLED))})", (reason, time.time(), model_id, *SETTLED))
 
 
 def model_row(conn, model_id: str):
     return conn.execute("SELECT * FROM models WHERE id=?", (model_id,)).fetchone()
+
+
+def unavailable(row, model_id: str) -> Optional[str]:
+    """Why a chat for this model is refused (None: it is ready)."""
+    status = row["status"] if row is not None else None
+    if status == "ready":
+        return None
+    if status == "disabled":
+        return (f"{model_id} is not being served: it was stopped in the LLMs tab. "
+                "Press Serve there to use it again.")
+    if status == "removed":
+        return f"{model_id} was removed from this pool."
+    return f"model {model_id!r} is not available"
 
 
 def model_layout(row) -> ModelLayout:
@@ -104,7 +120,8 @@ def accept_node_header(conn, s: InferenceSettings, node_id: str, filename: str, 
     (and FLOP profile) if the model doesn't have one yet."""
     name = first_shard_name(filename)
     row = model_row(conn, name)
-    if row is not None and row["status"] == "ready":
+    settled = row is not None and row["status"] in SETTLED
+    if settled and (row["status"] == "ready" or row["layout_json"]):
         return False
     try:
         parsed = [GGUFHeader.from_json(h) for h in headers]
@@ -114,7 +131,10 @@ def accept_node_header(conn, s: InferenceSettings, node_id: str, filename: str, 
         flops = ModelFlops.from_headers(parsed)
     except Exception as e:  # noqa: BLE001 - a bad header rejects the model, never the node
         log.warning("model %s from %s rejected: %s", name, node_id, e)
-        reject(conn, name, f"unreadable GGUF header: {e}")
+        if not settled:
+            reject(conn, name, f"unreadable GGUF header: {e}")
         return False
-    store_layout(conn, name, layout, f"node:{node_id}", flops, size_bytes=size_bytes)
+    # a stopped or removed model without a layer table keeps its status (Serve / Add back can use the table)
+    keep = {"status": row["status"], "status_reason": row["status_reason"]} if settled else {}
+    store_layout(conn, name, layout, f"node:{node_id}", flops, size_bytes=size_bytes, **keep)
     return True

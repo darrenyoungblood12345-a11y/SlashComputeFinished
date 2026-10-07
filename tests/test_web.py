@@ -1167,3 +1167,229 @@ def test_connect_moves_what_this_mac_lends_and_labels_follow_the_mode(tmp_path):
     assert len(started) == 1
     assert {k: started[0][k] for k in ("mode", "url", "training", "inference")} == {
         "mode": "join", "url": "10.0.0.8", "training": True, "inference": True}
+
+
+def _dom_probes(tmp_path, phases):
+    """Runs app.js under the Node DOM harness; each phase's probe after the first (the load)."""
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+
+
+# A LAN pool whose coordinator has model controls: net(models) is its /inference/status, model(status, more)
+# one row of it. (Not pool(): app.js has its own.)
+LLM_POOL = """
+  state.keys = {}; state.user = null; state.settings = { mode: "host" }; state.busy.clear();
+  state.ov = { status: { coordinator_up: true } };
+  globalThis.model = (status, more = {}) => ({ id: "q.gguf", status, status_reason: null, size_gb: 0.5, arch: "qwen3",
+    uploaded: false, heads: ["Studio"], downloading: {}, servable: status === "ready", min_memory_gb: 2, load: null,
+    held_by: [], restorable: true, ...more });
+  globalThis.net = (models, more = {}) => ({ model_controls: true, nodes: [], pipelines: [], models, ...more });
+  globalThis.air = { name: "Air", online: false, removing: false, error: null, kept: false };
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_llm_rows_offer_the_buttons_each_model_state_allows(tmp_path):
+    """Unload only while loaded or loading, Stop serving / Serve by the switch, Remove again and Add
+    back on a removed model once nothing is in flight; no buttons for a non-admin on a public pool
+    or under a coordinator without model controls."""
+    rows = """(() => {
+      const row = (m) => {
+        const v = llmRow(m, true);
+        return { tag: v.tag, acts: v.acts.map((a) => a.label + (a.on ? `:${a.on}` : "")), notes: v.notes.map((n) => n[0]) };
+      };
+      return {
+        loaded: row(model("ready", { load: "loaded" })),
+        loading: row(model("ready", { load: "loading" })),
+        idle: row(model("ready")),
+        unloading: row(model("ready", { load: "unloading" })),
+        disabled: row(model("disabled", { servable: false })),
+        offline: row(model("removed", { restorable: false, held_by: [air] })),
+        restorable: row(model("removed", { load: "unloading" })),
+        removing: row(model("removed", { held_by: [{ ...air, online: true, removing: true }] })),
+        failed: row(model("removed", { restorable: false, held_by: [{ ...air, online: true, error: "q.gguf: Operation not permitted" }] })),
+        kept: row(model("removed", { restorable: false, held_by: [{ ...air, online: true, kept: true }] })),
+        rejected: row(model("rejected", { servable: false, status_reason: "unknown arch" })),
+        nobody: llmRow(model("ready", { load: "loaded" }), false).acts,
+      };
+    })()"""
+    catalog = 'state.keys = {}; renderModels(); [canManageModels(), $("#l-catalog").innerHTML, $("#l-count").textContent]'
+    lan = 'state.llm.net = net([model("ready", { load: "loaded" }), model("removed", { id: "old.gguf", held_by: [air] })]);'
+    public = 'state.settings = { mode: "public" }; state.user = { id: "u1", admin: %s }; state.llm.net = net([model("ready")]);'
+    older = 'state.llm.net = net([model("ready", { load: "loaded" })], { model_controls: undefined });'
+    phases = [{"routes": {}},
+              {"routes": {}, "run": LLM_POOL, "probe": rows},
+              {"routes": {}, "run": LLM_POOL + lan, "probe": catalog},
+              {"routes": {}, "run": LLM_POOL + public % "false", "probe": catalog},
+              {"routes": {}, "run": LLM_POOL + public % "true", "probe": catalog},
+              {"routes": {}, "run": LLM_POOL + older, "probe": catalog}]
+    r, lan_html, stranger, admin, old = _dom_probes(tmp_path, phases)
+
+    assert r["loaded"] == {"tag": "loaded", "acts": ["Unload", "Stop serving:0", "Remove"], "notes": []}
+    assert r["loading"]["tag"] == "loading" and r["loading"]["acts"] == ["Unload", "Stop serving:0", "Remove"]
+    assert r["idle"] == {"tag": "", "acts": ["Stop serving:0", "Remove"], "notes": []}
+    assert r["unloading"]["tag"] == "unloading" and r["unloading"]["acts"] == ["Stop serving:0", "Remove"]
+    assert any("reply in progress finishes first" in n for n in r["unloading"]["notes"])
+    assert r["disabled"]["tag"] == "not served" and r["disabled"]["acts"] == ["Serve:1", "Remove"]
+    assert r["disabled"]["notes"][0].startswith("Stopped for the whole pool")
+    assert r["offline"] == {"tag": "removed", "acts": ["Remove again"],
+                            "notes": ["Air is offline and keeps its copy. Press Remove again once it is back."]}
+    assert r["restorable"]["tag"] == "removed" and r["restorable"]["acts"] == ["Add back:1"]
+    assert r["removing"] == {"tag": "removing", "acts": [], "notes": ["Removing from Air…"]}
+    assert r["failed"]["acts"] == ["Remove again"] and r["failed"]["notes"] == ["Air: q.gguf: Operation not permitted"]
+    assert r["kept"]["notes"][0].startswith("Kept in Air's own models folder")
+    assert r["rejected"]["tag"] == "rejected" and r["rejected"]["acts"] == ["Remove"]
+    assert r["nobody"] == []
+
+    manage, html, count = lan_html
+    assert manage is True and count == "1"   # the removed row is listed but not counted
+    assert 'data-act="llm-unload" data-model="q.gguf"' in html and 'data-act="llm-remove"' in html
+    assert '<div class="acts">' in html and '<span class="tag ok">loaded</span>' in html
+    assert 'data-model="old.gguf"' in html and ">Remove again<" in html
+    manage, html, _ = stranger
+    assert manage is False and "data-act" not in html and '<div class="acts">' not in html
+    assert "admin can unload" in html
+    manage, html, _ = admin
+    assert manage is True and 'data-act="llm-serving"' in html
+    assert '<span class="tag' not in html   # an idle ready model has no tag
+    manage, html, _ = old
+    assert "data-act" not in html and "older /compute" in html
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_llm_catalog_keeps_its_buttons_across_download_progress_and_patches_rows_in_place(tmp_path):
+    """A download's progress changes every poll: it is patched into the row, never a rebuild that
+    replaces the buttons under the pointer. A tag change does rebuild."""
+    rebuild = """(() => {
+      state.llm.net = net([model("ready", { load: "loaded" })]);
+      renderModels();
+      const key = state.keys["llm-catalog"];
+      $("#l-catalog").innerHTML = "kept";
+      state.llm.net.models[0].downloading = { Air: 0.4 };
+      renderModels();
+      const kept = [state.keys["llm-catalog"] === key, $("#l-catalog").innerHTML];
+      state.llm.net.models[0].load = "unloading";
+      renderModels();
+      return { kept, rebuilt: $("#l-catalog").innerHTML !== "kept", meta: llmRow(state.llm.net.models[0], true).meta };
+    })()"""
+    patch = """(() => {
+      const meta = { textContent: "" };
+      const notes = { innerHTML: "", dataset: {} };
+      const buttons = [{ disabled: false }, { disabled: false }];
+      const card = { querySelector: (s) => ({ ".meta": meta, ".notes": notes })[s] || null,
+                     querySelectorAll: (s) => (s === ".acts .btn" ? buttons : []) };
+      const v = llmRow(model("removed", { held_by: [air] }), true);
+      patchModelCard(card, v, true);
+      const first = [meta.textContent, notes.innerHTML, buttons.map((b) => b.disabled)];
+      notes.innerHTML = "untouched";   // the same notes again are not written again
+      patchModelCard(card, v, false);
+      return { first, again: [notes.innerHTML, buttons.map((b) => b.disabled)] };
+    })()"""
+    phases = [{"routes": {}},
+              {"routes": {}, "run": LLM_POOL, "probe": rebuild},
+              {"routes": {}, "run": LLM_POOL, "probe": patch}]
+    rebuilt, patched = _dom_probes(tmp_path, phases)
+    assert rebuilt["kept"] == [True, "kept"]
+    assert rebuilt["rebuilt"] is True
+    assert rebuilt["meta"] == "0.5 GB · qwen3 · downloading on Air 40%"
+    meta, notes, disabled = patched["first"]
+    assert meta == "0.5 GB · qwen3 · removed from this pool"
+    assert notes == '<p class="note info">Air is offline and keeps its copy. Press Remove again once it is back.</p>'
+    assert disabled == [True, True]
+    assert patched["again"] == ["untouched", [False, False]]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_llm_remove_asks_first_and_names_what_happens_on_each_mac(tmp_path):
+    """The confirm says what Remove does on which Mac; Cancel sends nothing, OK sends one POST with
+    the model in the body (never in the path)."""
+    held = ('state.llm.net = net([model("ready", { uploaded: true, held_by: '
+            '[{ ...air, name: "Studio", online: true }, air] })]);')
+    questions = """[removeQuestion(llmModel("q.gguf"), false), removeQuestion(model("ready", { id: "z.gguf" }), false),
+                    removeQuestion(llmModel("q.gguf"), true)]"""
+    remove = ('calls.length = 0; globalThis.asked = []; '
+              'window.confirm = (q) => { asked.push(q); return %s; }; '
+              'actions["llm-remove"]({ dataset: { model: "q.gguf" }, textContent: "Remove" });')
+    sent = 'calls.filter((c) => c.path.includes("/inference/models")).map((c) => [c.method, c.path, c.body]).concat([asked.length])'
+    routes = {"/api/coord/inference/models/remove": {"ok": True, "model": "q.gguf", "macs": ["Studio"],
+                                                       "offline": ["Air"], "uploaded": True}}
+    phases = [{"routes": {}},
+              {"routes": {}, "run": LLM_POOL + held, "probe": questions},
+              {"routes": routes, "run": LLM_POOL + held + remove % "false", "probe": sent},
+              {"routes": routes, "run": LLM_POOL + held + remove % "true", "probe": sent}]
+    (lan, nobody, public), cancelled, confirmed = _dom_probes(tmp_path, phases)
+    assert lan.startswith("Remove q.gguf from this pool?")
+    assert "unloaded now" in lan and "a reply in progress finishes first" in lan
+    assert "copy uploaded to the pool is deleted" in lan
+    assert "On Studio: the app's copy is deleted, and a copy in the Mac's own models folder goes to its Trash." in lan
+    assert "offline" in lan and "Air" in lan.split("offline")[1]
+    assert "No Mac has a copy" in nobody and "Trash" not in nobody and "copy uploaded" not in nobody
+    assert "never moves files to the Trash" in public and "goes to its Trash" not in public
+    assert cancelled == [1]   # asked, nothing sent
+    assert confirmed == [["POST", "/api/coord/inference/models/remove", {"model": "q.gguf"}], 1]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_llm_why_offers_serve_for_a_stopped_model(tmp_path):
+    """A model whose Serve switch is off: the box under Send says so and its Serve posts on=true (a
+    real boolean); someone who may not manage models is told to ask the admin. The picker drops a
+    removed model and labels a stopped one."""
+    setup = LLM_POOL + """
+      state.llm.net = net([model("disabled", { servable: false }), model("removed", { id: "gone.gguf", held_by: [air] })]);
+      state.llm.models = []; state.llm.model = "q.gguf"; state.llm.error = "";
+      globalThis.st = { coordinator_up: true, inference_running: true, inference_status: { node_id: "n1", available: true } };"""
+    why = """(() => {
+      const admin = llmWhy(st, {}, state.llm, false);
+      state.settings = { mode: "public" }; state.user = { id: "u1", admin: false };
+      const stranger = llmWhy(st, {}, state.llm, false);
+      state.settings = { mode: "host" }; state.user = null;
+      renderLlm();
+      return { admin, stranger, choices: llmChoices(state.llm).map((m) => m.id), picker: $("#l-model").innerHTML,
+               pipe: $("#l-pipe").innerHTML };
+    })()"""
+    click = ('{ renderWhy(llmWhy(st, {}, state.llm, false)); calls.length = 0; '
+             'const b = $("#l-why-act"); actions[b.dataset.act](b); }')
+    sent = 'calls.filter((c) => c.path === "/api/coord/inference/models/serving").map((c) => c.body)'
+    routes = {"/api/coord/inference/models/serving": {"ok": True, "serving": True, "pipelines": 0}}
+    phases = [{"routes": {}},
+              {"routes": {}, "run": setup, "probe": why},
+              {"routes": routes, "run": setup + click, "probe": sent}]
+    shown, posted = _dom_probes(tmp_path, phases)
+    assert shown["admin"]["text"].startswith("q.gguf is not being served")
+    assert shown["admin"]["action"] == {"label": "Serve", "act": "llm-serving", "model": "q.gguf", "on": "1"}
+    assert "ask the pool's admin" in shown["stranger"]["text"].lower() and "action" not in shown["stranger"]
+    assert shown["choices"] == ["q.gguf"]
+    assert "q.gguf · 0.5 GB · stopped" in shown["picker"] and "gone.gguf" not in shown["picker"]
+    assert "stopped for the whole pool" in shown["pipe"] and "Press Serve" in shown["pipe"]
+    assert posted == [{"model": "q.gguf", "on": True}]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_llm_pipeline_card_shows_the_serving_pipeline_and_keeps_unload_across_speed_updates(tmp_path):
+    """The pipeline serving now is shown before one still draining; the live speed doesn't rebuild the
+    card; a draining pipeline's Unload is a disabled Unloading…, and an older coordinator keeps the
+    per-pipeline Unload."""
+    pipes = ('state.llm.model = "q.gguf"; state.llm.net = net([model("ready", { load: "loaded" })], { pipelines: ['
+             '{ id: "p-old", model: "q.gguf", state: "draining", members: [], explanation: "" },'
+             '{ id: "p-new", model: "q.gguf", state: "active", members: [], explanation: "", live_tok_s: 5 }] });')
+    card = """(() => {
+      renderLlm();
+      const first = [$("#l-pipe-tag").textContent, $("#l-pipe").innerHTML, state.keys["llm-pipe"]];
+      state.llm.net.pipelines[1].live_tok_s = 9;
+      renderLlm();
+      const steady = state.keys["llm-pipe"] === first[2];
+      const draining = pipeUnload(state.llm.net.pipelines[0]);
+      state.llm.net.model_controls = false;
+      return { first: first.slice(0, 2), steady, draining, older: pipeUnload(state.llm.net.pipelines[1]) };
+    })()"""
+    phases = [{"routes": {}}, {"routes": {}, "run": LLM_POOL + pipes, "probe": card}]
+    (shown,) = _dom_probes(tmp_path, phases)
+    tag, html = shown["first"]
+    assert tag == "active"
+    assert 'data-act="llm-unload" data-model="q.gguf">Unload<' in html and "data-pipeline" not in html
+    assert shown["steady"] is True
+    assert "disabled" in shown["draining"] and "Unloading…" in shown["draining"] and "data-act" not in shown["draining"]
+    assert 'data-pipeline="p-new"' in shown["older"]

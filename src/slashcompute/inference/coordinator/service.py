@@ -3,7 +3,7 @@
   /inference/nodes/*     inference nodes register, heartbeat, report benchmarks/models (bearer token)
   /inference/agent/*     command long-poll + token stream from the head (outbound from the node)
   /inference/relay/*     llama.cpp RPC relayed over WebSockets (TRANSPORT=relay)
-  /inference/models/*    GGUF upload, download by heads, delete
+  /inference/models/*    GGUF upload, download by heads; unload, Serve switch and remove (LLMs tab)
   /inference/status      snapshot for the GUI
   /v1/models, /v1/chat/completions   OpenAI-compatible API (credits via :class:`Accounting`)
 """
@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 TOKEN_HEADER = "x-inference-token"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+\.gguf$")
 DOWNLOAD_TIMEOUT_S = 6 * 3600
+REMOVE_TIMEOUT_S = 120
 DEFAULT_MAX_TOKENS = 256
 
 
@@ -90,6 +91,33 @@ def _bearer(request: Request) -> str:
     return auth[7:].strip()
 
 
+async def _json_body(request: Request) -> dict:
+    """An admin route's JSON body (read after check_admin, so a stranger gets 401, not a 400)."""
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "send a JSON body") from None
+    if not isinstance(body, dict):
+        raise HTTPException(400, "send a JSON object")
+    return body
+
+
+def _model_field(body: dict) -> str:
+    name = body.get("model")
+    if not isinstance(name, str) or not name:
+        raise HTTPException(400, "model must be a model file name")
+    return name
+
+
+def _removal_error(name: str, error: str) -> str:
+    """A Mac's failed removal as the LLMs tab shows it (the node's text names files, never folders)."""
+    if "unknown command" in error:   # nodes from before remove_model
+        return f"runs an older /compute: update it, or delete {name} from its models folder by hand"
+    if "timed out" in error:
+        return "did not answer in time"
+    return re.sub(r"^\w+Error: ", "", error)
+
+
 class InferenceService:
     """State and background loops of the inference coordinator."""
 
@@ -104,6 +132,9 @@ class InferenceService:
         self.online: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
         self.pushing: set[tuple[str, str]] = set()
+        # model -> node id -> {"removing", "error", "kept"} while a Mac removes its copy, or after it failed
+        # or kept it (an entry that finished cleanly is dropped). In memory only: Remove again redoes it.
+        self.removals: dict[str, dict[str, dict]] = {}
         self.latency_kick: Optional[asyncio.Event] = None
         if settings.MODELS_DIR:
             Path(settings.MODELS_DIR).expanduser().mkdir(parents=True, exist_ok=True)
@@ -294,10 +325,18 @@ class InferenceService:
         finally:
             self.pushing.discard((node_id, filename))
 
+    def removing(self, name: str) -> bool:
+        return any(e["removing"] for e in self.removals.get(name, {}).values())
+
+    def _refuse_while_removing(self, name: str) -> None:
+        if self.removing(name):
+            raise HTTPException(409, f"{name} is still being removed from the pool's Macs; try again in a moment")
+
     async def receive_upload(self, request: Request, name: str) -> dict:
         if not _SAFE_NAME.match(name or ""):
             raise HTTPException(400, "file name must look like model-name.gguf (letters, digits, . _ -)")
         root = self.models_dir()
+        self._refuse_while_removing(name)   # a Mac still deleting it would delete the new copy too
         dest = root / name
         tmp = root / f".{name}.{uuid.uuid4().hex[:6]}.part"
         h = hashlib.sha256()
@@ -318,14 +357,20 @@ class InferenceService:
                 mflops = fl.ModelFlops.from_headers([header])
             except Exception as e:  # noqa: BLE001
                 raise HTTPException(422, f"not a usable GGUF model: {e}") from e
+            self._refuse_while_removing(name)
             os.replace(tmp, dest)
         finally:
             tmp.unlink(missing_ok=True)
         digest = h.hexdigest()
+        row = registry.model_row(self.conn, name)
+        # a stopped model stays stopped; uploading a removed one again is how it comes back
+        keep = {"status": "disabled", "status_reason": row["status_reason"]} \
+            if row is not None and row["status"] == "disabled" else {}
         with tx(self.conn):
             self.conn.execute("INSERT OR REPLACE INTO model_files (name, size, sha256, uploaded_at) VALUES (?,?,?,?)",
                               (name, size, digest, time.time()))
-        registry.store_layout(self.conn, name, layout, "upload", mflops, size_bytes=size, sha256=digest)
+            registry.store_layout(self.conn, name, layout, "upload", mflops, size_bytes=size, sha256=digest, **keep)
+        self.removals.pop(name, None)
         pushed = self.push_models()
         log.info("uploaded %s (%.2f GB); pushing to %d head(s)", name, size / 1e9, pushed)
         return {"name": name, "size": size, "sha256": digest, "layers": layout.n_layers, "pushed": pushed}
@@ -334,9 +379,101 @@ class InferenceService:
 
     def model_or_404(self, model_id: str):
         row = registry.model_row(self.conn, model_id)
-        if row is None or row["status"] != "ready":
-            raise HTTPException(404, f"model {model_id!r} is not available")
+        why = registry.unavailable(row, model_id)
+        if why:
+            raise HTTPException(404, why)
         return row
+
+    # ------------------------------------------------------------ unload, Serve switch, remove (LLMs tab)
+
+    def known_or_404(self, name: str):
+        row = registry.model_row(self.conn, name)
+        if row is None:
+            raise HTTPException(404, f"no model {name!r} in this pool")
+        return row
+
+    async def unload(self, name: str) -> dict:
+        """Stop the model's pipelines everywhere (the reply in progress finishes). The next chat loads it again."""
+        self.known_or_404(name)
+        return {"ok": True, "pipelines": await self.mgr.unload(name, "unloaded from the app")}
+
+    async def set_serving(self, name: str, on: bool) -> dict:
+        """The pool-wide Serve switch. Off unloads the model and keeps it from loading until switched on;
+        the files stay on disk and the setting survives restarts and node reports."""
+        row = self.known_or_404(name)
+        status = row["status"]
+        if on:
+            if status == "ready":
+                return {"ok": True, "serving": True, "pipelines": 0}
+            if status not in ("disabled", "removed") or not row["layout_json"]:
+                raise HTTPException(409, f"{name} has no usable layer table: upload it again")
+            if status == "removed":
+                self._refuse_while_removing(name)
+            with tx(self.conn):
+                self.conn.execute("UPDATE models SET status='ready', status_reason=NULL, updated_at=? WHERE id=?",
+                                  (time.time(), name))
+            self.removals.pop(name, None)
+            log.info("model %s: serving again", name)
+            return {"ok": True, "serving": True, "pipelines": 0}
+        if status not in ("ready", "disabled"):
+            raise HTTPException(409, f"{name} is {status}: there is nothing to stop serving")
+        # the status first (synchronously): a chat arriving while the pipelines drain is already refused
+        with tx(self.conn):
+            self.conn.execute("UPDATE models SET status='disabled', status_reason=?, updated_at=? WHERE id=?",
+                              ("stopped in the LLMs tab", time.time(), name))
+        n = await self.mgr.unload(name, "stopped serving from the app")
+        log.info("model %s: stopped serving (%d pipeline(s) stopped)", name, n)
+        return {"ok": True, "serving": False, "pipelines": n}
+
+    async def remove_model(self, name: str, trash: bool) -> dict:
+        """Drop a model from the pool: unload it, delete the uploaded copy and ask every online Mac that
+        has it to delete the app's copy (and, with ``trash``, move one in its own models folder to the Trash).
+        The row stays as a tombstone so node reports don't bring the model back."""
+        if not registry.plain_gguf(name):
+            raise HTTPException(400, "model must be a .gguf file name")
+        row = registry.model_row(self.conn, name)
+        uploaded = self.conn.execute("SELECT 1 FROM model_files WHERE name=?", (name,)).fetchone() is not None
+        holders = [r for r in self.conn.execute("SELECT * FROM nodes ORDER BY created_at").fetchall()
+                   if name in json.loads(r["gguf_files_json"] or "[]")]
+        if not ((row is not None and row["status"] != "removed") or uploaded or holders):
+            raise HTTPException(404, f"no model {name!r} to remove")
+        now = time.time()
+        with tx(self.conn):
+            self.conn.execute("INSERT OR IGNORE INTO models (id, created_at) VALUES (?, ?)", (name, now))
+            self.conn.execute("UPDATE models SET status='removed', status_reason=?, updated_at=? WHERE id=?",
+                              ("removed in the LLMs tab", now, name))
+            self.conn.execute("DELETE FROM model_files WHERE name=?", (name,))  # stops pushes and downloads
+        if uploaded and self.s.MODELS_DIR:
+            try:
+                (Path(self.s.MODELS_DIR).expanduser() / name).unlink(missing_ok=True)
+            except OSError as e:
+                log.warning("could not delete the uploaded %s: %s", name, e.strerror or e)
+        await self.mgr.unload(name, "removed from the app")
+        macs, offline = [], []
+        for r in holders:
+            if not nodes.is_online(r, self.s):
+                offline.append(r["name"])
+                continue
+            macs.append(r["name"])
+            entry = {"removing": True, "error": None, "kept": False}
+            self.removals.setdefault(name, {})[r["id"]] = entry
+            self.spawn(self._remove_on(r["id"], name, trash, entry))
+        log.info("model %s removed (uploaded copy: %s); asking %s", name, uploaded, macs or "no Mac")
+        return {"ok": True, "model": name, "macs": macs, "offline": offline, "uploaded": uploaded}
+
+    async def _remove_on(self, node_id: str, name: str, trash: bool, entry: dict) -> None:
+        try:
+            res = await self.bus.send(node_id, "remove_model", {"filename": name, "trash": trash}, REMOVE_TIMEOUT_S)
+        except CommandFailed as e:
+            log.warning("removing %s on %s failed: %s", name, node_id, e)
+            entry.update(removing=False, error=_removal_error(name, str(e)))
+            return
+        entry.update(removing=False, kept=bool(res.get("kept")))
+        per_node = self.removals.get(name, {})
+        if not entry["kept"] and per_node.get(node_id) is entry:   # done: nothing left to show for this Mac
+            del per_node[node_id]
+            if not per_node:
+                self.removals.pop(name, None)
 
     def members_view(self, members) -> list[dict]:
         names = nodes.node_names(self.conn)
@@ -378,7 +515,7 @@ def make_router(svc: InferenceService) -> APIRouter:
 
     @r.get("/status")
     async def status_view():
-        return status.snapshot(conn, s)
+        return status.snapshot(conn, s, svc.removals)
 
     # ------------------------------------------------------------ nodes
 
@@ -544,16 +681,31 @@ def make_router(svc: InferenceService) -> APIRouter:
             raise HTTPException(404, "no such uploaded model")
         return FileResponse(root / name, media_type="application/octet-stream")
 
+    # The model travels in the JSON body: the shell's proxy rebuilds decoded paths, and names may have spaces.
+    @r.post("/models/unload")
+    async def unload_model(request: Request):
+        svc.check_admin(request)
+        return await svc.unload(_model_field(await _json_body(request)))
+
+    @r.post("/models/serving")
+    async def model_serving(request: Request):
+        svc.check_admin(request)
+        body = await _json_body(request)
+        name = _model_field(body)
+        if body.get("on") is None:   # body_bool would read a missing value as False: Stop serving by accident
+            raise HTTPException(400, "on must be true or false.")
+        return await svc.set_serving(name, body_bool(body, "on"))
+
+    @r.post("/models/remove")
+    async def remove_model(request: Request):
+        svc.check_admin(request)
+        return await svc.remove_model(_model_field(await _json_body(request)), trash=True)
+
     @r.delete("/models/{name}")
     async def delete_model(name: str, request: Request):
+        """The older UI's Remove (no confirm): the same removal, but never moves anyone's files to the Trash."""
         svc.check_admin(request)
-        row = conn.execute("SELECT name FROM model_files WHERE name=?", (name,)).fetchone()
-        if row is None:
-            raise HTTPException(404, "no such uploaded model")
-        with tx(conn):
-            conn.execute("DELETE FROM model_files WHERE name=?", (name,))
-        (svc.models_dir() / name).unlink(missing_ok=True)
-        return {"ok": True}
+        return await svc.remove_model(name, trash=False)
 
     @r.get("/plan")
     async def plan_view(model: str, max_tokens: int = DEFAULT_MAX_TOKENS):
