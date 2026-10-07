@@ -525,13 +525,14 @@ def test_agent_restart_that_cannot_stop_yet_completes_on_a_later_poll(tmp_path, 
 
     assert stopped == [77]
     assert snap.agent_running and snap.agent_pid == 77 and snap.agent_draining
+    assert snap.agent_restart_pending          # the window says Restarting…, not Stopping…
     assert "Restarting the training agent" in snap.last_error
     assert launcher._spawned == []
     assert json.loads((tmp_path / "agent.args").read_text()) == old_args
 
     # Still draining on the next poll: nothing changes, and it is not asked to stop again.
     snap = launcher.snapshot()
-    assert snap.agent_draining and launcher._spawned == [] and stopped == [77]
+    assert snap.agent_draining and snap.agent_restart_pending and launcher._spawned == [] and stopped == [77]
 
     # It finished and exited: the next poll starts the new one with the saved settings.
     running[77] = False
@@ -540,7 +541,7 @@ def test_agent_restart_that_cannot_stop_yet_completes_on_a_later_poll(tmp_path, 
     assert launcher._spawned[0].argv == launcher.agent_argv(settings.url, 50)
     assert launcher._spawned[0].session == "tok"
     assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(launcher._spawned[0].argv, "tok")
-    assert snap.last_error == "" and not snap.agent_draining
+    assert snap.last_error == "" and not snap.agent_draining and not snap.agent_restart_pending
     assert launcher.snapshot().last_error == "" and len(launcher._spawned) == 1   # done once
 
 
@@ -944,6 +945,81 @@ def test_load_settings_never_waits_for_the_lock(tmp_path):
     assert launcher.load_settings().gpu_percent == 80
 
 
+def test_update_settings_is_one_locked_read_modify_write(tmp_path):
+    # Every settings write loaded, changed and saved on its own request thread. Two of them
+    # changing different fields at once (a slider save landing during a Start's merge, or two
+    # saves) each wrote back the other's field as it had loaded it: one change was lost.
+    launcher = _launcher(tmp_path)
+    launcher.save_settings(launcher.with_session(LauncherSettings(mode="join", url="http://10.0.0.1:8765"), "tok"))
+    real = launcher.load_settings
+
+    def slow_load():
+        s = real()
+        time.sleep(0.02)              # widen the window between a thread's read and its write
+        return s
+
+    launcher.load_settings = slow_load
+    threads = [
+        threading.Thread(target=lambda: [launcher.update_settings({"gpu_percent": 30 + i}) for i in range(5)]),
+        threading.Thread(target=lambda: [launcher.update_settings({"memory_gb": 1 + i}) for i in range(5)]),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert not any(t.is_alive() for t in threads)
+    s = real()
+    assert (s.gpu_percent, s.memory_gb) == (34, 5)                              # both threads' last change
+    assert (s.mode, s.url, s.session_token) == ("join", "http://10.0.0.1:8765", "tok")   # the rest untouched
+
+
+def test_update_settings_applies_an_edit_to_the_changed_settings(tmp_path):
+    launcher = _launcher(tmp_path)
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.1:8765"))
+    # The field changes go in first, then the edit sees them: a sign-in in the same body as
+    # Connect's url is bound to the pool the settings now point at. Clamped, as saved.
+    s = launcher.update_settings({"url": "http://10.0.0.2:8765", "gpu_percent": 999},
+                                 edit=lambda s: launcher.with_session(s, "tok"))
+    assert (s.url, s.gpu_percent) == ("http://10.0.0.2:8765", 100)
+    assert (s.session_token, s.session_url) == ("tok", "http://10.0.0.2:8765")
+    assert launcher.load_settings() == s
+    # An edit that depends on what is stored (drop this one token, not a newer one) sees the stored value.
+    forget = lambda token: (lambda s: replace(s, session_token="", session_url="") if s.session_token == token else s)  # noqa: E731
+    assert launcher.update_settings(edit=forget("older")).session_token == "tok"
+    assert launcher.update_settings(edit=forget("tok")).session_token == ""
+    assert launcher.load_settings().session_token == ""
+
+
+def test_a_bounded_snapshot_returns_the_last_one_while_the_lock_is_held(tmp_path):
+    # /api/overview waited for the lock behind a Start (up to ~25 s): the window's pills froze and
+    # its polls piled up. Bounded, a poll answers with what the last snapshot said.
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": 3, "jobs": 1}))
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.1:8765"))
+    last = launcher.snapshot()
+    assert last.coordinator_up and last.nodes == 3
+    launcher.last_error = "No coordinator at http://10.0.0.1:8765."   # stale: a full poll would clear it
+    got: list = []
+    with launcher._lock:                       # a Start in progress on another thread
+        poll = threading.Thread(target=lambda: got.append(launcher.snapshot(wait=0.1)))
+        began = time.monotonic()
+        poll.start()
+        poll.join(2)
+        assert not poll.is_alive() and time.monotonic() - began < 1.0
+    assert got[0] is last                      # as it was: nothing re-polled, last_error untouched
+    assert launcher.last_error == "No coordinator at http://10.0.0.1:8765."
+    # The lock free again: a full poll, which is also the next fallback.
+    snap = launcher.snapshot(wait=0.1)
+    assert snap.last_error == "" and snap is not last and launcher._last_snapshot is snap
+    # Without a bound the call waits, as start() must for the snapshot it ends in.
+    with launcher._lock:
+        poll = threading.Thread(target=lambda: got.append(launcher.snapshot()))
+        poll.start()
+        poll.join(0.3)
+        assert poll.is_alive()
+    poll.join(2)
+    assert not poll.is_alive() and len(got) == 2 and got[1] is not snap
+
+
 def test_concurrent_starts_spawn_one_coordinator(tmp_path, monkeypatch):
     # Two Start clicks reach the shared launcher on two threads: both used to pass the
     # "no coordinator.pid yet" check while the first coordinator was still being spawned.
@@ -1075,33 +1151,55 @@ def test_status_reports_a_draining_agent_and_its_share(tmp_path, monkeypatch):
     launcher.paths.write_status(draining=True)
     assert launcher.snapshot().agent_draining
 
-    # Asked to stop but still finishing its step (status.json not updated yet): draining too.
+    # Asked to stop but still finishing its step (status.json not updated yet): draining too, and
+    # with no restart behind it (the window says Stopping…, not Restarting…).
     launcher.paths.write_status(draining=False, gpu_percent="lots")
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: None)
     snap = launcher.stop_agent()
     assert snap.agent_running and snap.agent_draining and snap.agent_gpu_percent is None
+    assert not snap.agent_restart_pending
 
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: False)
     snap = launcher.snapshot()
     assert not snap.agent_running and not snap.agent_draining and snap.agent_gpu_percent is None
 
 
-def test_a_hung_agent_is_force_stopped_after_the_grace_period(tmp_path, monkeypatch):
-    # daemon.shutdown drains the step for grace_period_s and exits; one that is still alive well
-    # past that is hung, and the shell said "Stopping…" (or "Restarting…") for ever.
+def _hung_agent(tmp_path, monkeypatch) -> tuple[Launcher, dict, float, dict]:
+    """Our agent (pid 77), asked to stop for new settings and ignoring it. Returns the launcher,
+    the fake clock, how long it may drain before it counts as hung, and what is `running`."""
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.paths.pid_file.write_text("77\n")
     (tmp_path / "agent.args").write_text(json.dumps(launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), "")))
     running = {77: True}
-    kills: list[tuple[int, int]] = []
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: running.get(pid, False))
-    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append((pid, sig)))
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: None)   # SIGTERM ignored
     clock = _fake_clock(monkeypatch)
-    limit = launcher.cfg.grace_period_s + AGENT_STOP_MARGIN_S
-
     snap = launcher.start(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=80))
-    assert snap.agent_draining and launcher._pending_agent is not None and kills == []
+    assert snap.agent_draining and snap.agent_restart_pending and launcher._pending_agent is not None
+    return launcher, clock, launcher.cfg.grace_period_s + AGENT_STOP_MARGIN_S, running
+
+
+def _record_kills(monkeypatch, killpg_raises: type[OSError] | None = None) -> list:
+    """Every SIGKILL the launcher sends, as ("pg", pid, sig) for a process group and ("pid", pid, sig)
+    for one process. `killpg_raises` makes killpg refuse, as it does for a pid leading no group."""
+    kills: list = []
+
+    def killpg(pid, sig):
+        kills.append(("pg", pid, sig))
+        if killpg_raises is not None:
+            raise killpg_raises()
+
+    monkeypatch.setattr("slashcompute.launcher.controller.os.killpg", killpg)
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append(("pid", pid, sig)))
+    return kills
+
+
+def test_a_hung_agent_is_force_stopped_after_the_grace_period(tmp_path, monkeypatch):
+    # daemon.shutdown drains the step for grace_period_s and exits; one that is still alive well
+    # past that is hung, and the shell said "Stopping…" (or "Restarting…") for ever.
+    kills = _record_kills(monkeypatch)
+    launcher, clock, limit, running = _hung_agent(tmp_path, monkeypatch)
+    assert kills == []
 
     clock["t"] += limit - 5                      # still within what a drain may take
     snap = launcher.snapshot()
@@ -1109,14 +1207,27 @@ def test_a_hung_agent_is_force_stopped_after_the_grace_period(tmp_path, monkeypa
 
     clock["t"] += 10
     snap = launcher.snapshot()
-    assert kills == [(77, signal.SIGKILL)]
+    # The whole process group (the agent leads its own session): a download it hung on goes with it.
+    assert kills == [("pg", 77, signal.SIGKILL)]
     assert "force-stopped" in snap.last_error and f"{limit:.0f} s" in snap.last_error
-    assert not snap.agent_draining and launcher._pending_agent is None
+    assert not snap.agent_draining and not snap.agent_restart_pending and launcher._pending_agent is None
 
     running[77] = False                          # killed: the restart it waited on is not attempted
     snap = launcher.snapshot()
     assert not snap.agent_running and launcher._spawned == [] and "force-stopped" in snap.last_error
-    assert kills == [(77, signal.SIGKILL)]       # once
+    assert kills == [("pg", 77, signal.SIGKILL)]       # once
+
+
+@pytest.mark.parametrize("refused", [ProcessLookupError, PermissionError])
+def test_force_stop_falls_back_to_the_pid_when_it_leads_no_group_of_ours(tmp_path, monkeypatch, refused):
+    # An agent started by hand leads no session of its own: killpg names no group by its pid (or
+    # one that is not ours to signal), and the agent is killed by its pid instead.
+    kills = _record_kills(monkeypatch, killpg_raises=refused)
+    launcher, clock, limit, _ = _hung_agent(tmp_path, monkeypatch)
+    clock["t"] += limit + 1
+    snap = launcher.snapshot()
+    assert kills == [("pg", 77, signal.SIGKILL), ("pid", 77, signal.SIGKILL)]
+    assert "force-stopped" in snap.last_error and launcher._pending_agent is None
 
 
 # ------------------------------------------------------------ our own pool is not one to join

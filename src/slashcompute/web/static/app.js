@@ -12,7 +12,7 @@ const POLL_MS = 2000;
 const API_TIMEOUT_MS = 20000;       // polls: a hung one must not hold up the next
 const ACTION_TIMEOUT_MS = 120000;   // starts, stops, saves: the controller may wait on a process
 // Reads made every poll or on a timer; everything else is an action (or the dataset upload).
-const POLL_PATHS = ["/api/overview", "/api/grants", "/api/coord/auth/me", "/api/status", "/inference/status", "/v1/models"];
+const POLL_PATHS = ["/api/overview", "/api/grants", "/api/coord/auth/me", "/api/coord/auth/terms", "/api/status", "/inference/status", "/v1/models"];
 const MAX_UPLOAD_GIB = 64;          // the shell refuses a bigger GGUF: no Mac pool loads one
 const RATE_WINDOW = 5;          // polls averaged into the "now" rate
 const OUTDATED_COORDINATOR = "This pool's coordinator has no LLM inference: it runs an older /compute. "
@@ -122,10 +122,12 @@ const post = (path, body) => api(path, { method: "POST", body: body === undefine
 const patch = (path, body) => api(path, { method: "PATCH", body: JSON.stringify(body) });
 const signedIn = () => !!(state.user && state.user.id);
 // The controller's "Restarting the training agent / the LLM node after the current step finishes":
-// news that new settings are on their way, not a failure.
+// news that new settings are on their way, not a failure. Only the tone of a toast or the banner
+// hangs on it; what the agent is doing comes from the status flags.
 const isRestartNote = (msg) => typeof msg === "string" && msg.startsWith("Restarting ");
-// The agent drains to start again with new settings: on screen a restart, not a stop.
-const agentRestarting = (st) => !!(st.agent_running && st.agent_draining && isRestartNote(st.last_error));
+// The agent drains with a restart queued behind it, to start again with new settings: on screen a
+// restart, not a stop.
+const agentRestarting = (st) => !!(st.agent_running && st.agent_draining && st.agent_restart_pending);
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
@@ -1559,24 +1561,27 @@ const actions = {
   }),
 
   logout: (btn) => withBusy("auth", btn, "Signing out…", async () => {
+    let remote = true;
     try {
       await post("/api/coord/auth/logout", {});
-    } finally {
-      // The stored session goes even when the pool did not answer: nothing here may keep earning for it.
-      await saveSettings({ session_token: "" });
-      state.user = null;
-      state.credits = null;
-      $("#auth-password").value = "";
-      // Back to the sign-in form, even if this session started with a registration.
-      state.authMode = "login";
-      const mode = document.querySelector("[data-act='auth-mode']");
-      if (mode) mode.textContent = "Create account";
-      // The grant board is per user (admin review queue, pledges): rebuild it
-      // so nothing from the old session stays on screen.
-      $("#g-request").hidden = true;
+    } catch {
+      remote = false;   // the pool did not answer: this Mac still forgets the session
     }
+    // The stored session goes even when the pool did not answer: nothing here may keep earning for it.
+    await saveSettings({ session_token: "" });
+    state.user = null;
+    state.credits = null;
+    $("#auth-password").value = "";
+    // Back to the sign-in form, even if this session started with a registration.
+    state.authMode = "login";
+    const mode = document.querySelector("[data-act='auth-mode']");
+    if (mode) mode.textContent = "Create account";
+    // The grant board is per user (admin review queue, pledges): rebuild it
+    // so nothing from the old session stays on screen.
+    $("#g-request").hidden = true;
     await loadGrants();
-    toast("Signed out.");
+    if (remote) toast("Signed out.");
+    else toast("Signed out on this Mac (the pool did not answer)", "bad");
   }),
 
   "toggle-request": () => {
@@ -1595,7 +1600,12 @@ document.addEventListener("click", async (e) => {
   if (d.tab) return showTab(d.tab);
   if (d.act && actions[d.act]) return actions[d.act](el);
   if (d.mode) {
-    await saveSettings({ mode: d.mode });
+    // One stored address serves Join and Public: a switch between them drops it, so the LAN address
+    // never turns up in the Public field (nor the public URL in the LAN one). Host keeps it.
+    const prev = (state.settings || {}).mode;
+    const remote = (m) => m === "join" || m === "public";
+    const swap = prev !== d.mode && remote(prev) && remote(d.mode);
+    await saveSettings(swap ? { mode: d.mode, url: "" } : { mode: d.mode });
     return poll();
   }
   if (d.llmHead) {
@@ -1799,8 +1809,8 @@ $("#auth-form").addEventListener("submit", (e) => {
     const path = state.authMode === "register" ? "/api/coord/auth/register" : "/api/coord/auth/login";
     const body = { email, password };
     if (state.authMode === "register") body.name = name;
+    // The shell stores the sign-in token as it relays the reply: nothing to save here.
     const r = await post(path, body);
-    if (r.token) await saveSettings({ session_token: r.token });
     state.user = r.user || null;
     await loadAuth();
     if (state.user && !state.user.accepted_terms) {
@@ -1837,15 +1847,18 @@ $("#l-log").addEventListener("click", (e) => {
   if (block) state.llm.messages[block.dataset.think].thinkOpen = !block.open;
 });
 
-// A file dropped anywhere but a picker must not replace the dashboard with it (pywebview hands the
-// drop to WKWebView, which would navigate to the file).
-// Text dragged into a field is left to the browser.
-const guardFileDrop = (e) => {
+// A drop must never replace the dashboard: pywebview hands it to WKWebView, which would navigate to
+// a dropped file or link. Files are refused everywhere; anything else is left to the browser only
+// when it lands in a field, where the default is to insert the text.
+const guardDrop = (e) => {
   const types = e.dataTransfer && e.dataTransfer.types;
-  if (types && Array.from(types).includes("Files")) e.preventDefault();
+  const files = !!types && Array.from(types).includes("Files");
+  const t = e.target;
+  const inField = !!(t && typeof t.closest === "function" && t.closest("input, textarea, [contenteditable]"));
+  if (files || !inField) e.preventDefault();
 };
-window.addEventListener("dragover", guardFileDrop);
-window.addEventListener("drop", guardFileDrop);
+window.addEventListener("dragover", guardDrop);
+window.addEventListener("drop", guardDrop);
 
 renderGate();   // nothing that saves is usable before the first overview answers
 poll();   // each poll schedules the next once it has finished (see poll())

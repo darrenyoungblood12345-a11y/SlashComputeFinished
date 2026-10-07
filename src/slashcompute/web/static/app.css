@@ -727,7 +727,8 @@ input[type="range"]::-webkit-slider-thumb {
 
 @media (max-width: 760px) {
   .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; min-height: 100dvh; }
-  .side { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; position: sticky; top: 0; }
+  /* Sticky, but never the whole window: an open sign-in form scrolls inside it instead. */
+  .side { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; position: sticky; top: 0; max-height: 40vh; overflow-y: auto; }
   .brand { padding: 0; }
   .tagline, .side-status { display: none; }
   .nav { flex-direction: row; flex-wrap: wrap; }

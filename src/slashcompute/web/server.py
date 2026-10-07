@@ -29,7 +29,7 @@ from slashcompute.common.config import DEMO_MODEL_CANDIDATES, DEV_MODEL
 from slashcompute.common.jsonbool import body_bool
 from slashcompute.launcher.controller import (
     FINISHES, INFERENCE_SETTINGS, OUTDATED_COORDINATOR, Launcher, LauncherError, LauncherSettings,
-    supports_inference,
+    SettingsEdit, supports_inference,
 )
 from slashcompute.launcher.dashboard import POOL_LISTS, PoolData, fresh_pool, overview
 from slashcompute.web import sample_grants
@@ -38,7 +38,7 @@ STATIC = Path(__file__).resolve().parent / "static"
 SHELL_HOST = os.environ.get("SLASHCOMPUTE_SHELL_HOST", "127.0.0.1")
 SHELL_PORT = int(os.environ.get("SLASHCOMPUTE_SHELL_PORT", "8766"))
 # Bump when the shell changes: a running older shell is then replaced instead of reused.
-SHELL_GENERATION = 9
+SHELL_GENERATION = 10
 MODELS = [DEV_MODEL, *DEMO_MODEL_CANDIDATES]
 SESSION_COOKIE = "slashcompute_session"
 # Coordinator routes whose 200 carries a freshly issued session token, and the one that says whose it is.
@@ -57,6 +57,9 @@ PROXY_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 # While waiting on the coordinator's first byte, how often to check that the window still wants it.
 DISCONNECT_POLL_S = 0.5
 POOL_LIST_TIMEOUT = 1.5
+# How long a poll waits for the launcher's lock (a Start holds it for up to ~25 s) before it
+# answers with the last snapshot instead: the window keeps its pills, not a 20 s stall.
+OVERVIEW_WAIT_S = 2.0
 MAX_UPLOAD_BYTES = 64 << 30     # no Mac pool loads a bigger GGUF; refuse before relaying it
 DRAIN_LIMIT = 4 << 20           # how much of a refused upload to take so the browser gets the answer
 
@@ -126,13 +129,12 @@ def public_settings(s: LauncherSettings, session: str) -> dict:
     return out
 
 
-def settings_from_body(body: dict, stored: LauncherSettings) -> LauncherSettings:
-    """The stored settings with the body's fields changed: a partial body (the slider alone, Connect's
-    mode and url) leaves everything else as it was. The session is always the stored one (the UI
-    never sees it to send it back): a body's session_token is a sign-in or sign-out, which the
-    caller binds to the pool that issued it."""
-    changes = {name: body[name] for name in _SETTING_FIELDS if name in body}
-    return replace(stored, **changes).clamp()
+def setting_changes(body: dict) -> dict:
+    """The settings fields a body changes, for Launcher.update_settings: a partial body (the slider
+    alone, Connect's mode and url) leaves everything else as it was. Never the session fields: the
+    UI never sees the token to send it back, and a body's session_token is a sign-in or sign-out,
+    which the shell binds to the pool that issued it (see session_edit)."""
+    return {name: body[name] for name in _SETTING_FIELDS if name in body}
 
 
 def _lends_session(request: Request, session: str) -> bool:
@@ -353,20 +355,21 @@ def create_shell(launcher: Optional[Launcher] = None,
         return base.rstrip("/")
 
     def remember_session(url: str, token: str) -> None:
-        """Keep a session the pool at `url` just issued, before the window gets the reply: the next
-        poll is then already signed in (it used to flicker to Sign in until the window had saved the
-        token itself) and sign-out revokes this token. A Connect that moved on meanwhile is left alone."""
-        s = launch.load_settings()
-        if launch.proxy_url(s) == url:
-            launch.save_settings(launch.with_session(s, token))
+        """Keep a session the pool at `url` just issued, before the window gets the reply, and rebind
+        what runs here to it: the next poll is then already signed in (it used to flicker to Sign in
+        until the window had saved the token itself), the agent and LLM node earn for the account
+        from now on without the window posting the token back, and sign-out revokes this token.
+        A Connect that moved on meanwhile is left alone. Runs off the event loop (to_thread)."""
+        s = launch.update_settings(edit=lambda s: launch.with_session(s, token) if launch.proxy_url(s) == url else s)
+        if launch.session_for(s, url) == token:
+            launch.rebind_session()
 
     def forget_session(token: str) -> None:
         """Drop the stored session when it is still `token`, which its pool no longer knows (it expired,
         or the coordinator's database was reset): the window shows Sign in instead of lending a dead
         token forever. A sign-in that stored a new token meanwhile is kept."""
-        s = launch.load_settings()
-        if s.session_token == token:
-            launch.save_settings(replace(s, session_token="", session_url=""))
+        launch.update_settings(edit=lambda s: replace(s, session_token="", session_url="")
+                               if s.session_token == token else s)
 
     def build(method: str, url: str, **kw) -> httpx.Request:
         try:
@@ -489,11 +492,13 @@ def create_shell(launcher: Optional[Launcher] = None,
     def shown(s: LauncherSettings) -> dict:
         return public_settings(s, launch.session_for(s))
 
-    def body_settings(body: dict) -> LauncherSettings:
-        s = settings_from_body(body, launch.load_settings())
-        if "session_token" in body:   # signed in or out: the session belongs to the pool that issued it
-            s = launch.with_session(s, str(body["session_token"] or ""))
-        return s
+    def session_edit(body: dict) -> Optional[SettingsEdit]:
+        """A body's session_token is a sign-in ("" a sign-out): bound, once the body's other changes
+        are in, to the pool the settings then point at. None when the body carries no session."""
+        if "session_token" not in body:
+            return None
+        token = str(body["session_token"] or "")
+        return lambda s: launch.with_session(s, token)
 
     @app.get("/api/settings")
     def get_settings():
@@ -501,8 +506,7 @@ def create_shell(launcher: Optional[Launcher] = None,
 
     @app.post("/api/settings")
     def post_settings(body: dict):
-        s = body_settings(body)
-        launch.save_settings(s)
+        s = launch.update_settings(setting_changes(body), session_edit(body))
         if "session_token" in body:
             launch.rebind_session()   # what runs here now earns for the signed-in account
         return shown(s)
@@ -516,9 +520,8 @@ def create_shell(launcher: Optional[Launcher] = None,
 
     @app.post("/api/start")
     def start(body: dict):
-        s = body_settings(body)
-        try:
-            snap = launch.start(s)
+        try:   # the body is merged into the saved settings under the launcher's lock, with the start
+            snap = launch.start_with(setting_changes(body), session_edit(body))
         except LauncherError as e:
             raise HTTPException(400, str(e)) from e
         return {**asdict(snap), **shown(launch.load_settings())}
@@ -561,7 +564,8 @@ def create_shell(launcher: Optional[Launcher] = None,
     async def get_overview():
         """Status, pool, this Mac and the leaderboard in one poll."""
         s = await settings()
-        snap = await asyncio.to_thread(launch.snapshot, s)
+        # Bounded: a Start holding the lock answers with the last snapshot, not a 20 s stall.
+        snap = await asyncio.to_thread(launch.snapshot, s, OVERVIEW_WAIT_S)
         url, coordinator_url, my_id = await asyncio.to_thread(
             lambda: (launch.proxy_url(s), launch.coordinator_url(s), launch.my_node_id()))
         # snapshot() just polled /health: its answer says whether the lists are worth asking for.
@@ -704,9 +708,7 @@ def create_shell(launcher: Optional[Launcher] = None,
         found = launch.find_on_lan()
         if not found:
             raise HTTPException(404, "No coordinator found on the LAN.")
-        s = launch.load_settings()
-        s.url = found
-        launch.save_settings(s)
+        launch.update_settings({"url": found})
         return {"url": found}
 
     async def relay_form(request: Request, url: str, headers: dict[str, str], content_type: str) -> httpx.Response:

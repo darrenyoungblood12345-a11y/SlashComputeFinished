@@ -186,7 +186,26 @@ on the shell served from a scratch home → repeat until a hunt finds nothing �
 - [x] Browser pass (scratch shell on :8790 against an isolated coordinator on :18765): button inside its card at 1021x640, 1280x600, 1280x792, 2560x1400; Start → Contributing · 50% with the Mac block → Stop → idle; Pool header one row at 900; 760 layout; no console errors
 - [x] Round 2 hunt: UI 0 high/4 med/13 low; backend 2 high (shell freezes on the launcher lock from async handlers; psutil.net_connections raises AccessDenied on macOS so replacing an old shell crashed the launch) / 4 med / 9 low
 - [x] Round 2 fixes (app.js+css, server, controller+discovery, window); browser re-check at 960x640, 1280x600/792, 2560x1400 incl. Start → slider save → Stop; full suite 615 passed
-- [ ] Round 3 hunt (regressions from round 2) → fixes if any
+- [x] Round 3 hunt: 0 high, 0 medium, 11 low → all fixed (restart state from a snapshot flag, terms fetch on the poll timeout, sign-out survives an unreachable pool, link drops never navigate, join/public addresses kept apart, shell stores and rebinds sign-in tokens, locked read-modify-write for settings, bounded overview snapshot, killpg for hung agents, psutil>=6.0)
 - [x] Full suite: 586 after round 1, 615 after round 2 (the known pipeline-loss test deselected)
 - [ ] Rebuild the DMG, reinstall, verify in /Applications/compute.app
 - [ ] Review + lessons
+
+## Review (2026-10-07)
+
+- Three commits on `fix/ui-screen-sizes`: d360ade (round 1), 990a637 (round 2), and round 3. Full suite
+  after each round: 586 → 615 → 623 passed (the known pipeline-loss test deselected). Shell/launcher files: 191.
+- The reported bug: the Contributions view pinned its height to the viewport, so the Contribute card was
+  whatever space was left (275px at 1280x600, 168px at 1021x640) and the Stop button rendered 86-105px
+  below the card and off-screen once contributing added the Mac block; on tall windows it sat 500-675px
+  below the sliders. Cards now size to content; verified at 960x640, 1021x640, 1280x600/792, 2560x1400.
+- Also fixed (highest first): shell freezing on the launcher lock from async handlers; psutil
+  AccessDenied crashing the launch when an old shell was on :8766; the session cookie leaking to other
+  pools; non-atomic launcher.json writes; stale pids trusted and signalled; settings/sign-in during a drain
+  silently stopping contributing; public-pool connect deadlock; double pledges; polls piling up and
+  landing out of order; sliders snapping back mid-drag; no minimum window size; signed out on every launch.
+- Verified in a scratch shell against an isolated coordinator (never the live pool), plus a rebuilt DMG
+  whose bundled package diffs clean against src. Installing it over /Applications/compute.app is the
+  user's call (their live pool runs from that bundle).
+- Not done: the LLMs tab's Send button still sits ~27px below the fold at the default window (needs a
+  structural change); a GPU share change still applies at the next Start (the hint says so; README aligned).

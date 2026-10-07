@@ -17,7 +17,7 @@ dependencies = [
     "msgpack>=1.0",
     "zeroconf>=0.131",
     "typer>=0.12",
-    "psutil>=5.9",
+    "psutil>=6.0",
     "python-multipart>=0.0.9",
     "pywebview>=5.0",
 ]

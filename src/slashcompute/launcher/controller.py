@@ -170,6 +170,7 @@ class StatusSnapshot:
     agent_fetch_done_bytes: Optional[int] = None    # the agent is downloading a job's model
     agent_fetch_total_bytes: Optional[int] = None
     agent_draining: bool = False                    # it was asked to stop and finishes its step first
+    agent_restart_pending: bool = False             # a restart waits for it to finish its step
     agent_gpu_percent: Optional[int] = None         # the share the running agent was started with
     coordinator_pid: Optional[int] = None
     agent_pid: Optional[int] = None
@@ -186,6 +187,9 @@ class StatusSnapshot:
 
 
 PopenFn = Callable[..., Any]
+# A further change to the settings an update applies once the field changes are in (binding a
+# session to the pool they then point at, a clear that depends on what is stored).
+SettingsEdit = Callable[[LauncherSettings], LauncherSettings]
 
 
 def normalize_url(url: str, port: int = 8765, scheme: str = "http") -> str:
@@ -396,6 +400,8 @@ class Launcher:
         # start it as, done from snapshot() once the old one is gone.
         self._pending_agent: Optional[tuple[list[str], str]] = None
         self._pending_inference: Optional[tuple[list[str], str]] = None
+        # What the last snapshot() reported: a bounded poll that finds the lock taken gets this.
+        self._last_snapshot = StatusSnapshot()
         self.paths = AgentPaths(self.home)
 
     @property
@@ -452,6 +458,22 @@ class Launcher:
             if (s.mode, s.url) != (before.mode, before.url):
                 self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
             write_private(self.settings_path, json.dumps(asdict(s), indent=2) + "\n")
+
+    def update_settings(self, changes: Optional[dict] = None,
+                        edit: Optional[SettingsEdit] = None) -> LauncherSettings:
+        """Change the saved settings in one locked read-modify-write and return what was saved:
+        `changes` are field values to replace (a partial body: the slider alone, Connect's mode and
+        url), `edit` any further change that depends on the result or on what is stored (a session
+        bound to the pool the settings now point at, a clear of one token only). Every request
+        thread used to load, change and save on its own: two of them changing different fields at
+        once (a slider save landing during a Start) lost one of the changes."""
+        with self._lock:
+            s = replace(self.load_settings(), **(changes or {}))
+            if edit is not None:
+                s = edit(s)
+            s = s.clamp()
+            self.save_settings(s)
+            return s
 
     def session_for(self, settings: LauncherSettings, url: Optional[str] = None) -> str:
         """The stored session, but only for the pool that issued it (`url`, default the pool the
@@ -824,6 +846,13 @@ class Launcher:
         with self._lock:
             return self._start(settings)
 
+    def start_with(self, changes: Optional[dict] = None, edit: Optional[SettingsEdit] = None) -> StatusSnapshot:
+        """Start with the saved settings changed by `changes` (and `edit`, as update_settings takes
+        them). Merged under the lock: a Start that merged the body first and took the lock after
+        overwrote a slider save that landed in between."""
+        with self._lock:
+            return self._start(self.update_settings(changes, edit))
+
     def _start(self, settings: LauncherSettings) -> StatusSnapshot:
         s = settings.clamp()
         self.save_settings(s)
@@ -1009,8 +1038,16 @@ class Launcher:
             return []
         return data if isinstance(data, list) else []
 
-    def snapshot(self, settings: Optional[LauncherSettings] = None) -> StatusSnapshot:
-        with self._lock:   # what reaps, restarts or forgets processes; the network polls run outside
+    def snapshot(self, settings: Optional[LauncherSettings] = None,
+                 wait: Optional[float] = None) -> StatusSnapshot:
+        """What runs here and whether the pool answers. `wait` bounds how long a poll waits for the
+        lock (a Start or Start serving holds it for up to ~25 s): when it is not free in time the
+        last snapshot taken is returned as it was, so the window keeps polling instead of hanging.
+        Without `wait` the call waits, as start() does for the snapshot it ends in."""
+        timeout = -1 if wait is None else wait
+        if not self._lock.acquire(timeout=timeout):
+            return self._last_snapshot
+        try:   # what reaps, restarts or forgets processes; the network polls run outside
             s = settings.clamp() if settings is not None else self.load_settings()
             self._check_coordinator()
             self._check_inference()
@@ -1021,21 +1058,28 @@ class Launcher:
             agent_running = agent_pid is not None
             if agent_running and self.paths.read_pid() != agent_pid:
                 agent = {}   # spawned moments ago: status.json is still the last run's
+            restart_pending = self._pending_agent is not None
             draining = agent_running and (
-                bool(agent.get("draining")) or self._pending_agent is not None
-                or self._agent_stop_pid == agent_pid)
+                bool(agent.get("draining")) or restart_pending or self._agent_stop_pid == agent_pid)
             inference_pid = self.read_inference_pid()
             inference_status = self.inference_status() if inference_pid is not None else {}
             coordinator_pid = self.read_coordinator_pid()
+        finally:
+            self._lock.release()
         url = self.coordinator_url(s)
         health = self.poll_health(self.proxy_url(s)) if s.mode == "host" else None
         health = health or self.poll_health(url) or {}
         mem_total, mem_free = self._memory()
-        with self._lock:
-            if health and self.last_error.startswith(UNREACHABLE_ERRORS):
-                self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
-            last_error = self.last_error
-        return StatusSnapshot(
+        if self._lock.acquire(timeout=timeout):
+            try:
+                if health and self.last_error.startswith(UNREACHABLE_ERRORS):
+                    self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
+                last_error = self.last_error
+            finally:
+                self._lock.release()
+        else:
+            last_error = self.last_error   # a Start took the lock meanwhile: report, never clear
+        snap = StatusSnapshot(
             coordinator_up=bool(health),
             nodes=health_count(health, "nodes"),
             jobs=health_count(health, "jobs"),
@@ -1045,6 +1089,7 @@ class Launcher:
             agent_fetch_done_bytes=agent.get("fetch_done_bytes") if agent_running else None,
             agent_fetch_total_bytes=agent.get("fetch_total_bytes") if agent_running else None,
             agent_draining=draining,
+            agent_restart_pending=restart_pending,
             agent_gpu_percent=agent_gpu_percent(agent) if agent_running else None,
             coordinator_pid=coordinator_pid,
             agent_pid=agent_pid,
@@ -1059,6 +1104,8 @@ class Launcher:
             memory_total_bytes=mem_total,
             memory_available_bytes=mem_free,
         )
+        self._last_snapshot = snap
+        return snap
 
     def _check_agent(self) -> None:
         """Reap the training agent we spawned once it exits (a zombie until then, and the
@@ -1136,8 +1183,14 @@ class Launcher:
         limit = self.cfg.grace_period_s + AGENT_STOP_MARGIN_S
         if time.monotonic() - asked < limit:
             return
+        # The agent leads its own session (_spawn: start_new_session), so its pid is its group's:
+        # killing the group takes the children it hung on (a model download) with it. One that
+        # leads no group of ours (started by hand) is killed by itself.
         with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
         self._agent_stop_pid = self._agent_stop_at = None
         self._pending_agent = None
         self.last_error = AGENT_FORCE_STOPPED.format(seconds=limit)

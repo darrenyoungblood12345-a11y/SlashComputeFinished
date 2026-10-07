@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
-from slashcompute.launcher.controller import Launcher, LauncherSettings, stateless_http
+from slashcompute.launcher.controller import Launcher, LauncherSettings, launch_record, stateless_http
 from slashcompute.web.server import create_shell
 
 SHELL = "http://127.0.0.1:8766"   # the shell refuses any Host but loopback
@@ -697,6 +698,78 @@ def test_proxy_stores_the_session_a_sign_in_issues_as_it_relays_the_reply(tmp_pa
         c.post("/api/settings", json={"mode": "join", "url": "10.0.0.2"})
         c.get("/api/coord/auth/me")
         assert http.seen[-1] == {}
+
+
+def test_a_sign_in_through_the_proxy_rebinds_the_running_agent_to_its_session(tmp_path, monkeypatch):
+    """The window no longer posts the token back after a sign-in: storing it as the reply is relayed
+    must also restart what runs here with it, or the agent keeps earning for nobody until the next
+    Start."""
+    monkeypatch.delenv("SLASHCOMPUTE_SESSION", raising=False)
+    app, launcher, spawned = _shell(tmp_path, http=SessionHTTP(live=[]))
+    sessions, spawn = [], launcher._popen
+
+    def popen(argv, env=None, **kw):
+        sessions.append((env or {}).get("SLASHCOMPUTE_SESSION", ""))
+        return spawn(argv, env=env, **kw)
+
+    launcher._popen = popen
+    launcher.save_settings(LauncherSettings(mode="join", url="10.0.0.1"))
+    pool = launcher.proxy_url(launcher.load_settings())
+    launcher.paths.pid_file.write_text("77\n")                                   # our agent, no session
+    (tmp_path / "agent.args").write_text(json.dumps(launch_record(launcher.agent_argv(pool, 50), "")))
+    running = {77: True}
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: running.get(pid, False))
+
+    def stop(paths):
+        running[77] = False
+        paths.clear_pid()
+
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", stop)
+    with TestClient(app, base_url=SHELL) as c:
+        assert c.get("/api/status").json()["agent_running"]
+        r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "password1"})
+        assert r.status_code == 200 and r.json()["token"] == "fresh"
+        assert c.get("/api/settings").json()["has_session"] is True
+    assert launcher.load_settings().session_token == "fresh"
+    assert [p.argv for p in spawned] == [launcher.agent_argv(pool, 50)] and sessions == ["fresh"]
+    assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(spawned[0].argv, "fresh")
+
+
+def test_start_merges_its_body_under_the_lock_so_a_save_meanwhile_survives(tmp_path):
+    """Start merged the body into the settings it had loaded and then waited for the lock: a slider
+    save that landed in between was overwritten by what Start saved once it had the lock."""
+    app, launcher, _ = _shell(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.save_settings(LauncherSettings(mode="host", gpu_percent=50))
+    with TestClient(app, base_url=SHELL) as c:
+        with launcher._lock:                   # another Start (or a poll) holds the lock
+            connect = threading.Thread(target=lambda: c.post(
+                "/api/start", json={"mode": "join", "url": "10.0.0.5", "training": False}))
+            connect.start()
+            time.sleep(0.2)                    # it has its body and waits for the lock
+            launcher.save_settings(replace(launcher.load_settings(), gpu_percent=30))   # the slider lands
+        connect.join(10)
+    assert not connect.is_alive()
+    s = launcher.load_settings()
+    assert (s.mode, s.url, s.gpu_percent, s.training) == ("join", "10.0.0.5", 30, False)
+
+
+def test_overview_answers_with_the_last_snapshot_while_a_start_holds_the_lock(tmp_path, monkeypatch):
+    """A Start holds the launcher's lock for up to ~25 s; every poll used to wait behind it and the
+    window's pills froze. Bounded, the poll answers at once with what the last snapshot said."""
+    monkeypatch.setattr("slashcompute.web.server.OVERVIEW_WAIT_S", 0.1)
+    app, launcher, _ = _shell(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.save_settings(LauncherSettings(mode="host"))
+    with TestClient(app, base_url=SHELL) as c:
+        first = c.get("/api/overview").json()["status"]
+        assert first["coordinator_up"] is True and first["agent_restart_pending"] is False
+        launcher._http.health = None           # the pool went away...
+        with launcher._lock:                   # ...while a Start holds the lock
+            t0 = time.monotonic()
+            held = c.get("/api/overview").json()["status"]
+            assert time.monotonic() - t0 < 1.0
+        assert held["coordinator_up"] is True  # the last snapshot, not a stall
+        fresh = c.get("/api/overview").json()["status"]
+    assert fresh["coordinator_up"] is False    # free again: a full poll
 
 
 @pytest.mark.parametrize("path", ["/api/overview", "/api/coord/auth/me"])
