@@ -12,8 +12,9 @@ from typing import Optional
 JOB_WAITING = ("queued", "recovering")
 JOB_ACTIVE = ("starting", "running")
 JOB_TERMINAL = ("completed", "failed", "cancelled")
-# The coordinator's /jobs has no limit parameter, so the cap is applied here: the newest rows are
-# listed, every row is counted.
+# The coordinator's /jobs has no limit parameter, so the cap is applied here: every job still
+# queued or running is listed (its Cancel button must not vanish because newer jobs finished),
+# the newest finished ones fill the list up to this many, and every row is counted.
 JOBS_SHOWN = 50
 POOL_LISTS = ("/nodes", "/jobs", "/ledger")
 
@@ -40,9 +41,18 @@ def fresh_pool(previous: PoolData, nodes: Optional[list], jobs: Optional[list],
     )
 
 
+def _submitted(job: dict) -> float:
+    return job.get("submitted_at") or 0.0
+
+
 def recent_jobs(jobs: list, limit: int = JOBS_SHOWN) -> list:
-    """The newest ``limit`` jobs, newest first."""
-    return sorted(jobs, key=lambda j: j.get("submitted_at") or 0.0, reverse=True)[:limit]
+    """Newest first: every job that is not finished (queued, starting, running, recovering), however
+    old, then the newest finished ones until ``limit`` jobs are listed. A queued job from before fifty
+    newer finished ones used to drop off the list, and its Cancel button with it."""
+    newest = sorted(jobs, key=_submitted, reverse=True)
+    live = [j for j in newest if j.get("status") not in JOB_TERMINAL]
+    finished = [j for j in newest if j.get("status") in JOB_TERMINAL]
+    return sorted(live + finished[:max(0, limit - len(live))], key=_submitted, reverse=True)
 
 
 def format_flops(flops: float) -> str:

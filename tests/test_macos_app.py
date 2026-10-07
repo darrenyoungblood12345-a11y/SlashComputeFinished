@@ -3,6 +3,7 @@ import os
 import stat
 import subprocess
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +13,7 @@ import pytest
 from slashcompute.launcher.main import (
     MIN_H, MIN_W, SCREEN_MARGIN_H, SCREEN_MARGIN_W, SHELL_GENERATION, WINDOW_H, WINDOW_W,
     _stop_listener, confirm_close_when_busy, ensure_shell, main, shell_busy, ui_ready,
-    window_size,
+    watch_busy, window_size,
 )
 from slashcompute.web.server import asset_version
 
@@ -97,38 +98,132 @@ def test_ensure_shell_refuses_a_port_held_by_something_else(monkeypatch):
         ensure_shell()
 
 
-def test_stop_listener_leaves_unrelated_servers_alone(monkeypatch):
+OLD_SHELL = ["/Applications/compute.app/Contents/Resources/python/bin/python3", "-m",
+             "slashcompute.launcher.main"]
+OTHER_SERVER = ["uvicorn", "myapp:app", "--port", "8766"]
+
+
+class FakeProc:
+    """A psutil.Process stand-in: what process_iter yields and what Process(pid) returns.
+
+    ``listening`` are the ports it serves, ``connected`` those it is a client of; with
+    ``sockets_visible=False`` its sockets are off limits, as another user's are on macOS."""
+
+    def __init__(self, pid: int, cmdline: list[str], listening=(), connected=(),
+                 sockets_visible: bool = True) -> None:
+        self.pid = pid
+        self._cmdline = cmdline
+        self._listening = listening
+        self._connected = connected
+        self._sockets_visible = sockets_visible
+        self.terminated = False
+
+    def ppid(self) -> int:
+        return 1
+
+    def cmdline(self) -> list[str]:
+        return self._cmdline
+
+    def net_connections(self, kind="inet"):
+        import psutil
+
+        if not self._sockets_visible:
+            raise psutil.AccessDenied(pid=self.pid)
+
+        def conn(port: int, status: str) -> SimpleNamespace:
+            return SimpleNamespace(laddr=SimpleNamespace(ip="127.0.0.1", port=port),
+                                   status=status, pid=self.pid)
+
+        return [*(conn(p, "LISTEN") for p in self._listening),
+                *(conn(p, "ESTABLISHED") for p in self._connected)]
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout=None) -> int:
+        return 0
+
+
+def non_root_psutil(monkeypatch, procs: list[FakeProc]) -> None:
+    """psutil as a non-root user sees it on macOS: the system-wide socket table is denied, each
+    process answers for its own sockets, ``Process(pid)`` knows only the processes listed."""
     import psutil
 
-    cmdlines = {
-        11: ["uvicorn", "myapp:app", "--port", "8766"],
-        12: ["/Applications/compute.app/Contents/Resources/python/bin/python3", "-m",
-             "slashcompute.launcher.main"],
-    }
-    terminated: list[int] = []
+    by_pid = {p.pid: p for p in procs}
 
-    class Proc:
-        def __init__(self, pid: int) -> None:
-            self.pid = pid
+    def denied(kind="inet"):
+        raise psutil.AccessDenied(pid=os.getpid())
 
-        def ppid(self) -> int:
-            return 1
+    def process(pid: int) -> FakeProc:
+        if pid not in by_pid:
+            raise psutil.NoSuchProcess(pid)
+        return by_pid[pid]
 
-        def cmdline(self) -> list[str]:
-            return cmdlines[self.pid]
+    monkeypatch.setattr(psutil, "net_connections", denied)
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs=None, ad_value=None: iter(procs))
+    monkeypatch.setattr(psutil, "Process", process)
 
-        def terminate(self) -> None:
-            terminated.append(self.pid)
 
-        def wait(self, timeout=None) -> int:
-            return 0
+def no_lsof(monkeypatch) -> None:
+    def missing(cmd, **kwargs):
+        raise FileNotFoundError(cmd[0])
+    monkeypatch.setattr("slashcompute.launcher.main.subprocess.run", missing)
 
-    listening = [SimpleNamespace(laddr=SimpleNamespace(port=8766), status="LISTEN", pid=pid)
-                 for pid in cmdlines]
-    monkeypatch.setattr(psutil, "net_connections", lambda kind="tcp": listening)
-    monkeypatch.setattr(psutil, "Process", Proc)
+
+def test_stop_listener_quits_only_the_old_shell_without_the_system_socket_table(monkeypatch):
+    other = FakeProc(11, OTHER_SERVER, listening=[8000])
+    old_shell = FakeProc(12, OLD_SHELL, listening=[8766])
+    client = FakeProc(13, ["python", "-m", "slashcompute.cli", "status"], connected=[8766])
+    hidden = FakeProc(14, ["launchd"], sockets_visible=False)
+    non_root_psutil(monkeypatch, [other, hidden, old_shell, client])
+    no_lsof(monkeypatch)   # psutil found the listener: lsof is not needed
     _stop_listener(8766)
-    assert terminated == [12]
+    assert [p.pid for p in (other, old_shell, client, hidden) if p.terminated] == [12]
+
+
+def test_stop_listener_leaves_an_unrelated_server_alone(monkeypatch):
+    other = FakeProc(11, OTHER_SERVER, listening=[8766])
+    non_root_psutil(monkeypatch, [other])
+    no_lsof(monkeypatch)
+    _stop_listener(8766)
+    assert other.terminated is False
+
+
+def test_stop_listener_asks_lsof_when_psutil_cannot_see_the_listener(monkeypatch):
+    old_shell = FakeProc(12, OLD_SHELL, listening=[8766], sockets_visible=False)
+    other = FakeProc(11, OTHER_SERVER, listening=[8000])
+    non_root_psutil(monkeypatch, [other, old_shell])
+    calls: list[tuple[list[str], dict]] = []
+
+    def lsof(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="12\n12\n", stderr="")
+
+    monkeypatch.setattr("slashcompute.launcher.main.subprocess.run", lsof)
+    _stop_listener(8766)
+    assert old_shell.terminated is True and other.terminated is False
+    [(cmd, kwargs)] = calls
+    assert cmd[0] == "lsof" and {"-iTCP:8766", "-sTCP:LISTEN", "-t"} <= set(cmd)
+    assert kwargs["timeout"] == 3
+
+
+@pytest.mark.parametrize("lsof_outcome", ["missing", "timeout", "nothing", "unknown pid"])
+def test_stop_listener_gives_up_quietly_when_nothing_of_ours_is_found(monkeypatch, lsof_outcome):
+    hidden = FakeProc(99, ["someone-elses-server"], listening=[8766], sockets_visible=False)
+    non_root_psutil(monkeypatch, [hidden])
+
+    def lsof(cmd, **kwargs):
+        if lsof_outcome == "missing":
+            raise FileNotFoundError("lsof")
+        if lsof_outcome == "timeout":
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        if lsof_outcome == "nothing":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="4242\n", stderr="")   # psutil: NoSuchProcess
+
+    monkeypatch.setattr("slashcompute.launcher.main.subprocess.run", lsof)
+    _stop_listener(8766)   # no exception: ensure_shell goes on to report the busy port
+    assert hidden.terminated is False
 
 
 def test_window_size_fits_small_screens_but_never_below_the_layout_minimum():
@@ -153,36 +248,67 @@ def test_shell_busy_follows_api_status(monkeypatch, status, busy):
     assert shell_busy(URL) is busy
 
 
-def test_shell_busy_is_false_when_the_shell_is_gone(monkeypatch):
+@pytest.mark.parametrize("failure", [httpx.ConnectError("refused"), httpx.ReadTimeout("slow")])
+def test_shell_busy_is_unknown_not_idle_when_the_shell_does_not_answer(monkeypatch, failure):
     def gone(url, timeout=None):
-        raise httpx.ConnectError("refused")
+        raise failure
 
     monkeypatch.setattr("slashcompute.launcher.main.httpx.get", gone)
-    assert shell_busy(URL) is False
+    assert shell_busy(URL) is None
+
+
+def wait_for(condition, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out waiting for the busy watch"
+        time.sleep(0.005)
+
+
+def test_watch_busy_polls_in_the_background_and_keeps_the_last_answer(monkeypatch):
+    answer = {"status": {"agent_running": True}}
+    calls: list[tuple[threading.Thread, str, float]] = []
+
+    def status(url, timeout=None):
+        calls.append((threading.current_thread(), url, timeout))
+        if isinstance(answer["status"], Exception):
+            raise answer["status"]
+        return FakeResponse(answer["status"])
+
+    monkeypatch.setattr("slashcompute.launcher.main.httpx.get", status)
+    stop = threading.Event()
+    is_busy = watch_busy(URL, interval=0.01, stop=stop)
+    try:
+        wait_for(lambda: is_busy() is True)
+        answer["status"] = httpx.ReadTimeout("slow")   # a slow shell: keep "busy", do not skip the prompt
+        time.sleep(0.05)
+        assert is_busy() is True
+        answer["status"] = {"agent_running": False, "inference_running": False, "coordinator_pid": None}
+        wait_for(lambda: is_busy() is False)
+    finally:
+        stop.set()
+    assert calls, "the shell was never asked"
+    assert all(t is not threading.main_thread() for t, _, _ in calls), "asked on the GUI thread"
+    assert all(url == f"{URL}/api/status" and timeout == 2.0 for _, url, timeout in calls)
 
 
 @pytest.mark.parametrize("busy", [True, False])
-def test_closing_asks_only_while_the_pool_works_here(monkeypatch, busy):
+def test_closing_asks_only_while_the_pool_works_here(busy):
     from webview.event import Event   # pywebview's dispatcher, without a window or a display
 
-    monkeypatch.setattr("slashcompute.launcher.main.shell_busy", lambda url, timeout=1.5: busy)
     window = SimpleNamespace(confirm_close=False)
     closing = Event(window, should_lock=True)
-    closing += confirm_close_when_busy(URL)
+    closing += confirm_close_when_busy(lambda: busy)
     cancelled = closing.set()
     assert cancelled is False          # the close goes on, to pywebview's confirm_close prompt
     assert window.confirm_close is busy
 
 
-def test_main_logs_and_alerts_when_the_shell_cannot_start(monkeypatch, tmp_path):
-    def no_shell() -> str:
-        raise SystemExit("Port 8766 is in use by another program. Quit it and open /compute again.")
-
+def run_main_expecting_failure(monkeypatch, tmp_path) -> list[str]:
+    """``main()`` with the window and the native alert stubbed; returns the alerts shown."""
     alerts: list[str] = []
     monkeypatch.setattr("slashcompute.launcher.main.launcher_home", lambda: tmp_path)
-    monkeypatch.setattr("slashcompute.launcher.main.ensure_shell", no_shell)
     monkeypatch.setattr("slashcompute.launcher.main.open_window",
-                        lambda url, home: pytest.fail("opened a window without a shell"))
+                        lambda url: pytest.fail("opened a window without a shell"))
     monkeypatch.setattr("slashcompute.launcher.main.show_alert", alerts.append)
     root = logging.getLogger()
     before = list(root.handlers)
@@ -194,7 +320,33 @@ def test_main_logs_and_alerts_when_the_shell_cannot_start(monkeypatch, tmp_path)
             root.removeHandler(h)
             h.close()
     assert exc.value.code == 1
+    return alerts
+
+
+def test_main_logs_and_alerts_when_the_shell_cannot_start(monkeypatch, tmp_path):
+    def no_shell() -> str:
+        raise SystemExit("UI did not start at http://127.0.0.1:8766")
+
+    monkeypatch.setattr("slashcompute.launcher.main.ensure_shell", no_shell)
+    alerts = run_main_expecting_failure(monkeypatch, tmp_path)
+    assert alerts == ["UI did not start at http://127.0.0.1:8766"]
+    assert "UI did not start" in (tmp_path / "logs" / "shell.log").read_text()
+
+
+def test_main_alerts_when_another_program_holds_the_port(monkeypatch, tmp_path):
+    """End to end as a non-root user: the system socket table is denied, the only listener on
+    :8766 is somebody else's server, so it is left running and the alert says who to quit."""
+    other = FakeProc(11, OTHER_SERVER, listening=[8766])
+    non_root_psutil(monkeypatch, [other])
+    no_lsof(monkeypatch)
+    monkeypatch.setattr("slashcompute.launcher.main.httpx.get",
+                        lambda url, timeout=None: FakeResponse({}, text="ok"))
+    monkeypatch.setattr("slashcompute.launcher.main._port_open", lambda host, port: True)
+    monkeypatch.setattr("slashcompute.launcher.main._serve", lambda: pytest.fail("bound a busy port"))
+    monkeypatch.setattr("slashcompute.launcher.main.time.sleep", lambda s: None)
+    alerts = run_main_expecting_failure(monkeypatch, tmp_path)
     assert alerts == ["Port 8766 is in use by another program. Quit it and open /compute again."]
+    assert other.terminated is False
     assert "Port 8766 is in use" in (tmp_path / "logs" / "shell.log").read_text()
 
 

@@ -41,6 +41,7 @@
         <div id="auth-terms" hidden>
           <p class="terms-box" id="terms-text"></p>
           <button type="button" class="btn primary sm block" data-act="accept-terms">Accept terms</button>
+          <button type="button" class="btn ghost sm block" data-act="logout">Sign out</button>
         </div>
         <div id="auth-user" hidden>
           <div class="side-row"><b id="auth-who"></b></div>
@@ -98,12 +99,12 @@
             <p class="muted" id="c-detail"></p>
             <div class="field">
               <div class="field-head"><label for="gpu">GPU share</label><output id="gpu-out">50%</output></div>
-              <input type="range" id="gpu" min="1" max="100" value="50">
+              <input type="range" id="gpu" min="1" max="100" value="50" disabled>
               <p class="hint" id="gpu-hint"></p>
             </div>
             <div class="field">
               <div class="field-head"><label for="mem">Memory lent</label><output id="mem-out">Auto</output></div>
-              <input type="range" id="mem" min="0" max="12" step="1" value="0">
+              <input type="range" id="mem" min="0" max="12" step="1" value="0" disabled>
               <p class="hint" id="mem-hint"></p>
             </div>
             <div id="c-mac"></div>
@@ -117,7 +118,7 @@
               <div><label>To grants</label><strong class="hot" id="split-grants">0%</strong><small id="split-grants-amt"></small></div>
               <div class="right"><label>You keep</label><strong class="sig" id="split-keep">100%</strong><small id="split-keep-amt"></small></div>
             </div>
-            <input type="range" class="split-range" id="split" min="0" max="100" value="0" aria-label="Share of credits given to grants">
+            <input type="range" class="split-range" id="split" min="0" max="100" value="0" aria-label="Share of credits given to grants" disabled>
             <p class="hint" id="split-hint">Credits are 1:1 with FLOPs. Sign in so this split is saved on your account.</p>
             <ul class="terms">
               <li>Runs in the background at the GPU share you choose, only while contributing is on.</li>
@@ -371,7 +372,7 @@
             <p class="muted" id="l-detail"></p>
             <div class="field">
               <div class="field-head"><label for="l-mem">Memory lent</label><output id="l-mem-out">Auto</output></div>
-              <input type="range" id="l-mem" min="0" max="12" step="1" value="0">
+              <input type="range" id="l-mem" min="0" max="12" step="1" value="0" disabled>
               <p class="hint" id="l-mem-hint"></p>
             </div>
             <div class="field"><label for="l-dir">Models folder</label><input type="text" id="l-dir" value="~/models" spellcheck="false" autocomplete="off"></div>

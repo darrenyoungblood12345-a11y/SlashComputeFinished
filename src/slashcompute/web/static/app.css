@@ -653,6 +653,8 @@ input[type="range"]::-webkit-slider-thumb {
 /* ------------------------------------------------------------ pool */
 
 .banner { background: var(--hot); color: var(--carbon); padding: 12px 16px; margin-bottom: 16px; }
+/* News, not a failure: "Restarting the training agent after the current step finishes…" */
+.banner.info { background: var(--slab-2); color: var(--paper); box-shadow: inset 4px 0 0 var(--sig); }
 
 .addr {
   display: flex;
@@ -688,6 +690,8 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* The Macs and Pipeline tables cannot shrink below their columns; scroll them sideways instead. */
 #p-macs, #l-pipe { overflow-x: auto; }
+/* Room inside the scroll box for the Unload button's focus ring, which overflow would clip. */
+#l-pipe { padding: 4px; margin: -4px; }
 
 /* ------------------------------------------------------------ toast */
 
@@ -723,7 +727,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 @media (max-width: 760px) {
   .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; min-height: 100dvh; }
-  .side { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; }
+  .side { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; position: sticky; top: 0; }
   .brand { padding: 0; }
   .tagline, .side-status { display: none; }
   .nav { flex-direction: row; flex-wrap: wrap; }

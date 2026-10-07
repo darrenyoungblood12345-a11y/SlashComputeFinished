@@ -42,7 +42,7 @@ def shell_url() -> str:
 
 
 def launcher_home() -> Path:
-    """Where launcher.json, logs/ and the window's cookies live (``SLASHCOMPUTE_HOME``)."""
+    """Where launcher.json and logs/ live (``SLASHCOMPUTE_HOME``)."""
     return Path(EngineConfig.from_env().home).expanduser()
 
 
@@ -84,30 +84,64 @@ def _shell_is_ours(url: str) -> bool:
     return generation == SHELL_GENERATION and info.get("assets") == asset_version()
 
 
-def _stop_listener(port: int) -> None:
-    """Quit a leftover /compute shell (never an unrelated server) so this launch can bind :8766."""
+def _lsof_listener_pids(port: int) -> list[int]:
+    """PIDs lsof sees listening on TCP ``port``; [] when lsof is missing, slow or finds none."""
+    cmd = ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("lsof could not look at port %s: %s", port, e)
+        return []
+    return [int(pid) for pid in r.stdout.split() if pid.isdigit()]   # exit 1 = nothing found
+
+
+def _listener_pids(port: int) -> list[int]:
+    """PIDs listening on TCP ``port``.
+
+    ``psutil.net_connections()`` wants root on macOS (AccessDenied for anyone else), so each
+    process is asked for its own sockets instead, which works for the user's own processes.
+    When that finds nothing, lsof gets a look: it sees listeners psutil is blind to.
+    """
     import psutil
 
-    for c in psutil.net_connections(kind="tcp"):
-        if not c.laddr or c.laddr.port != port or c.status != "LISTEN" or not c.pid:
+    pids: list[int] = []
+    for proc in psutil.process_iter():
+        try:
+            conns = proc.net_connections(kind="tcp")
+        except psutil.Error:
+            continue
+        if any(c.status == "LISTEN" and c.laddr and c.laddr.port == port for c in conns):
+            pids.append(proc.pid)
+    return list(dict.fromkeys(pids or _lsof_listener_pids(port)))
+
+
+def _stop_listener(port: int) -> None:
+    """Quit a leftover /compute shell (never an unrelated server) so this launch can bind :8766.
+
+    An unrelated or unknown listener is left alone: ``ensure_shell`` then reports it.
+    """
+    import psutil
+
+    for pid in _listener_pids(port):
+        if pid == os.getpid():
             continue
         try:
-            proc = psutil.Process(c.pid)
-        except (psutil.Error, OSError):
-            continue
-        if proc.pid == os.getpid() or proc.ppid() == os.getpid():
-            continue
-        try:
+            proc = psutil.Process(pid)
+            if proc.ppid() == os.getpid():
+                continue
             cmd = " ".join(proc.cmdline())
         except (psutil.Error, OSError):
-            cmd = ""
+            continue
         if "slashcompute" not in cmd:
             continue
-        proc.terminate()
         try:
-            proc.wait(timeout=3)
-        except psutil.TimeoutExpired:
-            proc.kill()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+        except (psutil.Error, OSError) as e:
+            log.warning("could not stop the old shell (pid %s): %s", pid, e)
 
 
 def ui_ready(url: str, timeout: float = 0.6) -> bool:
@@ -171,31 +205,62 @@ def primary_screen() -> Optional[tuple[int, int]]:
     return int(screens[0].width), int(screens[0].height)
 
 
-def shell_busy(url: str, timeout: float = 1.5) -> bool:
-    """True while this Mac trains, serves LLMs or hosts the pool, per the shell's /api/status."""
+def shell_busy(url: str, timeout: float = 2.0) -> Optional[bool]:
+    """Whether this Mac trains, serves LLMs or hosts the pool, per the shell's /api/status.
+
+    None when the shell did not answer in time (or not with status), so a caller can keep
+    the last answer it had instead of taking silence for idle.
+    """
     try:
         status = httpx.get(f"{url.rstrip('/')}/api/status", timeout=timeout).json()
     except (httpx.HTTPError, ValueError):
-        return False
+        return None
     if not isinstance(status, dict):
-        return False
+        return None
     return any(status.get(k) for k in ("agent_running", "inference_running", "coordinator_pid"))
 
 
-def confirm_close_when_busy(url: str) -> Callable[[Any], None]:
+def watch_busy(url: str, interval: float = 3.0, timeout: float = 2.0,
+               stop: Optional[threading.Event] = None) -> Callable[[], bool]:
+    """Keep a cached answer to ``shell_busy`` fresh from a daemon thread; the returned function
+    reads it without blocking. Asking the shell while the window closes would freeze the GUI
+    thread and, when /api/status is slow, answer "idle" exactly when something is running; here
+    a failed poll keeps the last answer. ``stop`` ends the thread (tests)."""
+    if stop is None:
+        stop = threading.Event()
+    last = [False]
+
+    def poll() -> None:
+        while True:
+            try:
+                busy = shell_busy(url, timeout=timeout)
+            except Exception as e:   # noqa: BLE001 — a surprise must not end the watch
+                log.warning("busy check failed: %s", e)
+                busy = None
+            if busy is not None:
+                last[0] = busy
+            if stop.wait(interval):
+                return
+
+    threading.Thread(target=poll, daemon=True, name="slashcompute-busy").start()
+    return lambda: last[0]
+
+
+def confirm_close_when_busy(is_busy: Callable[[], bool]) -> Callable[[Any], None]:
     """``window.events.closing`` handler: ask before closing while the pool still works here.
 
     It runs on the GUI thread as the window closes (Cmd-Q included), where
     ``window.create_confirmation_dialog`` would deadlock: it waits on the main run loop we are
     on. So flip pywebview's own ``confirm_close`` and let it show the native Quit/Cancel prompt
-    with BUSY_MESSAGE. Returning None lets the close go on to that prompt.
+    with BUSY_MESSAGE. Returning None lets the close go on to that prompt. ``is_busy`` must not
+    block: ``watch_busy`` provides a cached answer.
     """
     def closing(window: Any) -> None:
-        window.confirm_close = shell_busy(url)
+        window.confirm_close = is_busy()
     return closing
 
 
-def open_window(url: str, home: Path) -> None:
+def open_window(url: str) -> None:
     import webview
 
     width, height = window_size(primary_screen())
@@ -204,9 +269,12 @@ def open_window(url: str, home: Path) -> None:
         zoomable=True, text_select=True,
         localization={"global.quitConfirmation": BUSY_MESSAGE},
     )
-    window.events.closing += confirm_close_when_busy(url)
-    # Not private: cookies (the signed-in session) survive relaunches, in <home>/webview.
-    webview.start(private_mode=False, storage_path=str(home / "webview"))
+    window.events.closing += confirm_close_when_busy(watch_busy(url))
+    # Not private, so the page's cookies survive relaunches. On macOS pywebview ignores
+    # storage_path and keeps them in WebKit's shared default data store (one jar for every
+    # home on this Mac); the shell identifies the caller by its stored token as a Bearer and
+    # never relies on that cookie.
+    webview.start(private_mode=False)
 
 
 def log_to(path: Path) -> Optional[logging.Handler]:
@@ -248,7 +316,7 @@ def main() -> None:
     home = launcher_home()
     log_to(home / "logs" / "shell.log")
     try:
-        open_window(ensure_shell(), home)
+        open_window(ensure_shell())
     except SystemExit as e:
         if not e.code:   # a clean exit (None or 0)
             raise

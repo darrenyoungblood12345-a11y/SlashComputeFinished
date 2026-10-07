@@ -9,7 +9,11 @@ const SETTING_KEYS = [
 const GIB = 1024 ** 3;
 const GRANTS_REFRESH_MS = 20000;
 const POLL_MS = 2000;
-const API_TIMEOUT_MS = 20000;
+const API_TIMEOUT_MS = 20000;       // polls: a hung one must not hold up the next
+const ACTION_TIMEOUT_MS = 120000;   // starts, stops, saves: the controller may wait on a process
+// Reads made every poll or on a timer; everything else is an action (or the dataset upload).
+const POLL_PATHS = ["/api/overview", "/api/grants", "/api/coord/auth/me", "/api/status", "/inference/status", "/v1/models"];
+const MAX_UPLOAD_GIB = 64;          // the shell refuses a bigger GGUF: no Mac pool loads one
 const RATE_WINDOW = 5;          // polls averaged into the "now" rate
 const OUTDATED_COORDINATOR = "This pool's coordinator has no LLM inference: it runs an older /compute. "
   + "Ask whoever hosts it to update and restart it, or host a pool on this Mac.";
@@ -85,8 +89,20 @@ function detailText(data, fallback) {
   return fallback;
 }
 
+// How long a request may take: a poll gives up fast so the next is not stuck behind it; an action
+// (start, stop, save) waits for the controller; `timeout: 0` (the dataset upload) waits as long as it takes.
+function timeoutFor(path, opts) {
+  if (opts.timeout != null) return opts.timeout;
+  const p = String(path).split("?")[0];
+  const read = (opts.method || "GET").toUpperCase() === "GET";
+  return read && POLL_PATHS.some((x) => p === x || p.endsWith(x)) ? API_TIMEOUT_MS : ACTION_TIMEOUT_MS;
+}
+
 async function api(path, opts = {}) {
-  const next = { signal: timeoutSignal(API_TIMEOUT_MS), ...opts, credentials: "include", headers: { ...(opts.headers || {}) } };
+  const ms = timeoutFor(path, opts);
+  const rest = { ...opts };
+  delete rest.timeout;   // ours, not fetch's
+  const next = { signal: ms ? timeoutSignal(ms) : undefined, ...rest, credentials: "include", headers: { ...(opts.headers || {}) } };
   if (next.body && !(next.body instanceof FormData) && !next.headers["content-type"]) {
     next.headers["content-type"] = "application/json";
   }
@@ -105,6 +121,11 @@ async function api(path, opts = {}) {
 const post = (path, body) => api(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
 const patch = (path, body) => api(path, { method: "PATCH", body: JSON.stringify(body) });
 const signedIn = () => !!(state.user && state.user.id);
+// The controller's "Restarting the training agent / the LLM node after the current step finishes":
+// news that new settings are on their way, not a failure.
+const isRestartNote = (msg) => typeof msg === "string" && msg.startsWith("Restarting ");
+// The agent drains to start again with new settings: on screen a restart, not a stop.
+const agentRestarting = (st) => !!(st.agent_running && st.agent_draining && isRestartNote(st.last_error));
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
@@ -262,20 +283,22 @@ function pickSettings(src) {
   return Object.fromEntries(SETTING_KEYS.map((k) => [k, src[k]]));
 }
 
-// Saves run one after another, each posting the settings as they stand when its turn comes, so
-// the value set last is the one stored last. Only the final answer in the chain is applied: an
-// earlier one would briefly undo a change still waiting its turn.
+// Saves run one after another, each posting only what it changes (the server merges that over what
+// it stores), so the value set last is the one stored last, and a save queued behind Connect or
+// Start never carries the mode and address they have just replaced. Only the final answer in the
+// chain is applied: an earlier one would briefly undo a change still waiting its turn.
 const saveQueue = { tail: Promise.resolve(), seq: 0 };
 
 function saveSettings(changes) {
   if (!state.settings) return Promise.resolve();   // nothing to merge into before the first overview
-  state.settings = { ...state.settings, ...changes };
+  const delta = { ...changes };
+  state.settings = { ...state.settings, ...delta };
   state.settingsVersion += 1;
   state.saving += 1;
   const seq = ++saveQueue.seq;
   saveQueue.tail = saveQueue.tail.then(async () => {
     try {
-      const saved = pickSettings(await post("/api/settings", state.settings));
+      const saved = pickSettings(await post("/api/settings", delta));
       if (seq === saveQueue.seq) state.settings = saved;
     } catch (e) {
       toast(e.message, "bad");
@@ -331,6 +354,12 @@ async function pollOnce() {
     if (seq < state.pollApplied) return;   // a later poll has already answered
     state.pollApplied = seq;
     trackRate(ov);
+    // Another pool now: whatever account the old one knew is not this one's; loadAuth asks afresh.
+    const before = status().coordinator_url;
+    if (before && ov.status && ov.status.coordinator_url !== before) {
+      state.user = null;
+      state.credits = null;
+    }
     state.ov = ov;
     applySettings(ov.status, version);
     if (ov.status && ov.status.coordinator_up) {
@@ -439,6 +468,7 @@ function showTab(name) {
   });
   $$(".view").forEach((v) => v.classList.toggle("is-on", v.id === `view-${name}`));
   $("#main").scrollTop = 0;
+  if (document.scrollingElement) document.scrollingElement.scrollTop = 0;   // narrow windows scroll the page itself
   if (name === "grants") loadGrants();
   if (name === "llm" && status().coordinator_up) loadLlm().then(renderLlm);
 }
@@ -463,7 +493,9 @@ function renderSidebar() {
   }
   const agent = $("#side-agent");
   agent.hidden = !st.agent_running;
-  agent.textContent = st.agent_draining ? "Stopping…" : `Contributing · ${liveGpuPercent()}%`;
+  // Set whether shown or hidden: it must never lag the Contributions pill.
+  agent.textContent = !st.agent_running ? "Not contributing"
+    : agentRestarting(st) ? "Restarting…" : st.agent_draining ? "Stopping…" : `Contributing · ${liveGpuPercent()}%`;
 }
 
 function renderAuth() {
@@ -545,12 +577,16 @@ function renderContributions() {
   setText("#c-rank-sub", m.rank ? `of ${plural(m.of, "Mac")} in the pool` : "Not ranked yet");
 
   const running = !!st.agent_running;
-  const draining = running && !!st.agent_draining;   // Stop was pressed; the agent exits after its step
+  const draining = running && !!st.agent_draining;   // the agent exits after its step: Stop was pressed...
+  const restarting = draining && agentRestarting(st); // ...or new settings make it start again
   const s = state.settings || {};
-  setTag("#c-pill", draining ? "Stopping" : running ? `Contributing · ${liveGpuPercent()}%` : "Not contributing",
-    running && !draining ? "ok" : "");
+  setTag("#c-pill", restarting ? "Restarting…" : draining ? "Stopping" : running ? `Contributing · ${liveGpuPercent()}%` : "Not contributing",
+    running && !draining ? "ok" : restarting ? "line" : "");
   setDot("#c-dot", running ? "ok" : "", running && !draining);
-  if (draining) {
+  if (restarting) {
+    setText("#c-state", "Restarting…");
+    setText("#c-detail", "The current step finishes, then the agent starts again with the new settings.");
+  } else if (draining) {
     setText("#c-state", "Stopping");
     setText("#c-detail", "The current step finishes, then this Mac is released.");
   } else if (running) {
@@ -566,7 +602,7 @@ function renderContributions() {
   }
   const toggle = $("#c-toggle");
   if (draining) {
-    toggle.textContent = "Stopping…";
+    toggle.textContent = restarting ? "Restarting…" : "Stopping…";
     toggle.className = "btn block ghost";
     toggle.disabled = true;
   } else if (!state.busy.has("contribute")) {
@@ -776,7 +812,7 @@ function renderGrantsLive() {
     }
     return board.slice(0, 8).map((r) => `<li class="${r.is_me ? "is-me" : ""}">
       <span class="rank">${esc(Number(r.rank))}</span>
-      <span class="name">${esc(r.name)}${r.is_me ? ` <span class="tag ok">You</span>` : ""}</span>
+      <span class="name">${esc(r.name)}${r.is_me ? `<span class="tag ok">You</span>` : ""}</span>
       <span class="flops">${esc(withUnit(r.flops))}</span>
     </li>`).join("");
   });
@@ -870,13 +906,15 @@ function renderPool() {
   if (state.dirty.url && url.value.trim() === urlVal) state.dirty.url = false;
   if (!state.dirty.url && url.value !== urlVal) url.value = urlVal;
   const pub = $("#public-url");
-  const pubVal = s.url || st.public_url || "";
+  // One stored address serves Join and Public: the LAN one must not turn up in the Public field.
+  const pubVal = (s.mode === "public" && s.url) || st.public_url || "";
   if (state.dirty.publicUrl && pub.value.trim() === pubVal) state.dirty.publicUrl = false;
   if (!state.dirty.publicUrl && pub.value !== pubVal) pub.value = pubVal;
 
   const banner = $("#p-banner");
   banner.hidden = !st.last_error;
   banner.textContent = st.last_error || "";
+  banner.className = `banner ${isRestartNote(st.last_error) ? "info" : ""}`.trim();
 
   if (!state.busy.has("pool")) {
     // A coordinator that failed (port taken, crashed) must leave Start hosting free for a retry.
@@ -891,7 +929,8 @@ function renderPool() {
   const rows = [
     ["Coordinator", st.coordinator_up, st.coordinator_up ? (hostingHere(st) ? "hosting here" : "reachable") : "offline"],
     ["This Mac's agent", st.agent_running,
-      !st.agent_running ? "not contributing" : st.agent_draining ? "stopping" : `${agentActivity(st)}${job}`],
+      !st.agent_running ? "not contributing" : agentRestarting(st) ? "restarting" : st.agent_draining ? "stopping"
+        : `${agentActivity(st)}${job}`],
     ["Macs in pool", (st.nodes || 0) > 0, st.coordinator_up ? String(st.nodes || 0) : "—"],
     ["Jobs", (st.jobs || 0) > 0, st.coordinator_up ? String(st.jobs || 0) : "—"],
     ["LLM node", !!st.inference_running, st.inference_running ? llmNodeState(st) : "not serving"],
@@ -1266,7 +1305,12 @@ function uploadModel(file) {
   const l = state.llm;
   if (l.upload) return setMsg("#l-upmsg", `Still sending ${l.upload.name}; one upload at a time.`, "bad");
   if (!/\.gguf$/i.test(file.name)) return setMsg("#l-upmsg", "Pick a .gguf model file.", "bad");
+  // Said before a byte goes: a refusal mid-upload reaches the window as a reset connection, not a reason.
+  if (!status().coordinator_up) return setMsg("#l-upmsg", "Start or join a pool first (Pool tab).", "bad");
   if (status().inference_supported === false) return setMsg("#l-upmsg", OUTDATED_COORDINATOR, "bad");
+  if (file.size > MAX_UPLOAD_GIB * GIB) {
+    return setMsg("#l-upmsg", `${file.name} is ${fmtBytes(file.size)}: no Mac pool loads a GGUF over ${MAX_UPLOAD_GIB} GB.`, "bad");
+  }
   const pooled = ((l.net && l.net.nodes) || []).filter((n) => n.online).reduce((sum, n) => sum + (Number(n.committed_gb) || 0), 0);
   const needs = file.size / GIB;
   const tooBig = l.net && needs > pooled
@@ -1333,11 +1377,18 @@ async function withBusy(key, button, busyText, fn) {
   }
 }
 
-// /api/start stores the settings it is given: a poll begun before it may not bring the old ones back.
+// /api/start lays the body over the stored settings and starts from the result, so only the keys an
+// action means to change travel (mode, address, what this Mac lends): a copy of every setting would
+// carry values a save still waiting its turn is about to replace. A poll begun before it may not
+// bring the old ones back.
 function startWith(body) {
   state.settingsVersion += 1;
-  return post("/api/start", { ...state.settings, ...body });
+  return post("/api/start", body);
 }
+
+// "Connected to …", with the controller's note when what this Mac lends restarts on the new pool.
+const connectedNote = (ov, snap) => `Connected to ${ov.status.coordinator_url}`
+  + (isRestartNote(snap.last_error) ? `. ${snap.last_error}` : "");
 
 // What this Mac lends right now, kept as it is when the pool it lends to changes.
 const lending = (st) => ({
@@ -1358,7 +1409,8 @@ function serveLlm(btn, on, changes = {}) {
     });
     state.settingsVersion += 1;   // a poll begun before this answer may not undo it
     state.settings = pickSettings(snap);
-    if (snap.last_error) toast(snap.last_error, "bad");
+    if (isRestartNote(snap.last_error)) toast(snap.last_error);
+    else if (snap.last_error) toast(snap.last_error, "bad");
     else if (on && !snap.inference_running) toast("The LLM node did not start: see ~/.slashcompute/logs/inference.log.", "bad");
     else toast(on ? "Serving. This Mac hosts LLM layers whenever a chat needs them."
       : "Stopped serving. The current reply finishes first.");
@@ -1366,9 +1418,9 @@ function serveLlm(btn, on, changes = {}) {
 }
 
 // Joining another pool stops the coordinator hosted here once that pool answers: ask first.
-function leaveHostedPool() {
+function leaveHostedPool(what = "Connecting") {
   return status().coordinator_pid == null || window.confirm(
-    "Connecting stops the pool hosted on this Mac. Macs that joined it lose their coordinator. Continue?");
+    `${what} stops the pool hosted on this Mac. Macs that joined it lose their coordinator. Continue?`);
 }
 
 const actions = {
@@ -1401,8 +1453,11 @@ const actions = {
         toast("Stopped contributing. The current step finishes first.");
         return;
       }
+      // Lending to another pool stops a coordinator still hosted here, as Connect does: ask first.
+      if ((state.settings || {}).mode !== "host" && !leaveHostedPool("Contributing to another pool")) return;
       const snap = await startWith({ contribute: true, training: true });
-      if (snap.last_error) toast(snap.last_error, "bad");
+      if (isRestartNote(snap.last_error)) toast(snap.last_error);
+      else if (snap.last_error) toast(snap.last_error, "bad");
       else toast("Contributing. This Mac picks up work whenever the pool has some.");
     });
   },
@@ -1412,7 +1467,8 @@ const actions = {
     const keep = lending(status());
     return withBusy("pool", btn, "Starting…", async () => {
       const snap = await startWith({ ...keep, mode: "host" });
-      if (snap.last_error) toast(snap.last_error, "bad");
+      if (isRestartNote(snap.last_error)) toast(`Pool is up. ${snap.last_error}`);
+      else if (snap.last_error) toast(snap.last_error, "bad");
       else toast("Pool is up. Share this Mac's address with the others.");
     });
   },
@@ -1428,13 +1484,13 @@ const actions = {
     return withBusy("connect", btn, "Connecting…", async () => {
       const url = $("#url").value.trim();
       if (!url) throw new Error("Enter the host Mac's address, or press Find on LAN.");
+      if (!leaveHostedPool()) return;   // declined: the typed address stays, polls still leave it alone
       state.dirty.url = false;
-      if (!leaveHostedPool()) return;
       const snap = await startWith({ ...keep, mode: "join", url });
-      if (snap.last_error) throw new Error(snap.last_error);
+      if (snap.last_error && !isRestartNote(snap.last_error)) throw new Error(snap.last_error);
       const ov = await api("/api/overview");
       if (!ov.status.coordinator_up) throw new Error(`No coordinator answering at ${ov.status.coordinator_url}.`);
-      toast(`Connected to ${ov.status.coordinator_url}`);
+      toast(connectedNote(ov, snap));
     });
   },
 
@@ -1444,15 +1500,17 @@ const actions = {
       const url = $("#public-url").value.trim() || status().public_url || "";
       if (!url) throw new Error("Enter the public coordinator URL.");
       state.dirty.publicUrl = false;
-      // The sign-in goes to the pool at this address: store it first, or there is nothing to sign in to.
+      // The sign-in goes to the pool at this address: store it first, or there is nothing to sign in
+      // to, then ask that pool whether the stored session is one of its own.
       await saveSettings({ mode: "public", url });
+      await loadAuth();
       if (!signedIn()) throw new Error("Sign in first (in the sidebar), then press Connect.");
       if (!leaveHostedPool()) return;
       const snap = await startWith({ ...keep, mode: "public", url });
-      if (snap.last_error) throw new Error(snap.last_error);
+      if (snap.last_error && !isRestartNote(snap.last_error)) throw new Error(snap.last_error);
       const ov = await api("/api/overview");
       if (!ov.status.coordinator_up) throw new Error(`No coordinator answering at ${ov.status.coordinator_url}.`);
-      toast(`Connected to ${ov.status.coordinator_url}`);
+      toast(connectedNote(ov, snap));
     });
   },
 
@@ -1501,18 +1559,22 @@ const actions = {
   }),
 
   logout: (btn) => withBusy("auth", btn, "Signing out…", async () => {
-    await post("/api/coord/auth/logout", {});
-    await saveSettings({ session_token: "" });
-    state.user = null;
-    state.credits = null;
-    $("#auth-password").value = "";
-    // Back to the sign-in form, even if this session started with a registration.
-    state.authMode = "login";
-    const mode = document.querySelector("[data-act='auth-mode']");
-    if (mode) mode.textContent = "Create account";
-    // The grant board is per user (admin review queue, pledges): rebuild it
-    // so nothing from the old session stays on screen.
-    $("#g-request").hidden = true;
+    try {
+      await post("/api/coord/auth/logout", {});
+    } finally {
+      // The stored session goes even when the pool did not answer: nothing here may keep earning for it.
+      await saveSettings({ session_token: "" });
+      state.user = null;
+      state.credits = null;
+      $("#auth-password").value = "";
+      // Back to the sign-in form, even if this session started with a registration.
+      state.authMode = "login";
+      const mode = document.querySelector("[data-act='auth-mode']");
+      if (mode) mode.textContent = "Create account";
+      // The grant board is per user (admin review queue, pledges): rebuild it
+      // so nothing from the old session stays on screen.
+      $("#g-request").hidden = true;
+    }
     await loadGrants();
     toast("Signed out.");
   }),
@@ -1595,14 +1657,25 @@ document.addEventListener("click", async (e) => {
 function bindSlider(el, onInput, onChange) {
   const key = el.id;
   let moved = false;
-  el.addEventListener("pointerdown", () => state.dragging.add(key));
+  let start = null;   // the value under the thumb when the press began
+  el.addEventListener("pointerdown", () => {
+    start = el.value;
+    state.dragging.add(key);
+  });
   el.addEventListener("input", () => {
     moved = true;
     state.dragging.add(key);
     onInput(el);
   });
-  // A press that never moved the thumb fires no change: let the next poll sync it again.
-  const release = () => { if (!moved) state.dragging.delete(key); };
+  // A press that never moved the thumb, or a drag that came back to where it began, fires no change:
+  // release the slider here so polls sync it again (a drag that did move is released by its change).
+  const release = () => {
+    if (moved && el.value !== start) return;
+    const wandered = moved;
+    moved = false;
+    state.dragging.delete(key);
+    if (wandered) render();   // the split's input wrote the value into settings: draw from them again
+  };
   window.addEventListener("pointerup", release);
   window.addEventListener("pointercancel", release);
   el.addEventListener("change", async () => {
@@ -1689,7 +1762,7 @@ $("#job-form").addEventListener("submit", (e) => {
   msg.dataset.sticky = "1";
   return withBusy("submit", $("#job-submit"), "Uploading…", async () => {
     try {
-      const job = await api("/api/coord/jobs/upload", { method: "POST", body });
+      const job = await api("/api/coord/jobs/upload", { method: "POST", body, timeout: 0 });
       setMsg("#job-msg", `Submitted job ${String(job.id).slice(0, 8)}. It starts when enough Macs are free.`, "ok");
       toast("Job submitted");
     } catch (err) {
@@ -1766,7 +1839,13 @@ $("#l-log").addEventListener("click", (e) => {
 
 // A file dropped anywhere but a picker must not replace the dashboard with it (pywebview hands the
 // drop to WKWebView, which would navigate to the file).
-window.addEventListener("dragover", (e) => e.preventDefault());
-window.addEventListener("drop", (e) => e.preventDefault());
+// Text dragged into a field is left to the browser.
+const guardFileDrop = (e) => {
+  const types = e.dataTransfer && e.dataTransfer.types;
+  if (types && Array.from(types).includes("Files")) e.preventDefault();
+};
+window.addEventListener("dragover", guardFileDrop);
+window.addEventListener("drop", guardFileDrop);
 
+renderGate();   // nothing that saves is usable before the first overview answers
 poll();   // each poll schedules the next once it has finished (see poll())

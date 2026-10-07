@@ -1,6 +1,8 @@
 import json
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,13 @@ from slashcompute.launcher.controller import Launcher, LauncherSettings, statele
 from slashcompute.web.server import create_shell
 
 SHELL = "http://127.0.0.1:8766"   # the shell refuses any Host but loopback
+
+
+@pytest.fixture(autouse=True)
+def _unknown_cmdlines(monkeypatch):
+    """The fake pids in these tests belong to no process (or, worse, to some unrelated real one):
+    their command lines are unreadable, which leaves the pid files trusted as before."""
+    monkeypatch.setattr("slashcompute.launcher.controller.process_cmdline", lambda pid: None)
 
 
 class FakeProc:
@@ -212,6 +221,8 @@ def test_start_stop_and_discover(tmp_path, monkeypatch):
     app, launcher, spawned = _shell(tmp_path, http=http)
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive",
                         lambda pid: any(p.pid == pid for p in spawned))
+    killed = []   # Stop SIGTERMs the fake coordinator's pid: a real process 5001 must never get it
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: killed.append((pid, sig)))
 
     def health_after(url):
         if spawned:
@@ -227,6 +238,7 @@ def test_start_stop_and_discover(tmp_path, monkeypatch):
         found = c.post("/api/discover").json()
         assert found["url"] == "http://10.0.0.9:8765"
         c.post("/api/stop")
+    assert (spawned[0].pid, 15) in killed
 
 
 def test_join_start_requires_url(tmp_path):
@@ -358,15 +370,28 @@ def test_overview_keeps_the_last_good_lists_when_a_fetch_times_out(tmp_path):
     assert gone["pool"]["online"] is False and gone["pool"]["jobs"] == [] and gone["leaderboard"] == []
 
 
-def test_overview_lists_the_newest_fifty_jobs_but_counts_them_all(tmp_path):
-    jobs = [{"id": f"j{i}", "status": "running" if i < 55 else "completed", "steps": 10,
-             "progress_step": 1, "submitted_at": i} for i in range(60)]
-    app, launcher, _ = _shell(tmp_path, http=RoutedHTTP({**POOL, "/jobs": jobs}))
+def test_overview_lists_fifty_jobs_but_never_hides_one_that_can_still_be_cancelled(tmp_path):
+    """The newest fifty, except that a job still queued or running stays listed however old it is:
+    its Cancel button used to vanish once fifty newer jobs had finished. Every job is counted."""
+    jobs = [{"id": f"j{i}", "status": "completed", "steps": 10, "progress_step": 10, "submitted_at": i}
+            for i in range(60)]
+    jobs[0].update(status="queued", progress_step=0)      # the oldest of all, still waiting
+    jobs[7].update(status="running", progress_step=3)
+    http = RoutedHTTP({**POOL, "/jobs": jobs})
+    app, launcher, _ = _shell(tmp_path, http=http)
     launcher.save_settings(LauncherSettings(mode="host"))
     with TestClient(app, base_url=SHELL) as c:
         ov = c.get("/api/overview").json()
-    assert [j["id"] for j in ov["pool"]["jobs"]][:3] == ["j59", "j58", "j57"]
-    assert len(ov["pool"]["jobs"]) == 50
+        ids = [j["id"] for j in ov["pool"]["jobs"]]
+        assert len(ids) == 50 and ids[:3] == ["j59", "j58", "j57"]
+        assert ids[-2:] == ["j7", "j0"]                               # kept, in order
+        assert [j["can_cancel"] for j in ov["pool"]["jobs"][-2:]] == [True, True]
+        assert "j12" in ids and "j11" not in ids                      # finished ones fill the rest
+        assert (ov["pool"]["capacity"]["running"], ov["pool"]["capacity"]["waiting"]) == (1, 1)
+        # More than fifty unfinished: all of them are listed.
+        http.routes["/jobs"] = [{**j, "status": "running"} for j in jobs[:55]] + jobs[55:]
+        ov = c.get("/api/overview").json()
+    assert len(ov["pool"]["jobs"]) == 55 and all(j["can_cancel"] for j in ov["pool"]["jobs"])
     assert ov["pool"]["capacity"]["running"] == 55
 
 
@@ -484,15 +509,25 @@ def test_proxy_never_keeps_a_cookie_but_lends_the_stored_session(tmp_path, monke
                 "email": "ada@lan.test", "password": "password1", "name": "Ada"})
             assert r.status_code == 200, r.text
             assert "slashcompute_session=" in r.headers.get("set-cookie", "")
+            # The shell stored the token as it relayed the reply: a poll before the window has saved
+            # it is already signed in (the board used to flicker to Sign in in between).
+            assert c.get("/api/settings").json()["has_session"] is True
+            assert launcher.load_settings().session_token == r.json()["token"]
             c.post("/api/settings", json={"session_token": r.json()["token"]})   # as the window does
             assert c.get("/api/coord/auth/me").json()["user"]["email"] == "ada@lan.test"
-            # pywebview's private mode drops cookies between launches: the launcher's copy, bound to
-            # this pool, signs the window back in as a Bearer token the coordinator accepts.
+            # The window's cookie is never what signs it in: the launcher's copy, bound to this
+            # pool, does, as a Bearer token the coordinator accepts.
             c.cookies.clear()
             assert c.get("/api/coord/auth/me").json()["user"]["email"] == "ada@lan.test"
             # Signed out: nothing stored and nothing in the browser leaves nothing to lend.
             c.post("/api/settings", json={"session_token": ""})
             assert c.get("/api/coord/auth/me").json()["user"] is None
+            # A stored token the pool does not know (it expired, or the coordinator's database was
+            # reset) is dropped the first time the pool says so, not lent forever.
+            c.post("/api/settings", json={"session_token": "from-before-the-reset"})
+            assert c.get("/api/settings").json()["has_session"] is True
+            assert c.get("/api/coord/auth/me").json()["user"] is None
+            assert c.get("/api/settings").json()["has_session"] is False
         assert not launcher._http.cookies
 
 
@@ -508,16 +543,19 @@ class HeaderHTTP(FakeHTTP):
         return super().get(url, timeout, params, headers)
 
 
-def test_proxy_sends_the_session_cookie_only_to_the_pool_that_issued_it(tmp_path):
+def test_proxy_lends_the_stored_session_to_its_pool_and_never_the_browsers_cookie(tmp_path):
     http = HeaderHTTP()
     app, launcher, _ = _shell(tmp_path, http=http)
     pool_a = LauncherSettings(mode="join", url="10.0.0.1")
     launcher.save_settings(launcher.with_session(pool_a, "tok-a"))
     with TestClient(app, base_url=SHELL) as c:
-        # Only the session cookie goes through, never the rest of the browser's cookies.
-        c.get("/api/coord/auth/me", headers={"cookie": "theme=dark; slashcompute_session=tok-a"})
-        assert http.seen[-1] == {"cookie": "slashcompute_session=tok-a"}
-        # No cookie (a private-mode window): the stored session for this pool signs it in.
+        # The stored session signs the window in, cookie or no cookie. pywebview on macOS ignores
+        # storage_path, so the WKWebView jar is shared by every home on this Mac and may hold a stale
+        # token from another one: forwarded, it used to shadow the valid stored token.
+        c.get("/api/coord/auth/me", headers={"cookie": "theme=dark; slashcompute_session=stale-other-home"})
+        assert http.seen[-1] == {"authorization": "Bearer tok-a"}
+        c.get("/api/coord/auth/me", headers={"cookie": "slashcompute_session=tok-a"})
+        assert http.seen[-1] == {"authorization": "Bearer tok-a"}
         c.get("/api/coord/auth/me")
         assert http.seen[-1] == {"authorization": "Bearer tok-a"}
         # The browser's own Authorization wins over the stored session.
@@ -533,7 +571,158 @@ def test_proxy_sends_the_session_cookie_only_to_the_pool_that_issued_it(tmp_path
         # Back on pool A everything is as it was.
         c.post("/api/settings", json={"mode": "join", "url": "10.0.0.1"})
         c.get("/api/coord/auth/me", headers={"cookie": "slashcompute_session=tok-a"})
-        assert http.seen[-1] == {"cookie": "slashcompute_session=tok-a"}
+        assert http.seen[-1] == {"authorization": "Bearer tok-a"}
+
+
+def _json_response(payload, status: int = 200):
+    raw = json.dumps(payload).encode()
+
+    class R:
+        status_code = status
+        content = raw
+        headers = {"content-type": "application/json"}
+
+        def json(self_inner):
+            return payload
+    return R()
+
+
+class SessionHTTP:
+    """A coordinator that knows which session tokens are live, as the real one behaves: /auth/me
+    answers 200 {user: null} for a token it does not know (never 401); a sign-in issues "fresh";
+    `strict` paths 401 an unknown Bearer but answer a stranger; `private` paths 401 anyone unknown.
+    Every call's headers are recorded."""
+
+    def __init__(self, live=("sess",), strict=(), private=()) -> None:
+        self.live, self.strict, self.private = set(live), set(strict), set(private)
+        self.seen: list[dict] = []
+
+    @staticmethod
+    def _path(url: str) -> str:
+        return "/" + url.split("://", 1)[-1].split("/", 1)[-1].split("?")[0]
+
+    @staticmethod
+    def _bearer(headers) -> str | None:
+        auth = (headers or {}).get("authorization", "")
+        return auth[7:] if auth.lower().startswith("bearer ") else None
+
+    def get(self, url: str, timeout: float = 1.0, params=None, headers=None):
+        self.seen.append(dict(headers or {}))
+        path, token = self._path(url), self._bearer(headers)
+        if path == "/auth/me":
+            return _json_response({"user": {"id": "u1", "email": "ada@lan.test"} if token in self.live else None})
+        if path in self.private and token not in self.live:
+            return _json_response({"detail": "Sign in first."}, 401)
+        if path in self.strict and token is not None and token not in self.live:
+            return _json_response({"detail": "Sign in first."}, 401)
+        return _json_response({"ok": True, "path": path})
+
+    def post(self, url: str, content=None, headers=None, timeout: float = 1.0, **_):
+        self.seen.append(dict(headers or {}))
+        path = self._path(url)
+        if path in ("/auth/login", "/auth/register", "/auth/google"):
+            if json.loads(content or b"{}").get("password") == "wrong":
+                return _json_response({"detail": "Wrong password."}, 401)
+            self.live.add("fresh")
+            return _json_response({"user": {"id": "u1", "email": "ada@lan.test"}, "token": "fresh"})
+        return _json_response({"detail": "not found"}, 404)
+
+
+def test_proxy_forgets_a_stored_session_its_pool_no_longer_knows(tmp_path):
+    """A token that expired, or from before the coordinator's database was reset, used to be lent to
+    every request forever: /auth/me kept answering {user: null} (it never 401s) and every submit
+    "Sign in first.", with nothing to clear it but a manual sign-out."""
+    http = SessionHTTP(live=["sess"])
+    app, launcher, _ = _shell(tmp_path, http=http)
+    launcher.save_settings(launcher.with_session(LauncherSettings(mode="host"), "stale"))
+    with TestClient(app, base_url=SHELL) as c:
+        assert c.get("/api/settings").json()["has_session"] is True
+        assert c.get("/api/coord/auth/me").json()["user"] is None
+        assert http.seen[-1] == {"authorization": "Bearer stale"}
+        assert c.get("/api/settings").json()["has_session"] is False
+        c.get("/api/coord/auth/me")
+        assert http.seen[-1] == {}                                  # nothing dead is lent again
+        # A live token stays stored, and so does one the browser answered for itself: when the
+        # window sends its own Authorization the shell lent nothing and learns nothing.
+        launcher.save_settings(launcher.with_session(launcher.load_settings(), "sess"))
+        assert c.get("/api/coord/auth/me").json()["user"]["email"] == "ada@lan.test"
+        assert c.get("/api/coord/auth/me", headers={"authorization": "Bearer stranger"}).json()["user"] is None
+        assert c.get("/api/settings").json()["has_session"] is True
+    assert launcher.load_settings().session_token == "sess"
+
+
+def test_proxy_retries_a_refused_lent_token_as_a_stranger(tmp_path):
+    """A 401 to a request the shell signed in itself: asked again without the token, an answer means
+    the token was what was wrong, so it is dropped. A route that needs a sign-in 401s both times
+    and the token is kept (the next /auth/me poll settles it)."""
+    http = SessionHTTP(live=[], strict=["/grants"], private=["/auth/me/nodes"])
+    app, launcher, _ = _shell(tmp_path, http=http)
+    launcher.save_settings(launcher.with_session(LauncherSettings(mode="host"), "stale"))
+    with TestClient(app, base_url=SHELL) as c:
+        r = c.get("/api/coord/auth/me/nodes")
+        assert r.status_code == 401 and "Sign in" in r.json()["detail"]
+        assert [h.get("authorization") for h in http.seen] == ["Bearer stale", None]
+        assert launcher.load_settings().session_token == "stale"
+        http.seen.clear()
+        r = c.get("/api/coord/grants")
+        assert r.status_code == 200 and r.json()["path"] == "/grants"
+        assert [h.get("authorization") for h in http.seen] == ["Bearer stale", None]
+        assert launcher.load_settings().session_token == ""
+        http.seen.clear()
+        assert c.get("/api/coord/grants").status_code == 200
+        assert http.seen == [{}]                                    # one try, nothing to lend
+
+
+def test_proxy_stores_the_session_a_sign_in_issues_as_it_relays_the_reply(tmp_path):
+    """The window saves the token itself, after the reply; a poll in between found no stored session
+    and the board flickered to Sign in. Stored at once, the next poll is signed in and a sign-out
+    revokes the right token."""
+    http = SessionHTTP(live=[])
+    app, launcher, _ = _shell(tmp_path, http=http)
+    launcher.save_settings(LauncherSettings(mode="join", url="10.0.0.1"))
+    with TestClient(app, base_url=SHELL) as c:
+        r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "wrong"})
+        assert r.status_code == 401 and launcher.load_settings().session_token == ""
+        r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "password1"})
+        assert r.status_code == 200 and r.json()["token"] == "fresh"
+        s = launcher.load_settings()
+        assert (s.session_token, s.session_url) == ("fresh", "http://10.0.0.1:8765")
+        assert c.get("/api/settings").json()["has_session"] is True
+        c.cookies.clear()
+        assert c.get("/api/coord/auth/me").json()["user"]["email"] == "ada@lan.test"
+        assert http.seen[-1] == {"authorization": "Bearer fresh"}
+        # The window's own save of the same token changes nothing (and re-binds what runs here).
+        assert c.post("/api/settings", json={"session_token": "fresh"}).json()["has_session"] is True
+        # Another pool never sees it.
+        c.post("/api/settings", json={"mode": "join", "url": "10.0.0.2"})
+        c.get("/api/coord/auth/me")
+        assert http.seen[-1] == {}
+
+
+@pytest.mark.parametrize("path", ["/api/overview", "/api/coord/auth/me"])
+def test_launcher_calls_stay_off_the_event_loop(tmp_path, path):
+    """Start and Start serving hold the launcher's lock for seconds. A handler that read the settings
+    on the event loop waited there, and with the loop the whole window froze: polls, static files,
+    the chat stream. While one request is stuck in the launcher, another must still be answered."""
+    app, launcher, _ = _shell(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.save_settings(LauncherSettings(mode="host"))
+    real, inside = launcher.load_settings, threading.Event()
+
+    def held_up():
+        inside.set()
+        time.sleep(0.4)          # a Start holding the lock
+        return real()
+
+    launcher.load_settings = held_up
+    with TestClient(app, base_url=SHELL) as c:
+        stuck = threading.Thread(target=lambda: c.get(path))
+        stuck.start()
+        assert inside.wait(5)
+        t0 = time.monotonic()
+        assert c.get("/api/shell").status_code == 200
+        quick = time.monotonic() - t0
+        stuck.join()
+    assert quick < 0.15, f"the shell froze for {quick:.2f}s while a handler waited on the launcher"
 
 
 def test_partial_settings_keep_the_stored_fields(tmp_path):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import ipaddress
 import json
 import os
 import signal
@@ -45,9 +46,18 @@ PORT_IN_USE = "Port {port} is already in use — quit the other /compute or coor
 AGENT_RESTARTING = ("Restarting the training agent after the current step finishes; "
                     "the new settings apply then.")
 NODE_RESTARTING = "Restarting the LLM node after the current step finishes; the new settings apply then."
+# An agent asked to stop drains its step for the grace period (daemon.shutdown waits that long),
+# then has this much longer to exit before it counts as hung and is killed.
+AGENT_STOP_MARGIN_S = 30.0
+AGENT_FORCE_STOPPED = ("The training agent did not stop within {seconds:.0f} s and was force-stopped; "
+                       "Start again to keep contributing.")
+RESOLVE_TIMEOUT_S = 1.5   # a name that takes longer to resolve (DNS or mDNS away) is not one of ours
 AGENT_MODULE = "slashcompute.agent.main"
+COORDINATOR_MODULE = "slashcompute.coordinator.main"
 INFERENCE_MODULE = "slashcompute.inference.node"
 HEALTH_COUNTS = ("nodes", "jobs", "inference_nodes")
+# Where a server bound to 0.0.0.0 (as our coordinator is) answers besides its interfaces.
+LOCAL_HOSTS = frozenset({"0.0.0.0", "::", "127.0.0.1", "::1", "localhost"})
 
 
 def stateless_http(**kw: Any) -> httpx.Client:
@@ -281,6 +291,67 @@ def port_free(host: str, port: int) -> bool:
     return True
 
 
+def canonical_ip(text: str) -> Optional[str]:
+    """`text` as the one spelling of an IP address (`::1`, not `0:0:0:0:0:0:0:1`; a link-local
+    `%en0` scope dropped), or None when it is not one."""
+    try:
+        return str(ipaddress.ip_address(text.strip("[]").split("%", 1)[0]))
+    except ValueError:
+        return None
+
+
+def local_addresses() -> set[str]:
+    """Every name and address this Mac answers on: each interface's addresses (LAN, VPN, link-local),
+    loopback, the wildcard, and its hostname with the `.local` form Bonjour gives it. Lower-cased."""
+    own = set(LOCAL_HOSTS)
+    try:
+        for entries in psutil.net_if_addrs().values():
+            for entry in entries:
+                if entry.family in (socket.AF_INET, socket.AF_INET6) and (ip := canonical_ip(entry.address)):
+                    own.add(ip)
+    except (psutil.Error, OSError):
+        pass
+    try:
+        name = socket.gethostname().lower()
+    except OSError:
+        name = ""
+    if name:
+        short = name.split(".")[0]
+        own |= {name, short, f"{short}.local"}
+    return own
+
+
+def resolve_host(host: str, timeout: Optional[float] = None) -> set[str]:
+    """The addresses `host` names: an IP literal is itself; a name is looked up on a thread we stop
+    waiting for after `timeout` (getaddrinfo has none of its own), so a dead DNS or a `.local`
+    name nobody answers for cannot hang a Start."""
+    if (ip := canonical_ip(host)) is not None:
+        return {ip}
+    resolved: list[set[str]] = []
+
+    def lookup() -> None:
+        try:
+            infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except (OSError, UnicodeError):
+            infos = []
+        resolved.append({ip for info in infos if (ip := canonical_ip(str(info[4][0])))})
+
+    thread = threading.Thread(target=lookup, name="resolve-host", daemon=True)
+    thread.start()
+    thread.join(RESOLVE_TIMEOUT_S if timeout is None else timeout)
+    return resolved[0] if resolved else set()
+
+
+def signal_child(proc: Any, sig: int) -> None:
+    """Signal a process through the Popen we spawned it with: it knows the pid is still its
+    child's (never reused until reaped), where a bare os.kill on a recorded pid does not. A
+    stand-in without send_signal cannot be signalled."""
+    send = getattr(proc, "send_signal", None)
+    if send is not None:
+        with contextlib.suppress(OSError):
+            send(sig)
+
+
 class Launcher:
     def __init__(
         self,
@@ -288,7 +359,7 @@ class Launcher:
         python: Optional[str] = None,
         popen: PopenFn = subprocess.Popen,
         http: Optional[httpx.Client] = None,
-        discover_fn: Callable[[float], Optional[str]] = discover,
+        discover_fn: Optional[Callable[[float], Optional[str]]] = None,
         lan_ip_fn: Callable[[], str] = lan_ip,
         memory_fn: Callable[[], tuple[int, int]] = system_memory,
         port_free_fn: Callable[[str, int], bool] = port_free,
@@ -301,19 +372,24 @@ class Launcher:
         self.python = python or sys.executable
         self._popen = popen
         self._http = http or stateless_http()
-        self._discover = discover_fn
+        # While hosting, the first advertisement to answer is our own coordinator: take the first
+        # that is not (``discover`` is looked up when called, so tests can stand one in).
+        self._discover = discover_fn or (lambda timeout: discover(timeout, exclude=self.is_own_url))
         self._lan_ip = lan_ip_fn
         self._memory = memory_fn
         self._port_free = port_free_fn
         self.last_error = ""
         # One launcher serves every request thread of the shell: starts, stops and the status polls
         # that reap and restart processes take this lock (re-entrant: start() ends in snapshot()).
+        # Reading the settings never does: a start holds the lock for up to ~25 s while the async
+        # handlers (the proxy) load them on the event loop, and launcher.json is replaced atomically.
         self._lock = threading.RLock()
         self._coordinator_proc: Any = None      # the coordinator this launcher spawned, while it runs
         self._coordinator_log_at = 0            # coordinator.log size when it was spawned
         self._stopping: list[Any] = []          # processes we stopped, reaped once they exit
         self._agent_proc: Any = None            # the training agent we spawned, reaped when it exits
         self._agent_stop_pid: Optional[int] = None   # the agent we asked to stop, until it has
+        self._agent_stop_at: Optional[float] = None  # when we asked (monotonic), for the hung check
         self._inference_proc: Any = None        # the LLM node we spawned, to report its exit
         self._inference_log_at = 0
         # A restart that could not happen yet (the old process still finishes its step): what to
@@ -337,10 +413,9 @@ class Launcher:
         return d
 
     def load_settings(self) -> LauncherSettings:
-        with self._lock:
-            return self._load_settings()
-
-    def _load_settings(self) -> LauncherSettings:
+        """The saved settings. Lock-free: write_private replaces launcher.json atomically, so a
+        reader sees the old or the new file, never a partial one — and the shell's event loop
+        must never wait behind a Start holding the lock."""
         if not self.settings_path.exists():
             return LauncherSettings()
         try:
@@ -373,7 +448,7 @@ class Launcher:
     def save_settings(self, settings: LauncherSettings) -> None:
         s = settings.clamp()
         with self._lock:
-            before = self._load_settings()
+            before = self.load_settings()
             if (s.mode, s.url) != (before.mode, before.url):
                 self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
             write_private(self.settings_path, json.dumps(asdict(s), indent=2) + "\n")
@@ -408,7 +483,7 @@ class Launcher:
         return self.coordinator_url(s)
 
     def coordinator_argv(self, transport: str = "direct") -> list[str]:
-        argv = [self.python, "-m", "slashcompute.coordinator.main", "serve",
+        argv = [self.python, "-m", COORDINATOR_MODULE, "serve",
                 "--home", str(self.home)]
         if transport != "direct":
             argv.extend(["--inference-transport", transport])
@@ -595,6 +670,9 @@ class Launcher:
         self.wait_health(self.proxy_url(settings))
 
     def read_coordinator_pid(self) -> Optional[int]:
+        """Our coordinator's pid from coordinator.pid, or None (and no file) when the process it
+        names is gone, began after the file was written, or is not our coordinator for this home:
+        a stale pid reused by another program is neither reported as ours nor ever signalled."""
         if not self.coordinator_pid_path.exists():
             return None
         try:
@@ -602,7 +680,8 @@ class Launcher:
             written = self.coordinator_pid_path.stat().st_mtime
         except (OSError, ValueError):
             return None
-        if process_alive(pid) and not started_after(pid, written):
+        if (process_alive(pid) and not started_after(pid, written)
+                and self._owned_process(pid, COORDINATOR_MODULE)):
             return pid
         self.coordinator_pid_path.unlink(missing_ok=True)
         return None
@@ -613,7 +692,7 @@ class Launcher:
         pids = []
         for proc in psutil.process_iter(["cmdline", "status"]):
             argv = proc.info["cmdline"] or []
-            if (proc.info["status"] != psutil.STATUS_ZOMBIE and "slashcompute.coordinator.main" in argv
+            if (proc.info["status"] != psutil.STATUS_ZOMBIE and COORDINATOR_MODULE in argv
                     and "serve" in argv and "--home" in argv[:-1]
                     and argv[argv.index("--home") + 1] == str(self.home)):
                 pids.append(proc.pid)
@@ -694,7 +773,8 @@ class Launcher:
 
     def find_on_lan(self, timeout: float = 5.0) -> Optional[str]:
         """The first coordinator advertised on the LAN that is not the one hosted on this Mac
-        (Connect would join it only for start(join) to stop hosting it)."""
+        (Connect would join it only for start(join) to stop hosting it). While hosting, ours is
+        the first to answer: discovery keeps listening past it until `timeout`."""
         found = self._discover(timeout)
         if not found:
             return None
@@ -702,14 +782,20 @@ class Launcher:
         return None if self.is_own_url(url) else url
 
     def is_own_url(self, url: str) -> bool:
-        """Whether `url` is this Mac's own coordinator address: its LAN ip or loopback, on our port."""
+        """Whether `url` is this Mac's own coordinator: on our port, at any address or name this
+        Mac answers on — an interface (LAN, VPN), loopback, 0.0.0.0, `my-mac.local` or another
+        name resolving to one of them. The LAN ip and loopback alone missed the rest, and
+        start(join) then stopped the very pool it had just joined."""
         try:
             parts = urlsplit(normalize_url(url, self.cfg.coordinator_port))
             port = parts.port or {"https": 443}.get(parts.scheme, 80)
         except ValueError:
             return False
-        own_hosts = {self._lan_ip(), "127.0.0.1", "localhost", "::1"}
-        return (parts.hostname or "") in own_hosts and port == self.cfg.coordinator_port
+        host = (parts.hostname or "").lower()
+        if not host or port != self.cfg.coordinator_port:
+            return False
+        own = local_addresses() | {self._lan_ip()}
+        return (canonical_ip(host) or host) in own or bool(resolve_host(host) & own)
 
     def _ensure_coordinator(self, s: LauncherSettings, url: str) -> None:
         """Hosting: run our coordinator (with the chosen LLM transport) and wait for it to answer."""
@@ -815,10 +901,16 @@ class Launcher:
 
     def _request_agent_stop(self) -> None:
         """Ask our training agent to stop (it drains its step first); its exit is expected now."""
-        if self._agent_proc is not None:
-            self._stopping.append(self._agent_proc)
-            self._agent_proc = None
+        proc, self._agent_proc = self._agent_proc, None
+        if proc is not None:
+            self._stopping.append(proc)
         self._agent_stop_pid = self.paths.read_pid()
+        self._agent_stop_at = time.monotonic()
+        if self._agent_stop_pid is None and proc is not None and proc.poll() is None:
+            # Spawned moments ago, agent.pid not written yet: only its Popen can name it.
+            self._agent_stop_pid = int(proc.pid)
+            signal_child(proc, signal.SIGTERM)
+            return
         request_stop(self.paths)
 
     def _ensure_agent(self, argv: list[str], session: str) -> None:
@@ -873,10 +965,13 @@ class Launcher:
             return self.snapshot()
 
     def _stop_coordinator(self) -> None:
+        """Stop the coordinator hosted from this home, and only that: a pid from the pid file or
+        a command line is signalled only once it is confirmed ours (another home's pool, or a
+        program that inherited a stale pid, is never SIGTERMed)."""
         self._forget_coordinator()
         # Also those found by command line: Stop must not leave ours up when its pid file was lost.
         for pid in dict.fromkeys([self.read_coordinator_pid(), *self.find_coordinators()]):
-            if pid is None:
+            if pid is None or not self._owned_process(pid, COORDINATOR_MODULE):
                 continue
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -924,6 +1019,8 @@ class Launcher:
             agent = self.paths.read_status()
             agent_pid = self._agent_pid()
             agent_running = agent_pid is not None
+            if agent_running and self.paths.read_pid() != agent_pid:
+                agent = {}   # spawned moments ago: status.json is still the last run's
             draining = agent_running and (
                 bool(agent.get("draining")) or self._pending_agent is not None
                 or self._agent_stop_pid == agent_pid)
@@ -969,6 +1066,7 @@ class Launcher:
         self._stopping = [p for p in self._stopping if p.poll() is None]
         if self._agent_proc is not None and self._agent_proc.poll() is not None:
             self._agent_proc = None
+        self._force_stop_hung_agent()
 
     def _finish_pending(self) -> None:
         """Complete a restart that waited for the old agent or LLM node to finish its step."""
@@ -1007,20 +1105,42 @@ class Launcher:
             return []
 
     def _agent_pid(self) -> Optional[int]:
-        """The pid of our running training agent; a pid file left by one that is gone, or that now
-        names another program, is removed."""
+        """The pid of our running training agent: the one agent.pid names when that is ours, else
+        the one we spawned and have not asked to stop while it still runs (it writes agent.pid
+        only once its imports are done, seconds in which a second Start used to spawn another).
+        A pid file left by one that is gone, or that now names another program, is removed."""
         pid = self.paths.read_pid()
-        if pid is None:
-            return None
-        if not self._owned_process(pid, AGENT_MODULE):
+        if pid is not None and self._owned_process(pid, AGENT_MODULE):
+            return pid
+        if pid is not None:
             self.paths.clear_pid()
             if self._agent_stop_pid == pid:
-                self._agent_stop_pid = None
-            return None
-        return pid
+                self._agent_stop_pid = self._agent_stop_at = None
+        proc = self._agent_proc
+        return int(proc.pid) if proc is not None and proc.poll() is None else None
 
     def _agent_running(self) -> bool:
         return self._agent_pid() is not None
+
+    def _force_stop_hung_agent(self) -> None:
+        """An agent asked to stop drains its step for the grace period (daemon.shutdown waits that
+        long) and then exits; one still alive a margin later is hung and is killed, so the shell
+        does not say "Stopping…" for ever. Only our own agent is signalled (_agent_pid vouches for
+        the pid), and a restart that waited on it is dropped: last_error says what happened."""
+        pid, asked = self._agent_stop_pid, self._agent_stop_at
+        if pid is None or asked is None:
+            return
+        if self._agent_pid() != pid:                  # it is gone (or another agent runs now)
+            self._agent_stop_pid = self._agent_stop_at = None
+            return
+        limit = self.cfg.grace_period_s + AGENT_STOP_MARGIN_S
+        if time.monotonic() - asked < limit:
+            return
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+        self._agent_stop_pid = self._agent_stop_at = None
+        self._pending_agent = None
+        self.last_error = AGENT_FORCE_STOPPED.format(seconds=limit)
 
     def _spawn(self, argv: list[str], log_path: Path,
                pid_writer: Optional[Callable[[int], None]] = None, session: Optional[str] = None) -> Any:

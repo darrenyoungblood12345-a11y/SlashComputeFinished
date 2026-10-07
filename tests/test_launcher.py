@@ -1,15 +1,18 @@
 import json
 import signal
+import socket
 import stat
 import threading
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from slashcompute.launcher.controller import (
-    Launcher, LauncherError, LauncherSettings, health_timeout, launch_record, normalize_url, write_private,
+    AGENT_STOP_MARGIN_S, Launcher, LauncherError, LauncherSettings, health_timeout, launch_record,
+    normalize_url, write_private,
 )
 
 
@@ -18,6 +21,32 @@ def _unknown_cmdlines(monkeypatch):
     """The fake pids in these tests belong to no process: their command lines are unreadable, which
     leaves the pid files trusted as before. Tests of the ownership check set their own."""
     monkeypatch.setattr("slashcompute.launcher.controller.process_cmdline", lambda pid: None)
+
+
+def _this_mac(monkeypatch, interfaces: dict | None = None, hostname: str = "test-mac.local",
+              names: dict[str, list[str]] | None = None) -> None:
+    """What is_own_url sees of this Mac: its interfaces' addresses, its hostname, and the names
+    that resolve (none by default: no DNS or mDNS lookup ever leaves a test)."""
+    addrs = {ifname: [SimpleNamespace(family=socket.AF_INET6 if ":" in ip else socket.AF_INET, address=ip)
+                      for ip in ips] for ifname, ips in (interfaces or {}).items()}
+    resolves = {k.lower(): v for k, v in (names or {}).items()}
+
+    def getaddrinfo(host, port, *a, **kw):
+        if host.lower() not in resolves:
+            raise socket.gaierror(8, "nodename nor servname provided, or not known")
+        return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))
+                for ip in resolves[host.lower()]]
+
+    monkeypatch.setattr("slashcompute.launcher.controller.psutil.net_if_addrs", lambda: addrs)
+    monkeypatch.setattr("slashcompute.launcher.controller.socket.gethostname", lambda: hostname)
+    monkeypatch.setattr("slashcompute.launcher.controller.socket.getaddrinfo", getaddrinfo)
+
+
+@pytest.fixture(autouse=True)
+def _one_plain_mac(monkeypatch):
+    """By default this Mac has no interfaces beyond the injected lan_ip and resolves no names, so
+    is_own_url never depends on the machine running the tests."""
+    _this_mac(monkeypatch)
 
 
 def _fake_clock(monkeypatch) -> dict:
@@ -35,6 +64,7 @@ class FakeProc:
         self.argv = argv
         self.env = env or {}
         self.returncode = None   # set to make the process "exit"
+        self.signals: list[int] = []   # what the launcher sent through the Popen
 
     @property
     def session(self) -> str:
@@ -42,6 +72,9 @@ class FakeProc:
 
     def poll(self):
         return self.returncode
+
+    def send_signal(self, sig: int) -> None:
+        self.signals.append(sig)
 
 
 class FakeResponse:
@@ -884,6 +917,33 @@ def test_settings_are_rewritten_atomically(tmp_path):
     assert launcher.load_settings().session_token == "tok"
 
 
+def test_load_settings_never_waits_for_the_lock(tmp_path):
+    # start()/set_inference()/rebind_session() hold the lock for up to ~25 s while the shell's
+    # async handlers load the settings on the event loop: a locked read froze the whole shell.
+    launcher = _launcher(tmp_path)
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=75))
+    loaded: list = []
+    saved = threading.Event()
+
+    def read():
+        loaded.append(launcher.load_settings())
+
+    def write():
+        launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=80))
+        saved.set()
+
+    with launcher._lock:                       # a Start in progress on another thread
+        reader = threading.Thread(target=read)
+        reader.start()
+        reader.join(2)
+        assert not reader.is_alive() and loaded[0].gpu_percent == 75
+        writer = threading.Thread(target=write)
+        writer.start()
+        assert not saved.wait(0.3)             # writes still queue behind the state changes
+    assert saved.wait(2)
+    assert launcher.load_settings().gpu_percent == 80
+
+
 def test_concurrent_starts_spawn_one_coordinator(tmp_path, monkeypatch):
     # Two Start clicks reach the shared launcher on two threads: both used to pass the
     # "no coordinator.pid yet" check while the first coordinator was still being spawned.
@@ -970,6 +1030,38 @@ def test_a_pid_file_naming_another_program_is_not_our_agent_or_node(tmp_path, mo
     assert launcher.snapshot().agent_running
 
 
+def test_a_coordinator_pid_file_naming_another_program_is_not_ours_and_never_signalled(tmp_path, monkeypatch):
+    # coordinator.pid survives a crash or a reboot; the pid in it can then be any other program,
+    # which the UI called our pool and Stop (or joining another pool) SIGTERMed.
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.launcher.controller.started_after", lambda pid, when: False)
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    cmdlines = {111: ["/usr/bin/python3", "some_other_app.py"]}
+    monkeypatch.setattr("slashcompute.launcher.controller.process_cmdline", lambda pid: cmdlines.get(pid))
+
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    assert launcher.read_coordinator_pid() is None and not (tmp_path / "coordinator.pid").exists()
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    assert launcher.snapshot().coordinator_pid is None
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    launcher.stop()
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    launcher.start(LauncherSettings(mode="join", url="http://10.0.0.8:8765", training=False))
+    assert [k for k in kills if k[1] == signal.SIGTERM] == []
+
+    # A coordinator serving another home is not ours either; ours (this home) is.
+    cmdlines[111] = launcher.coordinator_argv()[:-1] + ["/elsewhere"]
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    assert launcher.read_coordinator_pid() is None
+    cmdlines[111] = launcher.coordinator_argv()
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    assert launcher.read_coordinator_pid() == 111 and launcher.snapshot().coordinator_pid == 111
+    launcher.stop()
+    assert (111, signal.SIGTERM) in kills
+
+
 # ------------------------------------------------------------ draining and the running share
 
 def test_status_reports_a_draining_agent_and_its_share(tmp_path, monkeypatch):
@@ -994,6 +1086,39 @@ def test_status_reports_a_draining_agent_and_its_share(tmp_path, monkeypatch):
     assert not snap.agent_running and not snap.agent_draining and snap.agent_gpu_percent is None
 
 
+def test_a_hung_agent_is_force_stopped_after_the_grace_period(tmp_path, monkeypatch):
+    # daemon.shutdown drains the step for grace_period_s and exits; one that is still alive well
+    # past that is hung, and the shell said "Stopping…" (or "Restarting…") for ever.
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.paths.pid_file.write_text("77\n")
+    (tmp_path / "agent.args").write_text(json.dumps(launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), "")))
+    running = {77: True}
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: running.get(pid, False))
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: None)   # SIGTERM ignored
+    clock = _fake_clock(monkeypatch)
+    limit = launcher.cfg.grace_period_s + AGENT_STOP_MARGIN_S
+
+    snap = launcher.start(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=80))
+    assert snap.agent_draining and launcher._pending_agent is not None and kills == []
+
+    clock["t"] += limit - 5                      # still within what a drain may take
+    snap = launcher.snapshot()
+    assert snap.agent_draining and kills == [] and launcher._spawned == []
+
+    clock["t"] += 10
+    snap = launcher.snapshot()
+    assert kills == [(77, signal.SIGKILL)]
+    assert "force-stopped" in snap.last_error and f"{limit:.0f} s" in snap.last_error
+    assert not snap.agent_draining and launcher._pending_agent is None
+
+    running[77] = False                          # killed: the restart it waited on is not attempted
+    snap = launcher.snapshot()
+    assert not snap.agent_running and launcher._spawned == [] and "force-stopped" in snap.last_error
+    assert kills == [(77, signal.SIGKILL)]       # once
+
+
 # ------------------------------------------------------------ our own pool is not one to join
 
 def test_discovery_skips_the_coordinator_hosted_here(tmp_path):
@@ -1006,7 +1131,36 @@ def test_discovery_skips_the_coordinator_hosted_here(tmp_path):
     assert other.find_on_lan() == "http://192.168.1.21:8765"
 
 
-def test_joining_our_own_pool_does_not_stop_hosting_it(tmp_path, monkeypatch):
+def test_find_on_lan_while_hosting_listens_past_our_own_advertisement(tmp_path, monkeypatch):
+    # Discovery used to stop at the first advertisement, ours while hosting, so Find on LAN never
+    # found another pool. The launcher now asks it to skip ours and take the next.
+    ads = ["http://192.168.1.20:8765", "http://192.168.1.21:8765"]
+    asked: list = []
+
+    def fake_discover(timeout, exclude=None):
+        asked.append((timeout, exclude))
+        return next((url for url in ads if exclude is None or not exclude(url)), None)
+
+    monkeypatch.setattr("slashcompute.launcher.controller.discover", fake_discover)
+    launcher = _launcher(tmp_path, discover_fn=None, lan_ip_fn=lambda: "192.168.1.20")
+    assert launcher.find_on_lan(timeout=2.0) == "http://192.168.1.21:8765"
+    assert asked[0][0] == 2.0 and asked[0][1]("http://192.168.1.20:8765") and not asked[0][1]("http://192.168.1.21:8765")
+    del ads[1]
+    assert launcher.find_on_lan() is None                      # only ours is advertised
+
+
+@pytest.mark.parametrize("own_url", [
+    "http://192.168.1.20:8765",     # the LAN ip
+    "http://127.0.0.1:8765",
+    "http://0.0.0.0:8765",          # what the coordinator is bound to
+    "http://test-mac.local:8765",   # the Bonjour name another Mac would have used for us
+    "http://10.8.0.5:8765",         # a VPN interface
+    "http://[fd00::20]:8765",       # an IPv6 interface address
+])
+def test_joining_our_own_pool_does_not_stop_hosting_it(tmp_path, monkeypatch, own_url):
+    # From the default home this is the user's live :8765 pool: start(join) on any address of it
+    # used to SIGTERM the coordinator just joined when the address was not the LAN ip or loopback.
+    _this_mac(monkeypatch, interfaces={"en0": ["192.168.1.20", "fd00::20"], "utun3": ["10.8.0.5"]})
     kills: list[tuple[int, int]] = []
     monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append((pid, sig)))
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
@@ -1015,9 +1169,41 @@ def test_joining_our_own_pool_does_not_stop_hosting_it(tmp_path, monkeypatch):
     launcher.start(LauncherSettings(mode="host", contribute=False))
     [coord] = launcher._spawned  # type: ignore[attr-defined]
 
-    snap = launcher.start(LauncherSettings(mode="join", url="http://192.168.1.20:8765", training=False))
+    snap = launcher.start(LauncherSettings(mode="join", url=own_url, training=False))
     assert (coord.pid, signal.SIGTERM) not in kills
     assert snap.coordinator_pid == coord.pid and snap.last_error == ""
+
+
+def test_is_own_url_knows_every_address_this_mac_answers_on(tmp_path, monkeypatch):
+    _this_mac(monkeypatch, interfaces={"lo0": ["127.0.0.1", "::1", "fe80::1%lo0"],
+                                       "en0": ["192.168.1.20", "fe80::8a1:5af6%en0"],
+                                       "utun4": ["100.68.31.99"]},
+              hostname="My-Mac.local",
+              names={"my-mac.local": ["192.168.1.20", "fe80::8a1:5af6"],
+                     "pool.lan": ["192.168.1.30"],
+                     "alias.lan": ["10.9.9.9", "100.68.31.99"]})   # a DNS name for our VPN address
+    launcher = _launcher(tmp_path, lan_ip_fn=lambda: "192.168.1.20")
+    for url in ("http://my-mac.local:8765", "http://MY-MAC.local:8765", "my-mac", "My-Mac.local",
+                "http://0.0.0.0:8765", "http://[::]:8765", "http://[fe80::8a1:5af6%en0]:8765",
+                "http://100.68.31.99:8765", "http://alias.lan:8765", "http://[0:0:0:0:0:0:0:1]:8765"):
+        assert launcher.is_own_url(url), url
+    for url in ("http://pool.lan:8765", "http://192.168.1.30:8765", "http://my-mac.local:9000",
+                "http://100.68.31.98:8765", "https://pool.example.com", "http://nowhere.lan:8765", ""):
+        assert not launcher.is_own_url(url), url
+
+
+def test_is_own_url_gives_up_on_a_name_that_is_slow_to_resolve(tmp_path, monkeypatch):
+    # getaddrinfo has no timeout of its own: a dead DNS must not hang Start or Find on LAN.
+    def hangs(host, port, *a, **kw):
+        time.sleep(0.5)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.20", 0))]
+
+    monkeypatch.setattr("slashcompute.launcher.controller.socket.getaddrinfo", hangs)
+    monkeypatch.setattr("slashcompute.launcher.controller.RESOLVE_TIMEOUT_S", 0.05)
+    launcher = _launcher(tmp_path)
+    began = time.monotonic()
+    assert not launcher.is_own_url("http://slow.lan:8765")
+    assert time.monotonic() - began < 0.4
 
 
 # ------------------------------------------------------------ odds and ends
@@ -1040,3 +1226,30 @@ def test_the_spawned_agent_is_kept_and_reaped_when_it_exits(tmp_path):
     agent.returncode = 0
     launcher.snapshot()
     assert launcher._agent_proc is None
+
+
+def test_a_just_spawned_agent_counts_as_running_before_it_writes_its_pid(tmp_path, monkeypatch):
+    # The agent writes agent.pid only once its imports are done (seconds): a second Start in that
+    # window spawned a second agent, and Stop or a sign-in could not reach the first.
+    monkeypatch.delenv("SLASHCOMPUTE_SESSION", raising=False)
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.paths.write_status(status="draining", draining=True)   # the previous run's last words
+    settings = LauncherSettings(mode="join", url="http://10.0.0.1:8765")
+    snap = launcher.start(settings)
+    [agent] = launcher._spawned  # type: ignore[attr-defined]
+    assert snap.agent_running and snap.agent_pid == agent.pid and not snap.agent_draining
+    assert snap.agent_status == ""                                   # not the previous run's
+
+    launcher.start(settings)
+    assert launcher._spawned == [agent]                              # no second agent
+
+    launcher.save_settings(launcher.with_session(settings, "tok"))  # signed in: restart it with the session
+    launcher.rebind_session()
+    assert agent.signals == [signal.SIGTERM] and launcher._pending_agent is None
+    assert [p.session for p in launcher._spawned[1:]] == ["tok"]
+    rebound = launcher._spawned[1]
+    agent.returncode = -signal.SIGTERM
+
+    snap = launcher.stop()
+    assert rebound.signals == [signal.SIGTERM] and snap.agent_pid is None
+    assert len(launcher._spawned) == 2 and launcher._agent_proc is None

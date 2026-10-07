@@ -1,8 +1,11 @@
 """Shell + launcher side of LLM inference: the LLMs view, streaming chat/upload passthrough, the inference node."""
 
+import asyncio
 import json
 import os
 import re
+import threading
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -10,9 +13,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from slashcompute.launcher.controller import Launcher, LauncherSettings
-from slashcompute.web.server import create_shell
+from slashcompute.web.server import _drop_upstream, create_shell
 
 SHELL = "http://127.0.0.1:8766"   # the shell refuses any Host but loopback
+
+
+@pytest.fixture(autouse=True)
+def _unknown_cmdlines(monkeypatch):
+    """The fake pids in these tests belong to no process (or, worse, to some unrelated real one):
+    their command lines are unreadable, which leaves the pid files trusted as before."""
+    monkeypatch.setattr("slashcompute.launcher.controller.process_cmdline", lambda pid: None)
 
 
 class FakeProc:
@@ -88,6 +98,7 @@ def test_chat_streams_sse_through_with_session(tmp_path):
         seen["url"] = str(request.url)
         seen["body"] = json.loads(request.content)
         seen["cookie"] = request.headers.get("cookie")
+        seen["authorization"] = request.headers.get("authorization")
         sse = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
         return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
 
@@ -95,13 +106,61 @@ def test_chat_streams_sse_through_with_session(tmp_path):
     launcher = app.state.launcher
     launcher.save_settings(launcher.with_session(launcher.load_settings(), "tok"))   # signed in to this pool
     with TestClient(app, base_url=SHELL) as c:
-        c.cookies.set("slashcompute_session", "tok")
+        c.cookies.set("slashcompute_session", "stale-from-another-home")   # the shared WKWebView jar
         r = c.post("/api/chat", json={"model": "m.gguf", "messages": [{"role": "user", "content": "x"}]})
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
     assert r.text.endswith("data: [DONE]\n\n")
     assert seen["url"] == "http://127.0.0.1:8765/v1/chat/completions"
     assert seen["body"]["stream"] is True
-    assert seen["cookie"] == "slashcompute_session=tok"
+    # The stored session signs the chat in; the browser's cookie is never forwarded.
+    assert seen["authorization"] == "Bearer tok" and seen["cookie"] is None
+
+
+def test_chat_reads_the_settings_off_the_event_loop(tmp_path):
+    """A Start holding the launcher's lock must not freeze the shell for a chat that is only reading
+    the settings on its way to the coordinator."""
+    app = _shell(tmp_path, lambda r: httpx.Response(200, content=b"data: [DONE]\n\n",
+                                                    headers={"content-type": "text/event-stream"}))
+    launcher = app.state.launcher
+    real, inside = launcher.load_settings, threading.Event()
+
+    def held_up():
+        inside.set()
+        time.sleep(0.4)
+        return real()
+
+    launcher.load_settings = held_up
+    with TestClient(app, base_url=SHELL) as c:
+        stuck = threading.Thread(target=lambda: c.post("/api/chat", json={"model": "m", "messages": []}))
+        stuck.start()
+        assert inside.wait(5)
+        t0 = time.monotonic()
+        assert c.get("/api/shell").status_code == 200
+        quick = time.monotonic() - t0
+        stuck.join()
+    assert quick < 0.15, f"the shell froze for {quick:.2f}s while a handler waited on the launcher"
+
+
+async def test_an_upstream_response_that_will_not_be_relayed_is_closed():
+    """send_upstream lets go of a coordinator response that arrived just as the window left (or just
+    as the cancel did): the response must still be closed, or its connection stays leased."""
+    closed = []
+
+    class Arrived:
+        async def aclose(self):
+            closed.append(True)
+
+    loop = asyncio.get_running_loop()
+    arrived = loop.create_future()
+    arrived.set_result(Arrived())
+    await _drop_upstream(arrived)
+    assert closed == [True]
+    failed = loop.create_future()
+    failed.set_exception(httpx.ConnectError("refused"))
+    await _drop_upstream(failed)                         # nothing to close, nothing raised
+    pending = asyncio.ensure_future(asyncio.sleep(60))
+    await _drop_upstream(pending)
+    assert pending.cancelled()
 
 
 class BreaksMidStream(httpx.AsyncByteStream):

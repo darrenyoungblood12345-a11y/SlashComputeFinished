@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
 from slashcompute.common.config import DEMO_MODEL_CANDIDATES, DEV_MODEL
@@ -37,9 +38,12 @@ STATIC = Path(__file__).resolve().parent / "static"
 SHELL_HOST = os.environ.get("SLASHCOMPUTE_SHELL_HOST", "127.0.0.1")
 SHELL_PORT = int(os.environ.get("SLASHCOMPUTE_SHELL_PORT", "8766"))
 # Bump when the shell changes: a running older shell is then replaced instead of reused.
-SHELL_GENERATION = 8
+SHELL_GENERATION = 9
 MODELS = [DEV_MODEL, *DEMO_MODEL_CANDIDATES]
 SESSION_COOKIE = "slashcompute_session"
+# Coordinator routes whose 200 carries a freshly issued session token, and the one that says whose it is.
+SIGN_IN_ROUTES = frozenset({"auth/login", "auth/register", "auth/google"})
+ME_ROUTE = "auth/me"
 NO_COORDINATOR = "No coordinator URL. Host or enter one, then Start."
 _PROXY_BLOCK = {"verify"}
 _SORTS = ("top", "trending", "least")
@@ -55,6 +59,11 @@ DISCONNECT_POLL_S = 0.5
 POOL_LIST_TIMEOUT = 1.5
 MAX_UPLOAD_BYTES = 64 << 30     # no Mac pool loads a bigger GGUF; refuse before relaying it
 DRAIN_LIMIT = 4 << 20           # how much of a refused upload to take so the browser gets the answer
+
+
+def _route(path: str) -> str:
+    """A proxied path as the coordinator routes it: no empty or "." segments, no trailing slash."""
+    return "/".join(part for part in path.replace("\\", "/").split("/") if part not in ("", "."))
 
 
 def _proxy_blocked(path: str) -> bool:
@@ -126,23 +135,63 @@ def settings_from_body(body: dict, stored: LauncherSettings) -> LauncherSettings
     return replace(stored, **changes).clamp()
 
 
+def _lends_session(request: Request, session: str) -> bool:
+    """Whether the shell signs this request in itself, with the stored token: there is one for the
+    pool being dialled and the browser sent no Authorization of its own."""
+    return bool(session) and not request.headers.get("authorization")
+
+
 def _forward_headers(request: Request, session: str = "") -> dict[str, str]:
     """What the coordinator gets to identify the caller. `session` is the stored token when the pool
-    we are dialling issued it, else "". The browser's Authorization goes through as is. Of its
-    cookies only the session goes through, and only to that pool: the cookie belongs to the shell's
-    origin, so after Connect it still holds the old pool's token. No cookie (pywebview's private
-    mode drops them between launches) falls back to the stored token as a Bearer."""
+    we are dialling issued it, else "". The browser's own Authorization goes through as is; failing
+    that the stored token goes as a Bearer. The browser's session cookie never goes through: it is
+    not evidence of anything. It belongs to the shell's origin, so after Connect it still holds the
+    old pool's token, and pywebview on macOS ignores storage_path, so the WKWebView jar is shared by
+    every home on this Mac and may hold another home's (stale) token, which used to shadow a valid
+    stored one. The store knows which pool issued its token (session_url); the cookie knows nothing.
+    Every sign-in the shell relays is stored (see the proxy), so nothing is lost by ignoring it."""
     headers = {}
     if request.headers.get("authorization"):
         headers["authorization"] = request.headers["authorization"]
-    cookie = request.cookies.get(SESSION_COOKIE)
-    if session and cookie:
-        headers["cookie"] = f"{SESSION_COOKIE}={cookie}"
-    elif session and "authorization" not in headers:
+    elif session:
         headers["authorization"] = f"Bearer {session}"
     if token := os.environ.get("SLASHCOMPUTE_INF_TOKEN"):
         headers["x-inference-token"] = token   # internet-facing pools: shared secret for LLM routes
     return headers
+
+
+def _json_dict(r) -> Optional[dict]:
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _issued_token(r) -> str:
+    """The session token a 200 from a sign-in route carries, "" when it carries none."""
+    token = (_json_dict(r) or {}).get("token") if r.status_code == 200 else None
+    return token if isinstance(token, str) else ""
+
+
+def _nobodys_token(r) -> bool:
+    """Whether a /auth/me answer says the token it was shown belongs to nobody. The coordinator never
+    401s there: an expired token, or one from before its database was reset, gets 200 {user: null}."""
+    data = _json_dict(r) if r.status_code == 200 else None
+    return data is not None and "user" in data and data["user"] is None
+
+
+async def _drop_upstream(task: "asyncio.Future[httpx.Response]") -> None:
+    """Let go of an upstream send whose response will not be relayed: cancel it, and if it had
+    already produced a response (it finished while we were checking on the window, or just as the
+    cancel arrived), close that response so its connection goes back to the pool."""
+    if not task.done():
+        task.cancel()
+    with contextlib.suppress(BaseException):
+        await task
+    if task.done() and not task.cancelled() and task.exception() is None:
+        with contextlib.suppress(Exception):
+            await task.result().aclose()
 
 
 def _set_cookies(headers) -> list[str]:
@@ -283,15 +332,41 @@ def create_shell(launcher: Optional[Launcher] = None,
     async def invalid(request: Request, exc: RequestValidationError):
         return JSONResponse({"detail": _validation_detail(exc.errors())}, status_code=422)
 
-    def fwd(request: Request, s: Optional[LauncherSettings] = None) -> dict[str, str]:
-        s = launch.load_settings() if s is None else s
+    # The launcher is synchronous and its lock is held for seconds by Start and Start serving. An
+    # async handler that calls into it directly waits on the event loop, and with the loop every
+    # poll, static file and chat stream in the window freezes: from a coroutine, launcher calls go
+    # through these (or asyncio.to_thread), never straight.
+
+    async def settings() -> LauncherSettings:
+        return await asyncio.to_thread(launch.load_settings)
+
+    async def proxy_url(s: LauncherSettings) -> str:
+        return await asyncio.to_thread(launch.proxy_url, s)
+
+    def fwd(request: Request, s: LauncherSettings) -> dict[str, str]:
         return _forward_headers(request, launch.session_for(s))
 
-    def coord_base() -> str:
-        base = launch.proxy_url()
+    async def coord_base(s: LauncherSettings) -> str:
+        base = await proxy_url(s)
         if not base:
             raise HTTPException(503, NO_COORDINATOR)
         return base.rstrip("/")
+
+    def remember_session(url: str, token: str) -> None:
+        """Keep a session the pool at `url` just issued, before the window gets the reply: the next
+        poll is then already signed in (it used to flicker to Sign in until the window had saved the
+        token itself) and sign-out revokes this token. A Connect that moved on meanwhile is left alone."""
+        s = launch.load_settings()
+        if launch.proxy_url(s) == url:
+            launch.save_settings(launch.with_session(s, token))
+
+    def forget_session(token: str) -> None:
+        """Drop the stored session when it is still `token`, which its pool no longer knows (it expired,
+        or the coordinator's database was reset): the window shows Sign in instead of lending a dead
+        token forever. A sign-in that stored a new token meanwhile is kept."""
+        s = launch.load_settings()
+        if s.session_token == token:
+            launch.save_settings(replace(s, session_token="", session_url=""))
 
     def build(method: str, url: str, **kw) -> httpx.Request:
         try:
@@ -307,18 +382,20 @@ def create_shell(launcher: Optional[Launcher] = None,
         if not watch:
             return await streams.send(req, stream=True)
         task = asyncio.ensure_future(streams.send(req, stream=True))
+        relayed = False
         try:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=DISCONNECT_POLL_S)
                 if done:
-                    return task.result()
+                    r = task.result()
+                    relayed = True
+                    return r
                 if await request.is_disconnected():
                     raise ClientDisconnect()
         finally:
-            if not task.done():
-                task.cancel()
-                with contextlib.suppress(BaseException):
-                    await task
+            if not relayed:   # also when it finished while we were asking the window: close, don't leak
+                with anyio.CancelScope(shield=True):
+                    await _drop_upstream(task)
 
     async def relay_stream(request: Request, req: httpx.Request, *, watch_disconnect: bool = True) -> Response:
         """Pass a coordinator response through as it arrives (LLM tokens, upload results)."""
@@ -345,12 +422,15 @@ def create_shell(launcher: Optional[Launcher] = None,
                 with anyio.CancelScope(shield=True):   # release the connection even on a disconnect
                     await r.aclose()
 
-        return StreamingResponse(body(), status_code=r.status_code, media_type=media)
+        # The background task closes it too (aclose is idempotent): a window that left before the
+        # body generator ever ran would otherwise leave the coordinator's response open.
+        return StreamingResponse(body(), status_code=r.status_code, media_type=media,
+                                 background=BackgroundTask(r.aclose))
 
-    async def inference_base() -> str:
+    async def inference_base(s: LauncherSettings) -> str:
         """Coordinator URL for LLM routes. An older coordinator 404s them with a bare "Not Found", so say
         why up front, before the request (or a multi-GB upload) is sent."""
-        base = coord_base()
+        base = await coord_base(s)
         if supports_inference(await asyncio.to_thread(launch.poll_health, base)) is False:
             raise HTTPException(409, OUTDATED_COORDINATOR)
         return base
@@ -365,8 +445,9 @@ def create_shell(launcher: Optional[Launcher] = None,
         if not isinstance(body, dict):
             raise HTTPException(400, "Send a JSON chat request.")
         body["stream"] = True
-        req = build("POST", f"{await inference_base()}/v1/chat/completions", json=body,
-                    headers=fwd(request), timeout=STREAM_TIMEOUT)
+        s = await settings()
+        req = build("POST", f"{await inference_base(s)}/v1/chat/completions", json=body,
+                    headers=fwd(request, s), timeout=STREAM_TIMEOUT)
         return await relay_stream(request, req)
 
     @app.post("/api/models/upload")
@@ -374,14 +455,15 @@ def create_shell(launcher: Optional[Launcher] = None,
         """Stream a GGUF to the coordinator without holding it in memory."""
         name = request.query_params.get("name") or request.headers.get("x-filename", "")
         length = _content_length(request)
-        headers = {**fwd(request), "content-type": "application/octet-stream"}
+        s = await settings()
+        headers = {**fwd(request, s), "content-type": "application/octet-stream"}
         if length is not None:
             headers["content-length"] = str(length)
         try:
             if length is not None and length > MAX_UPLOAD_BYTES:
                 raise HTTPException(413, f"{name or 'That file'} is over {MAX_UPLOAD_BYTES >> 30} GiB: "
                                          "no pool of Macs can load it.")
-            base = await inference_base()
+            base = await inference_base(s)
         except HTTPException:
             await _drain(request)
             raise
@@ -478,15 +560,16 @@ def create_shell(launcher: Optional[Launcher] = None,
     @app.get("/api/overview")
     async def get_overview():
         """Status, pool, this Mac and the leaderboard in one poll."""
-        s = launch.load_settings()
+        s = await settings()
         snap = await asyncio.to_thread(launch.snapshot, s)
-        url = launch.proxy_url(s)
+        url, coordinator_url, my_id = await asyncio.to_thread(
+            lambda: (launch.proxy_url(s), launch.coordinator_url(s), launch.my_node_id()))
         # snapshot() just polled /health: its answer says whether the lists are worth asking for.
         pool = await fetch_pool(url) if snap.coordinator_up else PoolData()
         app.state.pool, app.state.pool_url = pool, url
-        status = {**asdict(snap), **shown(s), "coordinator_url": launch.coordinator_url(s),
+        status = {**asdict(snap), **shown(s), "coordinator_url": coordinator_url,
                   "models": MODELS, "public_url": launch.cfg.public_url or ""}
-        return overview(status, pool, launch.my_node_id(), s.grant_split)
+        return overview(status, pool, my_id, s.grant_split)
 
     # ------------------------------------------------------------ live grants
 
@@ -640,33 +723,50 @@ def create_shell(launcher: Optional[Launcher] = None,
     async def proxy(path: str, request: Request):
         if _proxy_blocked(path):
             raise HTTPException(404, "not proxied")
-        s = launch.load_settings()
-        base = launch.proxy_url(s)
+        s = await settings()
+        base = await proxy_url(s)
         if not base:
             raise HTTPException(503, NO_COORDINATOR)
+        route = _route(path)
         url = f"{base.rstrip('/')}/{path}"
-        headers = fwd(request, s)
+        session = launch.session_for(s)
+        lent = _lends_session(request, session)
         http = launch._http   # synchronous: every call runs off the event loop
         ct = request.headers.get("content-type", "")
+        multipart = request.method == "POST" and ct.startswith("multipart/")
+
+        async def send(headers: dict[str, str], body: Optional[bytes]):
+            if multipart:
+                return await relay_form(request, url, headers, ct)
+            if request.method == "DELETE":
+                return await asyncio.to_thread(http.delete, url, headers=headers or None, timeout=30.0)
+            if request.method == "GET":
+                return await asyncio.to_thread(http.get, url, params=request.query_params.multi_items() or None,
+                                               headers=headers or None, timeout=30.0)
+            fwd_headers = {**headers, "content-type": ct or "application/json"}
+            post = http.patch if request.method == "PATCH" else http.post
+            return await asyncio.to_thread(post, url, content=body, headers=fwd_headers, timeout=60.0)
+
         try:
-            if request.method == "POST" and ct.startswith("multipart/"):
-                r = await relay_form(request, url, headers, ct)
-            elif request.method == "DELETE":
-                r = await asyncio.to_thread(http.delete, url, headers=headers or None, timeout=30.0)
-            elif request.method == "GET":
-                r = await asyncio.to_thread(http.get, url, params=request.query_params.multi_items() or None,
-                                            headers=headers or None, timeout=30.0)
-            else:
-                fwd_headers = {**headers, "content-type": ct or "application/json"}
-                body = await request.body()
-                send = http.patch if request.method == "PATCH" else http.post
-                r = await asyncio.to_thread(send, url, content=body, headers=fwd_headers, timeout=60.0)
+            body = None if multipart or request.method in ("GET", "DELETE") else await request.body()
+            r = await send(_forward_headers(request, session), body)
+            if lent and r.status_code == 401 and not multipart:
+                # The pool refused the token we lent. Ask once more as a stranger: if that is accepted
+                # the token is what was wrong, so forget it. (A form was streamed through: no retry.)
+                again = await send(_forward_headers(request, ""), body)
+                if again.status_code < 400:
+                    await asyncio.to_thread(forget_session, session)
+                    r = again
+            elif lent and request.method == "GET" and route == ME_ROUTE and _nobodys_token(r):
+                await asyncio.to_thread(forget_session, session)
         except ClientDisconnect:
             raise HTTPException(499, "The window stopped sending.") from None
         except httpx.InvalidURL as e:
             raise HTTPException(400, f"Invalid coordinator address {base}: {e}") from e
         except (httpx.RequestError, ConnectionError, OSError) as e:
             raise HTTPException(502, f"Coordinator unreachable at {base}: {e}") from e
+        if request.method == "POST" and route in SIGN_IN_ROUTES and (token := _issued_token(r)):
+            await asyncio.to_thread(remember_session, base, token)
         return _cookie_response(r)
 
     if STATIC.is_dir():
