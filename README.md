@@ -16,7 +16,7 @@ Public users submit training datasets through `POST /jobs/upload` (the app's Usa
 
 Each account gets a one-time welcome credit of 1 PFLOP (1e15 FLOPs) when it first signs in (email or Google); set `SLASHCOMPUTE_WELCOME_FLOPS` on the coordinator to change it, or `0` to disable.
 
-Changing the pool address, GPU share, or session restarts the training agent after it drains. If it is still stopping, the app reports that settings have not yet been applied; start again after the current work finishes. Existing agents without saved argument metadata rejoin once after upgrading.
+Changing the pool address or signing in or out restarts the training agent after it drains (the app says "Restarting" until the new agent is up). A new GPU share or memory limit applies the next time you start contributing. Existing agents without saved argument metadata rejoin once after upgrading.
 
 
 ## How a job runs

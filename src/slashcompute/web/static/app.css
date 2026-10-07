@@ -107,6 +107,7 @@ body {
 .app {
   display: grid;
   grid-template-columns: var(--side-w) minmax(0, 1fr);
+  height: 100vh;
   height: 100dvh;
 }
 
@@ -217,15 +218,12 @@ body {
   z-index: 1;
 }
 
-.view { display: none; }
+.view { display: none; max-width: 1480px; }
 .view.is-on { display: block; }
 
 #view-contributions.view.is-on {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 12px;
-  height: calc(100dvh - 56px);
-  min-height: calc(100dvh - 56px);
 }
 
 #view-contributions .grid { margin-bottom: 0; min-height: 0; }
@@ -238,11 +236,12 @@ body {
   flex-direction: column;
 }
 #view-contributions .c-panels .btn.block { margin-top: auto; }
-#view-contributions #c-mac { margin-top: 20px; }
+#view-contributions #c-mac { margin: 20px 0; }
 #view-contributions .terms { margin-top: 22px; }
 
 .view-head {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: flex-end;
   gap: 24px;
@@ -261,6 +260,9 @@ body {
 }
 
 .view-head p { margin: 12px 0 0; color: #3d3d3b; max-width: 64ch; }
+
+/* The Pool mode switch drops to its own line instead of stacking its buttons. */
+.view-head .seg { flex: none; flex-wrap: nowrap; }
 
 /* ------------------------------------------------------------ grid + cards */
 
@@ -615,6 +617,7 @@ input[type="range"]::-webkit-slider-thumb {
 .leaders .rank { font-family: var(--font-mono); font-weight: 500; font-size: 18px; color: var(--dim); }
 .leaders li:nth-child(-n+3) .rank { color: var(--sig); }
 .leaders .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.leaders .name .tag { margin-left: 6px; }
 .leaders .flops { color: var(--warm); font-size: 11px; white-space: nowrap; }
 
 /* ------------------------------------------------------------ llms */
@@ -623,7 +626,7 @@ input[type="range"]::-webkit-slider-thumb {
   background: #0a0a0a;
   border: 1px solid var(--line-2);
   min-height: 180px;
-  max-height: 380px;
+  max-height: min(380px, 40vh);
   overflow: auto;
   padding: 12px;
   margin-bottom: 14px;
@@ -650,6 +653,8 @@ input[type="range"]::-webkit-slider-thumb {
 /* ------------------------------------------------------------ pool */
 
 .banner { background: var(--hot); color: var(--carbon); padding: 12px 16px; margin-bottom: 16px; }
+/* News, not a failure: "Restarting the training agent after the current step finishes…" */
+.banner.info { background: var(--slab-2); color: var(--paper); box-shadow: inset 4px 0 0 var(--sig); }
 
 .addr {
   display: flex;
@@ -660,7 +665,7 @@ input[type="range"]::-webkit-slider-thumb {
   padding: 6px 6px 6px 12px;
 }
 
-.addr code { flex: 1; font-family: var(--font-mono); font-size: 14px; color: var(--sig); }
+.addr code { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 14px; color: var(--sig); overflow-wrap: anywhere; }
 
 .status { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 14px 16px; margin: 0; }
 .status dt { display: flex; align-items: center; gap: 10px; color: var(--warm); }
@@ -682,6 +687,11 @@ input[type="range"]::-webkit-slider-thumb {
 .macs td:first-child { color: var(--paper); }
 .macs td.num { font-variant-numeric: tabular-nums; }
 .macs .who { display: flex; align-items: center; gap: 10px; }
+
+/* The Macs and Pipeline tables cannot shrink below their columns; scroll them sideways instead. */
+#p-macs, #l-pipe { overflow-x: auto; }
+/* Room inside the scroll box for the Unload button's focus ring, which overflow would clip. */
+#l-pipe { padding: 4px; margin: -4px; }
 
 /* ------------------------------------------------------------ toast */
 
@@ -713,22 +723,18 @@ input[type="range"]::-webkit-slider-thumb {
 @media (max-width: 1020px) {
   .two, .three, .split-2-3, .split-3-2 { grid-template-columns: minmax(0, 1fr); }
   .main { padding: 28px 24px 48px; }
-  #view-contributions.view.is-on {
-    height: auto;
-    min-height: 0;
-    grid-template-rows: auto;
-  }
 }
 
 @media (max-width: 760px) {
-  .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
-  .side { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; }
-  .brand { font-size: 22px; padding: 0; }
+  .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; min-height: 100dvh; }
+  /* Sticky, but never the whole window: an open sign-in form scrolls inside it instead. */
+  .side { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; position: sticky; top: 0; max-height: 40vh; overflow-y: auto; }
+  .brand { padding: 0; }
   .tagline, .side-status { display: none; }
   .nav { flex-direction: row; flex-wrap: wrap; }
   .nav-item { padding: 8px 10px; }
   .nav-item .num { display: none; }
-  .main { padding: 20px 16px 40px; }
+  .main { padding: 20px 16px 40px; overflow: visible; }
   .view-head { flex-direction: column; align-items: flex-start; }
   .tiles, .field-pair { grid-template-columns: minmax(0, 1fr); }
 }

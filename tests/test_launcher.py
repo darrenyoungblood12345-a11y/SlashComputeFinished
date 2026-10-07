@@ -1,13 +1,61 @@
 import json
 import signal
+import socket
 import stat
+import threading
+import time
+from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from slashcompute.launcher.controller import (
-    Launcher, LauncherError, LauncherSettings, health_timeout, launch_record, normalize_url,
+    AGENT_STOP_MARGIN_S, Launcher, LauncherError, LauncherSettings, health_timeout, launch_record,
+    normalize_url, write_private,
 )
+
+
+@pytest.fixture(autouse=True)
+def _unknown_cmdlines(monkeypatch):
+    """The fake pids in these tests belong to no process: their command lines are unreadable, which
+    leaves the pid files trusted as before. Tests of the ownership check set their own."""
+    monkeypatch.setattr("slashcompute.launcher.controller.process_cmdline", lambda pid: None)
+
+
+def _this_mac(monkeypatch, interfaces: dict | None = None, hostname: str = "test-mac.local",
+              names: dict[str, list[str]] | None = None) -> None:
+    """What is_own_url sees of this Mac: its interfaces' addresses, its hostname, and the names
+    that resolve (none by default: no DNS or mDNS lookup ever leaves a test)."""
+    addrs = {ifname: [SimpleNamespace(family=socket.AF_INET6 if ":" in ip else socket.AF_INET, address=ip)
+                      for ip in ips] for ifname, ips in (interfaces or {}).items()}
+    resolves = {k.lower(): v for k, v in (names or {}).items()}
+
+    def getaddrinfo(host, port, *a, **kw):
+        if host.lower() not in resolves:
+            raise socket.gaierror(8, "nodename nor servname provided, or not known")
+        return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))
+                for ip in resolves[host.lower()]]
+
+    monkeypatch.setattr("slashcompute.launcher.controller.psutil.net_if_addrs", lambda: addrs)
+    monkeypatch.setattr("slashcompute.launcher.controller.socket.gethostname", lambda: hostname)
+    monkeypatch.setattr("slashcompute.launcher.controller.socket.getaddrinfo", getaddrinfo)
+
+
+@pytest.fixture(autouse=True)
+def _one_plain_mac(monkeypatch):
+    """By default this Mac has no interfaces beyond the injected lan_ip and resolves no names, so
+    is_own_url never depends on the machine running the tests."""
+    _this_mac(monkeypatch)
+
+
+def _fake_clock(monkeypatch) -> dict:
+    """time.monotonic/time.sleep on a clock that only sleeping advances: waits take no real time."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr("slashcompute.launcher.controller.time.monotonic", lambda: clock["t"])
+    monkeypatch.setattr("slashcompute.launcher.controller.time.sleep",
+                        lambda seconds: clock.__setitem__("t", clock["t"] + seconds))
+    return clock
 
 
 class FakeProc:
@@ -16,6 +64,7 @@ class FakeProc:
         self.argv = argv
         self.env = env or {}
         self.returncode = None   # set to make the process "exit"
+        self.signals: list[int] = []   # what the launcher sent through the Popen
 
     @property
     def session(self) -> str:
@@ -23,6 +72,9 @@ class FakeProc:
 
     def poll(self):
         return self.returncode
+
+    def send_signal(self, sig: int) -> None:
+        self.signals.append(sig)
 
 
 class FakeResponse:
@@ -453,35 +505,99 @@ def test_start_restarts_agent_with_unknown_previous_arguments(tmp_path, monkeypa
     assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(launcher._spawned[0].argv, "tok")
 
 
-def test_agent_restart_waits_for_graceful_stop_and_reports_timeout(tmp_path, monkeypatch):
+def test_agent_restart_that_cannot_stop_yet_completes_on_a_later_poll(tmp_path, monkeypatch):
+    # The agent drains its step before it exits (minutes, mid-download). Start used to give up
+    # after 3 s with "Settings have not been applied" and never restart it: the Mac kept running
+    # the old settings, or stopped contributing for good when the drain finished.
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.paths.pid_file.write_text("77\n")
     old_args = launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), "tok")
     (tmp_path / "agent.args").write_text(json.dumps(old_args))
+    running = {77: True}
     stopped = []
-    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: running.get(pid, False))
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop",
-                        lambda paths: stopped.append(paths.read_pid()))
-    times = iter([0.0, 0.0, 4.0])
-    monkeypatch.setattr("slashcompute.launcher.controller.time.monotonic", lambda: next(times))
-    monkeypatch.setattr("slashcompute.launcher.controller.time.sleep", lambda seconds: None)
+                        lambda paths: stopped.append(paths.read_pid()))   # it drains: still up
+    _fake_clock(monkeypatch)
     settings = _signed_in(launcher, "tok", mode="join", url="http://10.0.0.2:8765")
 
     snap = launcher.start(settings)
 
     assert stopped == [77]
-    assert snap.agent_running and snap.agent_pid == 77
-    assert "Settings have not been applied" in snap.last_error
+    assert snap.agent_running and snap.agent_pid == 77 and snap.agent_draining
+    assert snap.agent_restart_pending          # the window says Restarting…, not Stopping…
+    assert "Restarting the training agent" in snap.last_error
     assert launcher._spawned == []
     assert json.loads((tmp_path / "agent.args").read_text()) == old_args
 
-    # Retrying after the old agent drains applies the saved configuration.
-    launcher.paths.clear_pid()
-    snap = launcher.start(settings)
+    # Still draining on the next poll: nothing changes, and it is not asked to stop again.
+    snap = launcher.snapshot()
+    assert snap.agent_draining and snap.agent_restart_pending and launcher._spawned == [] and stopped == [77]
+
+    # It finished and exited: the next poll starts the new one with the saved settings.
+    running[77] = False
+    snap = launcher.snapshot()
     assert len(launcher._spawned) == 1
     assert launcher._spawned[0].argv == launcher.agent_argv(settings.url, 50)
+    assert launcher._spawned[0].session == "tok"
     assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(launcher._spawned[0].argv, "tok")
-    assert snap.last_error == ""
+    assert snap.last_error == "" and not snap.agent_draining and not snap.agent_restart_pending
+    assert launcher.snapshot().last_error == "" and len(launcher._spawned) == 1   # done once
+
+
+def test_sign_in_while_the_agent_drains_restarts_it_once_it_is_gone(tmp_path, monkeypatch):
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": 0, "jobs": 0}))
+    alive = _running(launcher, monkeypatch)
+    launcher.start(LauncherSettings(mode="join", url="http://10.0.0.1:8765"))
+    [agent] = launcher._spawned  # type: ignore[attr-defined]
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: None)  # mid-step
+    _fake_clock(monkeypatch)
+    launcher.save_settings(launcher.with_session(launcher.load_settings(), "tok"))
+
+    snap = launcher.rebind_session()
+    assert snap.agent_running and snap.agent_draining and len(launcher._spawned) == 1
+    assert "Restarting the training agent" in snap.last_error
+
+    alive[agent.pid] = False      # drained and exited
+    snap = launcher.snapshot()
+    rebound = launcher._spawned[1]  # type: ignore[attr-defined]
+    assert rebound.argv == agent.argv and rebound.session == "tok"
+    assert snap.agent_running and not snap.agent_draining and snap.last_error == ""
+
+
+def test_a_sign_in_during_a_pending_restart_reaches_the_restarted_agent(tmp_path, monkeypatch):
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.paths.pid_file.write_text("77\n")
+    (tmp_path / "agent.args").write_text(json.dumps(launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), "")))
+    running = {77: True}
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: running.get(pid, False))
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: None)
+    monkeypatch.delenv("SLASHCOMPUTE_SESSION", raising=False)
+    _fake_clock(monkeypatch)
+    launcher.start(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=80))   # pending
+    launcher.save_settings(launcher.with_session(launcher.load_settings(), "tok"))
+    snap = launcher.rebind_session()
+    assert snap.agent_draining and launcher._spawned == []  # type: ignore[attr-defined]
+    running[77] = False
+    launcher.snapshot()
+    [agent] = launcher._spawned  # type: ignore[attr-defined]
+    assert agent.argv == launcher.agent_argv("http://10.0.0.1:8765", 80) and agent.session == "tok"
+
+
+def test_stopping_drops_a_pending_restart(tmp_path, monkeypatch):
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.paths.pid_file.write_text("77\n")
+    (tmp_path / "agent.args").write_text(json.dumps(launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), "")))
+    running = {77: True}
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: running.get(pid, False))
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: None)
+    _fake_clock(monkeypatch)
+    launcher.start(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=80))
+    assert launcher._pending_agent is not None
+    launcher.stop_agent()
+    running[77] = False
+    launcher.snapshot()
+    assert launcher._spawned == [] and launcher._pending_agent is None  # type: ignore[attr-defined]
 
 
 def test_start_join_requires_url(tmp_path):
@@ -766,3 +882,485 @@ def test_status_reports_this_macs_memory(tmp_path):
     launcher._memory = lambda: (16 << 30, 5 << 30)
     snap = launcher.snapshot()
     assert (snap.memory_total_bytes, snap.memory_available_bytes) == (16 << 30, 5 << 30)
+
+
+# ------------------------------------------------------------ one launcher, many threads
+
+def test_settings_are_rewritten_atomically(tmp_path):
+    # Every status poll loads launcher.json on its own thread. A truncate-then-write let a poll
+    # read an empty file (defaults, no session) which the next POST /api/settings saved back.
+    launcher = _launcher(tmp_path)
+    a = launcher.with_session(LauncherSettings(mode="join", url="http://10.0.0.1:8765"), "tok")
+    b = replace(a, gpu_percent=75)
+    launcher.save_settings(a)
+    path = tmp_path / "launcher.json"
+    seen: list = []
+    stop = threading.Event()
+
+    def read_the_file():   # the file itself, not load_settings: the lock is not what protects this
+        while not stop.is_set():
+            try:
+                seen.append(json.loads(path.read_text()).get("gpu_percent"))
+            except (OSError, ValueError) as e:
+                seen.append(repr(e))
+
+    reader = threading.Thread(target=read_the_file)
+    reader.start()
+    try:
+        for i in range(300):
+            write_private(path, json.dumps(asdict(b if i % 2 else a), indent=2) + "\n")
+    finally:
+        stop.set()
+        reader.join(5)
+    assert seen and all(v in (50, 75) for v in seen), [v for v in seen if v not in (50, 75)][:3]
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".launcher.json")] == []
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert launcher.load_settings().session_token == "tok"
+
+
+def test_load_settings_never_waits_for_the_lock(tmp_path):
+    # start()/set_inference()/rebind_session() hold the lock for up to ~25 s while the shell's
+    # async handlers load the settings on the event loop: a locked read froze the whole shell.
+    launcher = _launcher(tmp_path)
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=75))
+    loaded: list = []
+    saved = threading.Event()
+
+    def read():
+        loaded.append(launcher.load_settings())
+
+    def write():
+        launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=80))
+        saved.set()
+
+    with launcher._lock:                       # a Start in progress on another thread
+        reader = threading.Thread(target=read)
+        reader.start()
+        reader.join(2)
+        assert not reader.is_alive() and loaded[0].gpu_percent == 75
+        writer = threading.Thread(target=write)
+        writer.start()
+        assert not saved.wait(0.3)             # writes still queue behind the state changes
+    assert saved.wait(2)
+    assert launcher.load_settings().gpu_percent == 80
+
+
+def test_update_settings_is_one_locked_read_modify_write(tmp_path):
+    # Every settings write loaded, changed and saved on its own request thread. Two of them
+    # changing different fields at once (a slider save landing during a Start's merge, or two
+    # saves) each wrote back the other's field as it had loaded it: one change was lost.
+    launcher = _launcher(tmp_path)
+    launcher.save_settings(launcher.with_session(LauncherSettings(mode="join", url="http://10.0.0.1:8765"), "tok"))
+    real = launcher.load_settings
+
+    def slow_load():
+        s = real()
+        time.sleep(0.02)              # widen the window between a thread's read and its write
+        return s
+
+    launcher.load_settings = slow_load
+    threads = [
+        threading.Thread(target=lambda: [launcher.update_settings({"gpu_percent": 30 + i}) for i in range(5)]),
+        threading.Thread(target=lambda: [launcher.update_settings({"memory_gb": 1 + i}) for i in range(5)]),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert not any(t.is_alive() for t in threads)
+    s = real()
+    assert (s.gpu_percent, s.memory_gb) == (34, 5)                              # both threads' last change
+    assert (s.mode, s.url, s.session_token) == ("join", "http://10.0.0.1:8765", "tok")   # the rest untouched
+
+
+def test_update_settings_applies_an_edit_to_the_changed_settings(tmp_path):
+    launcher = _launcher(tmp_path)
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.1:8765"))
+    # The field changes go in first, then the edit sees them: a sign-in in the same body as
+    # Connect's url is bound to the pool the settings now point at. Clamped, as saved.
+    s = launcher.update_settings({"url": "http://10.0.0.2:8765", "gpu_percent": 999},
+                                 edit=lambda s: launcher.with_session(s, "tok"))
+    assert (s.url, s.gpu_percent) == ("http://10.0.0.2:8765", 100)
+    assert (s.session_token, s.session_url) == ("tok", "http://10.0.0.2:8765")
+    assert launcher.load_settings() == s
+    # An edit that depends on what is stored (drop this one token, not a newer one) sees the stored value.
+    forget = lambda token: (lambda s: replace(s, session_token="", session_url="") if s.session_token == token else s)  # noqa: E731
+    assert launcher.update_settings(edit=forget("older")).session_token == "tok"
+    assert launcher.update_settings(edit=forget("tok")).session_token == ""
+    assert launcher.load_settings().session_token == ""
+
+
+def test_a_bounded_snapshot_returns_the_last_one_while_the_lock_is_held(tmp_path):
+    # /api/overview waited for the lock behind a Start (up to ~25 s): the window's pills froze and
+    # its polls piled up. Bounded, a poll answers with what the last snapshot said.
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": 3, "jobs": 1}))
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.1:8765"))
+    last = launcher.snapshot()
+    assert last.coordinator_up and last.nodes == 3
+    launcher.last_error = "No coordinator at http://10.0.0.1:8765."   # stale: a full poll would clear it
+    got: list = []
+    with launcher._lock:                       # a Start in progress on another thread
+        poll = threading.Thread(target=lambda: got.append(launcher.snapshot(wait=0.1)))
+        began = time.monotonic()
+        poll.start()
+        poll.join(2)
+        assert not poll.is_alive() and time.monotonic() - began < 1.0
+    assert got[0] is last                      # as it was: nothing re-polled, last_error untouched
+    assert launcher.last_error == "No coordinator at http://10.0.0.1:8765."
+    # The lock free again: a full poll, which is also the next fallback.
+    snap = launcher.snapshot(wait=0.1)
+    assert snap.last_error == "" and snap is not last and launcher._last_snapshot is snap
+    # Without a bound the call waits, as start() must for the snapshot it ends in.
+    with launcher._lock:
+        poll = threading.Thread(target=lambda: got.append(launcher.snapshot()))
+        poll.start()
+        poll.join(0.3)
+        assert poll.is_alive()
+    poll.join(2)
+    assert not poll.is_alive() and len(got) == 2 and got[1] is not snap
+
+
+def test_concurrent_starts_spawn_one_coordinator(tmp_path, monkeypatch):
+    # Two Start clicks reach the shared launcher on two threads: both used to pass the
+    # "no coordinator.pid yet" check while the first coordinator was still being spawned.
+    launcher = _launcher(tmp_path)
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive",
+                        lambda pid: any(p.pid == pid for p in launcher._spawned))  # type: ignore[attr-defined]
+    launcher.poll_health = lambda url: {"ok": True} if launcher._spawned else None  # type: ignore
+    spawn = launcher._popen
+    entered = threading.Event()
+
+    def slow_popen(argv, **kw):
+        entered.set()
+        time.sleep(0.3)        # a second Start arrives while this one is still spawning
+        return spawn(argv, **kw)
+
+    launcher._popen = slow_popen
+    errors: list = []
+
+    def run():
+        try:
+            launcher.start(LauncherSettings(mode="host", contribute=False))
+        except Exception as e:   # noqa: BLE001
+            errors.append(e)
+
+    first = threading.Thread(target=run)
+    first.start()
+    assert entered.wait(5)
+    second = threading.Thread(target=run)
+    second.start()
+    first.join(10)
+    second.join(10)
+    assert errors == []
+    assert [p.argv[2] for p in launcher._spawned] == ["slashcompute.coordinator.main"]  # type: ignore
+    assert launcher.snapshot().coordinator_pid == launcher._spawned[0].pid  # type: ignore[attr-defined]
+
+
+# ------------------------------------------------------------ pid files that name a stranger
+
+def test_a_pid_file_naming_another_program_is_not_our_agent_or_node(tmp_path, monkeypatch):
+    # After a crash or a reboot the pid in agent.pid / node.pid can be any other program: the
+    # UI said "Contributing" and Stop sent it SIGTERM.
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr("os.kill", lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.agent.daemon._alive", lambda pid: True)
+    launcher = _launcher(tmp_path)
+    cmdlines = {
+        77: ["/usr/bin/python3", "some_other_app.py"],
+        88: ["/opt/venv/bin/python", "-m", "slashcompute.inference.node", "start", "--home", "/elsewhere"],
+    }
+    monkeypatch.setattr("slashcompute.launcher.controller.process_cmdline", lambda pid: cmdlines.get(pid))
+
+    def stale_pid_files():
+        launcher.paths.pid_file.write_text("77\n")
+        launcher.inference_pid_path.parent.mkdir(parents=True, exist_ok=True)
+        launcher.inference_pid_path.write_text("88\n")
+
+    stale_pid_files()
+    snap = launcher.snapshot()
+    assert not snap.agent_running and snap.agent_pid is None and not launcher.paths.pid_file.exists()
+    assert not snap.inference_running and not launcher.inference_pid_path.exists()
+    assert not launcher._agent_running() and launcher.read_inference_pid() is None
+
+    stale_pid_files()
+    launcher.stop()
+    assert [k for k in kills if k[1] == signal.SIGTERM] == []
+
+    # Our own agent and LLM node (the module and this home on their command lines) are ours.
+    cmdlines[77] = launcher.agent_argv("http://10.0.0.1:8765", 50)
+    cmdlines[88] = launcher.inference_argv("http://10.0.0.1:8765", LauncherSettings())
+    stale_pid_files()
+    snap = launcher.snapshot()
+    assert snap.agent_running and snap.agent_pid == 77 and snap.inference_running and snap.inference_pid == 88
+    assert launcher.paths.pid_file.exists() and launcher.inference_pid_path.exists()
+    launcher.stop()
+    assert {k[0] for k in kills if k[1] == signal.SIGTERM} == {77, 88}
+
+    # One started by hand without --home runs in the default home: ours only when that is this home.
+    cmdlines[77] = ["/usr/bin/python3", "-m", "slashcompute.agent.main", "start", "--url", "http://10.0.0.1:8765"]
+    stale_pid_files()
+    assert not launcher.snapshot().agent_running
+    monkeypatch.setenv("SLASHCOMPUTE_HOME", str(tmp_path))
+    stale_pid_files()
+    assert launcher.snapshot().agent_running
+
+
+def test_a_coordinator_pid_file_naming_another_program_is_not_ours_and_never_signalled(tmp_path, monkeypatch):
+    # coordinator.pid survives a crash or a reboot; the pid in it can then be any other program,
+    # which the UI called our pool and Stop (or joining another pool) SIGTERMed.
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.launcher.controller.started_after", lambda pid, when: False)
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    cmdlines = {111: ["/usr/bin/python3", "some_other_app.py"]}
+    monkeypatch.setattr("slashcompute.launcher.controller.process_cmdline", lambda pid: cmdlines.get(pid))
+
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    assert launcher.read_coordinator_pid() is None and not (tmp_path / "coordinator.pid").exists()
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    assert launcher.snapshot().coordinator_pid is None
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    launcher.stop()
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    launcher.start(LauncherSettings(mode="join", url="http://10.0.0.8:8765", training=False))
+    assert [k for k in kills if k[1] == signal.SIGTERM] == []
+
+    # A coordinator serving another home is not ours either; ours (this home) is.
+    cmdlines[111] = launcher.coordinator_argv()[:-1] + ["/elsewhere"]
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    assert launcher.read_coordinator_pid() is None
+    cmdlines[111] = launcher.coordinator_argv()
+    (tmp_path / "coordinator.pid").write_text("111\n")
+    assert launcher.read_coordinator_pid() == 111 and launcher.snapshot().coordinator_pid == 111
+    launcher.stop()
+    assert (111, signal.SIGTERM) in kills
+
+
+# ------------------------------------------------------------ draining and the running share
+
+def test_status_reports_a_draining_agent_and_its_share(tmp_path, monkeypatch):
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: pid == 9)
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.paths.pid_file.write_text("9\n")
+    launcher.paths.write_status(status="running", draining=False, gpu_percent=35, job_id="j1")
+    snap = launcher.snapshot()
+    assert snap.agent_running and not snap.agent_draining and snap.agent_gpu_percent == 35
+
+    launcher.paths.write_status(draining=True)
+    assert launcher.snapshot().agent_draining
+
+    # Asked to stop but still finishing its step (status.json not updated yet): draining too, and
+    # with no restart behind it (the window says Stopping…, not Restarting…).
+    launcher.paths.write_status(draining=False, gpu_percent="lots")
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: None)
+    snap = launcher.stop_agent()
+    assert snap.agent_running and snap.agent_draining and snap.agent_gpu_percent is None
+    assert not snap.agent_restart_pending
+
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: False)
+    snap = launcher.snapshot()
+    assert not snap.agent_running and not snap.agent_draining and snap.agent_gpu_percent is None
+
+
+def _hung_agent(tmp_path, monkeypatch) -> tuple[Launcher, dict, float, dict]:
+    """Our agent (pid 77), asked to stop for new settings and ignoring it. Returns the launcher,
+    the fake clock, how long it may drain before it counts as hung, and what is `running`."""
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.paths.pid_file.write_text("77\n")
+    (tmp_path / "agent.args").write_text(json.dumps(launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), "")))
+    running = {77: True}
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: running.get(pid, False))
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: None)   # SIGTERM ignored
+    clock = _fake_clock(monkeypatch)
+    snap = launcher.start(LauncherSettings(mode="join", url="http://10.0.0.1:8765", gpu_percent=80))
+    assert snap.agent_draining and snap.agent_restart_pending and launcher._pending_agent is not None
+    return launcher, clock, launcher.cfg.grace_period_s + AGENT_STOP_MARGIN_S, running
+
+
+def _record_kills(monkeypatch, killpg_raises: type[OSError] | None = None) -> list:
+    """Every SIGKILL the launcher sends, as ("pg", pid, sig) for a process group and ("pid", pid, sig)
+    for one process. `killpg_raises` makes killpg refuse, as it does for a pid leading no group."""
+    kills: list = []
+
+    def killpg(pid, sig):
+        kills.append(("pg", pid, sig))
+        if killpg_raises is not None:
+            raise killpg_raises()
+
+    monkeypatch.setattr("slashcompute.launcher.controller.os.killpg", killpg)
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append(("pid", pid, sig)))
+    return kills
+
+
+def test_a_hung_agent_is_force_stopped_after_the_grace_period(tmp_path, monkeypatch):
+    # daemon.shutdown drains the step for grace_period_s and exits; one that is still alive well
+    # past that is hung, and the shell said "Stopping…" (or "Restarting…") for ever.
+    kills = _record_kills(monkeypatch)
+    launcher, clock, limit, running = _hung_agent(tmp_path, monkeypatch)
+    assert kills == []
+
+    clock["t"] += limit - 5                      # still within what a drain may take
+    snap = launcher.snapshot()
+    assert snap.agent_draining and kills == [] and launcher._spawned == []
+
+    clock["t"] += 10
+    snap = launcher.snapshot()
+    # The whole process group (the agent leads its own session): a download it hung on goes with it.
+    assert kills == [("pg", 77, signal.SIGKILL)]
+    assert "force-stopped" in snap.last_error and f"{limit:.0f} s" in snap.last_error
+    assert not snap.agent_draining and not snap.agent_restart_pending and launcher._pending_agent is None
+
+    running[77] = False                          # killed: the restart it waited on is not attempted
+    snap = launcher.snapshot()
+    assert not snap.agent_running and launcher._spawned == [] and "force-stopped" in snap.last_error
+    assert kills == [("pg", 77, signal.SIGKILL)]       # once
+
+
+@pytest.mark.parametrize("refused", [ProcessLookupError, PermissionError])
+def test_force_stop_falls_back_to_the_pid_when_it_leads_no_group_of_ours(tmp_path, monkeypatch, refused):
+    # An agent started by hand leads no session of its own: killpg names no group by its pid (or
+    # one that is not ours to signal), and the agent is killed by its pid instead.
+    kills = _record_kills(monkeypatch, killpg_raises=refused)
+    launcher, clock, limit, _ = _hung_agent(tmp_path, monkeypatch)
+    clock["t"] += limit + 1
+    snap = launcher.snapshot()
+    assert kills == [("pg", 77, signal.SIGKILL), ("pid", 77, signal.SIGKILL)]
+    assert "force-stopped" in snap.last_error and launcher._pending_agent is None
+
+
+# ------------------------------------------------------------ our own pool is not one to join
+
+def test_discovery_skips_the_coordinator_hosted_here(tmp_path):
+    ours = _launcher(tmp_path, discover_fn=lambda timeout=5.0: "http://192.168.1.20:8765",
+                     lan_ip_fn=lambda: "192.168.1.20")
+    assert ours.find_on_lan() is None
+    assert ours.is_own_url("http://127.0.0.1:8765") and ours.is_own_url("192.168.1.20")
+    assert not ours.is_own_url("http://192.168.1.21:8765") and not ours.is_own_url("http://192.168.1.20:9000")
+    other = _launcher(tmp_path, discover_fn=lambda timeout=5.0: "http://192.168.1.21:8765/")
+    assert other.find_on_lan() == "http://192.168.1.21:8765"
+
+
+def test_find_on_lan_while_hosting_listens_past_our_own_advertisement(tmp_path, monkeypatch):
+    # Discovery used to stop at the first advertisement, ours while hosting, so Find on LAN never
+    # found another pool. The launcher now asks it to skip ours and take the next.
+    ads = ["http://192.168.1.20:8765", "http://192.168.1.21:8765"]
+    asked: list = []
+
+    def fake_discover(timeout, exclude=None):
+        asked.append((timeout, exclude))
+        return next((url for url in ads if exclude is None or not exclude(url)), None)
+
+    monkeypatch.setattr("slashcompute.launcher.controller.discover", fake_discover)
+    launcher = _launcher(tmp_path, discover_fn=None, lan_ip_fn=lambda: "192.168.1.20")
+    assert launcher.find_on_lan(timeout=2.0) == "http://192.168.1.21:8765"
+    assert asked[0][0] == 2.0 and asked[0][1]("http://192.168.1.20:8765") and not asked[0][1]("http://192.168.1.21:8765")
+    del ads[1]
+    assert launcher.find_on_lan() is None                      # only ours is advertised
+
+
+@pytest.mark.parametrize("own_url", [
+    "http://192.168.1.20:8765",     # the LAN ip
+    "http://127.0.0.1:8765",
+    "http://0.0.0.0:8765",          # what the coordinator is bound to
+    "http://test-mac.local:8765",   # the Bonjour name another Mac would have used for us
+    "http://10.8.0.5:8765",         # a VPN interface
+    "http://[fd00::20]:8765",       # an IPv6 interface address
+])
+def test_joining_our_own_pool_does_not_stop_hosting_it(tmp_path, monkeypatch, own_url):
+    # From the default home this is the user's live :8765 pool: start(join) on any address of it
+    # used to SIGTERM the coordinator just joined when the address was not the LAN ip or loopback.
+    _this_mac(monkeypatch, interfaces={"en0": ["192.168.1.20", "fd00::20"], "utun3": ["10.8.0.5"]})
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    launcher = _launcher(tmp_path)
+    launcher.poll_health = lambda url: {"ok": True} if launcher._spawned else None  # type: ignore
+    launcher.start(LauncherSettings(mode="host", contribute=False))
+    [coord] = launcher._spawned  # type: ignore[attr-defined]
+
+    snap = launcher.start(LauncherSettings(mode="join", url=own_url, training=False))
+    assert (coord.pid, signal.SIGTERM) not in kills
+    assert snap.coordinator_pid == coord.pid and snap.last_error == ""
+
+
+def test_is_own_url_knows_every_address_this_mac_answers_on(tmp_path, monkeypatch):
+    _this_mac(monkeypatch, interfaces={"lo0": ["127.0.0.1", "::1", "fe80::1%lo0"],
+                                       "en0": ["192.168.1.20", "fe80::8a1:5af6%en0"],
+                                       "utun4": ["100.68.31.99"]},
+              hostname="My-Mac.local",
+              names={"my-mac.local": ["192.168.1.20", "fe80::8a1:5af6"],
+                     "pool.lan": ["192.168.1.30"],
+                     "alias.lan": ["10.9.9.9", "100.68.31.99"]})   # a DNS name for our VPN address
+    launcher = _launcher(tmp_path, lan_ip_fn=lambda: "192.168.1.20")
+    for url in ("http://my-mac.local:8765", "http://MY-MAC.local:8765", "my-mac", "My-Mac.local",
+                "http://0.0.0.0:8765", "http://[::]:8765", "http://[fe80::8a1:5af6%en0]:8765",
+                "http://100.68.31.99:8765", "http://alias.lan:8765", "http://[0:0:0:0:0:0:0:1]:8765"):
+        assert launcher.is_own_url(url), url
+    for url in ("http://pool.lan:8765", "http://192.168.1.30:8765", "http://my-mac.local:9000",
+                "http://100.68.31.98:8765", "https://pool.example.com", "http://nowhere.lan:8765", ""):
+        assert not launcher.is_own_url(url), url
+
+
+def test_is_own_url_gives_up_on_a_name_that_is_slow_to_resolve(tmp_path, monkeypatch):
+    # getaddrinfo has no timeout of its own: a dead DNS must not hang Start or Find on LAN.
+    def hangs(host, port, *a, **kw):
+        time.sleep(0.5)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.20", 0))]
+
+    monkeypatch.setattr("slashcompute.launcher.controller.socket.getaddrinfo", hangs)
+    monkeypatch.setattr("slashcompute.launcher.controller.RESOLVE_TIMEOUT_S", 0.05)
+    launcher = _launcher(tmp_path)
+    began = time.monotonic()
+    assert not launcher.is_own_url("http://slow.lan:8765")
+    assert time.monotonic() - began < 0.4
+
+
+# ------------------------------------------------------------ odds and ends
+
+def test_malformed_health_counts_are_unhealthy_not_a_crash(tmp_path):
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": "many", "jobs": [1]}))
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.8:8765"))
+    snap = launcher.snapshot()
+    assert not snap.coordinator_up and (snap.nodes, snap.jobs) == (0, 0)
+    launcher.poll_health = lambda url: {"ok": True, "nodes": None, "jobs": "2", "inference_nodes": {}}  # type: ignore
+    snap = launcher.snapshot()
+    assert snap.coordinator_up and (snap.nodes, snap.jobs, snap.inference_nodes) == (0, 2, 0)
+
+
+def test_the_spawned_agent_is_kept_and_reaped_when_it_exits(tmp_path):
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.start(LauncherSettings(mode="join", url="http://10.0.0.1:8765"))
+    [agent] = launcher._spawned  # type: ignore[attr-defined]
+    assert launcher._agent_proc is agent
+    agent.returncode = 0
+    launcher.snapshot()
+    assert launcher._agent_proc is None
+
+
+def test_a_just_spawned_agent_counts_as_running_before_it_writes_its_pid(tmp_path, monkeypatch):
+    # The agent writes agent.pid only once its imports are done (seconds): a second Start in that
+    # window spawned a second agent, and Stop or a sign-in could not reach the first.
+    monkeypatch.delenv("SLASHCOMPUTE_SESSION", raising=False)
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.paths.write_status(status="draining", draining=True)   # the previous run's last words
+    settings = LauncherSettings(mode="join", url="http://10.0.0.1:8765")
+    snap = launcher.start(settings)
+    [agent] = launcher._spawned  # type: ignore[attr-defined]
+    assert snap.agent_running and snap.agent_pid == agent.pid and not snap.agent_draining
+    assert snap.agent_status == ""                                   # not the previous run's
+
+    launcher.start(settings)
+    assert launcher._spawned == [agent]                              # no second agent
+
+    launcher.save_settings(launcher.with_session(settings, "tok"))  # signed in: restart it with the session
+    launcher.rebind_session()
+    assert agent.signals == [signal.SIGTERM] and launcher._pending_agent is None
+    assert [p.session for p in launcher._spawned[1:]] == ["tok"]
+    rebound = launcher._spawned[1]
+    agent.returncode = -signal.SIGTERM
+
+    snap = launcher.stop()
+    assert rebound.signals == [signal.SIGTERM] and snap.agent_pid is None
+    assert len(launcher._spawned) == 2 and launcher._agent_proc is None

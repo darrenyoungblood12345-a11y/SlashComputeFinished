@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
+import ipaddress
 import json
 import os
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 import httpx
 import psutil
@@ -37,6 +42,22 @@ UNREACHABLE_ERRORS = ("No coordinator at ", "Coordinator started but is not answ
 OUTDATED_COORDINATOR = ("This pool's coordinator has no LLM inference: it runs an older /compute. "
                         "Ask whoever hosts it to update and restart it, or host a pool on this Mac.")
 PORT_IN_USE = "Port {port} is already in use — quit the other /compute or coordinator, then Start hosting."
+# A restart that waits for the running process to finish its step; cleared once the new one is up.
+AGENT_RESTARTING = ("Restarting the training agent after the current step finishes; "
+                    "the new settings apply then.")
+NODE_RESTARTING = "Restarting the LLM node after the current step finishes; the new settings apply then."
+# An agent asked to stop drains its step for the grace period (daemon.shutdown waits that long),
+# then has this much longer to exit before it counts as hung and is killed.
+AGENT_STOP_MARGIN_S = 30.0
+AGENT_FORCE_STOPPED = ("The training agent did not stop within {seconds:.0f} s and was force-stopped; "
+                       "Start again to keep contributing.")
+RESOLVE_TIMEOUT_S = 1.5   # a name that takes longer to resolve (DNS or mDNS away) is not one of ours
+AGENT_MODULE = "slashcompute.agent.main"
+COORDINATOR_MODULE = "slashcompute.coordinator.main"
+INFERENCE_MODULE = "slashcompute.inference.node"
+HEALTH_COUNTS = ("nodes", "jobs", "inference_nodes")
+# Where a server bound to 0.0.0.0 (as our coordinator is) answers besides its interfaces.
+LOCAL_HOSTS = frozenset({"0.0.0.0", "::", "127.0.0.1", "::1", "localhost"})
 
 
 def stateless_http(**kw: Any) -> httpx.Client:
@@ -51,6 +72,37 @@ def supports_inference(health: Optional[dict]) -> Optional[bool]:
     """Whether the coordinator serves LLMs (every build since inference reports its transport in
     /health). None while it is unreachable."""
     return None if not health else "inference_transport" in health
+
+
+def health_count(health: dict, key: str) -> int:
+    """A count from /health, 0 when it is missing or not a number."""
+    try:
+        return int(health.get(key, 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def agent_gpu_percent(status: dict) -> Optional[int]:
+    """The GPU share the agent reports in its status.json, None when absent or malformed."""
+    try:
+        value = status.get("gpu_percent")
+        return None if value is None else int(value)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return None
+
+
+def valid_health(data: Any) -> bool:
+    """Whether a /health body is one the shell can use: a coordinator whose counts are not numbers
+    is treated as unhealthy rather than crashing every status poll."""
+    if not isinstance(data, dict):
+        return False
+    for key in HEALTH_COUNTS:
+        value = data.get(key, 0)
+        try:
+            int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return True
 
 
 @dataclass
@@ -117,6 +169,9 @@ class StatusSnapshot:
     agent_job_id: Optional[str] = None
     agent_fetch_done_bytes: Optional[int] = None    # the agent is downloading a job's model
     agent_fetch_total_bytes: Optional[int] = None
+    agent_draining: bool = False                    # it was asked to stop and finishes its step first
+    agent_restart_pending: bool = False             # a restart waits for it to finish its step
+    agent_gpu_percent: Optional[int] = None         # the share the running agent was started with
     coordinator_pid: Optional[int] = None
     agent_pid: Optional[int] = None
     lan_ip: str = ""
@@ -132,6 +187,9 @@ class StatusSnapshot:
 
 
 PopenFn = Callable[..., Any]
+# A further change to the settings an update applies once the field changes are in (binding a
+# session to the pool they then point at, a clear that depends on what is stored).
+SettingsEdit = Callable[[LauncherSettings], LauncherSettings]
 
 
 def normalize_url(url: str, port: int = 8765, scheme: str = "http") -> str:
@@ -146,10 +204,22 @@ def normalize_url(url: str, port: int = 8765, scheme: str = "http") -> str:
 
 
 def write_private(path: Path, text: str) -> None:
-    """Write a file only this user can read: it holds a session or a fingerprint of one."""
-    path.touch(mode=0o600)
-    path.chmod(0o600)
-    path.write_text(text)
+    """Write a file only this user can read: it holds a session or a fingerprint of one.
+
+    Written beside the file and renamed over it: a reader on another thread (every status poll
+    loads launcher.json) sees the old or the new content, never a truncated file that loads as
+    defaults — and could then be saved back with the session gone."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")   # created 0600
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def launch_record(argv: list[str], session: str) -> dict:
@@ -199,6 +269,21 @@ def started_after(pid: int, when: float) -> bool:
         return False
 
 
+def process_cmdline(pid: int) -> Optional[list[str]]:
+    """The command line of process `pid`; None when it cannot be read (it is gone, or not ours)."""
+    try:
+        return list(psutil.Process(pid).cmdline() or [])
+    except psutil.Error:
+        return None
+
+
+def same_path(a: str, b: Path) -> bool:
+    try:
+        return Path(a).expanduser().resolve() == Path(b).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return str(a) == str(b)
+
+
 def port_free(host: str, port: int) -> bool:
     """Whether a server could bind host:port (uvicorn binds with SO_REUSEADDR too)."""
     with socket.socket() as s:
@@ -210,6 +295,67 @@ def port_free(host: str, port: int) -> bool:
     return True
 
 
+def canonical_ip(text: str) -> Optional[str]:
+    """`text` as the one spelling of an IP address (`::1`, not `0:0:0:0:0:0:0:1`; a link-local
+    `%en0` scope dropped), or None when it is not one."""
+    try:
+        return str(ipaddress.ip_address(text.strip("[]").split("%", 1)[0]))
+    except ValueError:
+        return None
+
+
+def local_addresses() -> set[str]:
+    """Every name and address this Mac answers on: each interface's addresses (LAN, VPN, link-local),
+    loopback, the wildcard, and its hostname with the `.local` form Bonjour gives it. Lower-cased."""
+    own = set(LOCAL_HOSTS)
+    try:
+        for entries in psutil.net_if_addrs().values():
+            for entry in entries:
+                if entry.family in (socket.AF_INET, socket.AF_INET6) and (ip := canonical_ip(entry.address)):
+                    own.add(ip)
+    except (psutil.Error, OSError):
+        pass
+    try:
+        name = socket.gethostname().lower()
+    except OSError:
+        name = ""
+    if name:
+        short = name.split(".")[0]
+        own |= {name, short, f"{short}.local"}
+    return own
+
+
+def resolve_host(host: str, timeout: Optional[float] = None) -> set[str]:
+    """The addresses `host` names: an IP literal is itself; a name is looked up on a thread we stop
+    waiting for after `timeout` (getaddrinfo has none of its own), so a dead DNS or a `.local`
+    name nobody answers for cannot hang a Start."""
+    if (ip := canonical_ip(host)) is not None:
+        return {ip}
+    resolved: list[set[str]] = []
+
+    def lookup() -> None:
+        try:
+            infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except (OSError, UnicodeError):
+            infos = []
+        resolved.append({ip for info in infos if (ip := canonical_ip(str(info[4][0])))})
+
+    thread = threading.Thread(target=lookup, name="resolve-host", daemon=True)
+    thread.start()
+    thread.join(RESOLVE_TIMEOUT_S if timeout is None else timeout)
+    return resolved[0] if resolved else set()
+
+
+def signal_child(proc: Any, sig: int) -> None:
+    """Signal a process through the Popen we spawned it with: it knows the pid is still its
+    child's (never reused until reaped), where a bare os.kill on a recorded pid does not. A
+    stand-in without send_signal cannot be signalled."""
+    send = getattr(proc, "send_signal", None)
+    if send is not None:
+        with contextlib.suppress(OSError):
+            send(sig)
+
+
 class Launcher:
     def __init__(
         self,
@@ -217,7 +363,7 @@ class Launcher:
         python: Optional[str] = None,
         popen: PopenFn = subprocess.Popen,
         http: Optional[httpx.Client] = None,
-        discover_fn: Callable[[float], Optional[str]] = discover,
+        discover_fn: Optional[Callable[[float], Optional[str]]] = None,
         lan_ip_fn: Callable[[], str] = lan_ip,
         memory_fn: Callable[[], tuple[int, int]] = system_memory,
         port_free_fn: Callable[[str, int], bool] = port_free,
@@ -230,16 +376,32 @@ class Launcher:
         self.python = python or sys.executable
         self._popen = popen
         self._http = http or stateless_http()
-        self._discover = discover_fn
+        # While hosting, the first advertisement to answer is our own coordinator: take the first
+        # that is not (``discover`` is looked up when called, so tests can stand one in).
+        self._discover = discover_fn or (lambda timeout: discover(timeout, exclude=self.is_own_url))
         self._lan_ip = lan_ip_fn
         self._memory = memory_fn
         self._port_free = port_free_fn
         self.last_error = ""
+        # One launcher serves every request thread of the shell: starts, stops and the status polls
+        # that reap and restart processes take this lock (re-entrant: start() ends in snapshot()).
+        # Reading the settings never does: a start holds the lock for up to ~25 s while the async
+        # handlers (the proxy) load them on the event loop, and launcher.json is replaced atomically.
+        self._lock = threading.RLock()
         self._coordinator_proc: Any = None      # the coordinator this launcher spawned, while it runs
         self._coordinator_log_at = 0            # coordinator.log size when it was spawned
-        self._stopping: list[Any] = []          # coordinators we stopped, reaped once they exit
+        self._stopping: list[Any] = []          # processes we stopped, reaped once they exit
+        self._agent_proc: Any = None            # the training agent we spawned, reaped when it exits
+        self._agent_stop_pid: Optional[int] = None   # the agent we asked to stop, until it has
+        self._agent_stop_at: Optional[float] = None  # when we asked (monotonic), for the hung check
         self._inference_proc: Any = None        # the LLM node we spawned, to report its exit
         self._inference_log_at = 0
+        # A restart that could not happen yet (the old process still finishes its step): what to
+        # start it as, done from snapshot() once the old one is gone.
+        self._pending_agent: Optional[tuple[list[str], str]] = None
+        self._pending_inference: Optional[tuple[list[str], str]] = None
+        # What the last snapshot() reported: a bounded poll that finds the lock taken gets this.
+        self._last_snapshot = StatusSnapshot()
         self.paths = AgentPaths(self.home)
 
     @property
@@ -257,6 +419,9 @@ class Launcher:
         return d
 
     def load_settings(self) -> LauncherSettings:
+        """The saved settings. Lock-free: write_private replaces launcher.json atomically, so a
+        reader sees the old or the new file, never a partial one — and the shell's event loop
+        must never wait behind a Start holding the lock."""
         if not self.settings_path.exists():
             return LauncherSettings()
         try:
@@ -288,10 +453,27 @@ class Launcher:
 
     def save_settings(self, settings: LauncherSettings) -> None:
         s = settings.clamp()
-        before = self.load_settings()
-        if (s.mode, s.url) != (before.mode, before.url):
-            self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
-        write_private(self.settings_path, json.dumps(asdict(s), indent=2) + "\n")
+        with self._lock:
+            before = self.load_settings()
+            if (s.mode, s.url) != (before.mode, before.url):
+                self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
+            write_private(self.settings_path, json.dumps(asdict(s), indent=2) + "\n")
+
+    def update_settings(self, changes: Optional[dict] = None,
+                        edit: Optional[SettingsEdit] = None) -> LauncherSettings:
+        """Change the saved settings in one locked read-modify-write and return what was saved:
+        `changes` are field values to replace (a partial body: the slider alone, Connect's mode and
+        url), `edit` any further change that depends on the result or on what is stored (a session
+        bound to the pool the settings now point at, a clear of one token only). Every request
+        thread used to load, change and save on its own: two of them changing different fields at
+        once (a slider save landing during a Start) lost one of the changes."""
+        with self._lock:
+            s = replace(self.load_settings(), **(changes or {}))
+            if edit is not None:
+                s = edit(s)
+            s = s.clamp()
+            self.save_settings(s)
+            return s
 
     def session_for(self, settings: LauncherSettings, url: Optional[str] = None) -> str:
         """The stored session, but only for the pool that issued it (`url`, default the pool the
@@ -323,7 +505,7 @@ class Launcher:
         return self.coordinator_url(s)
 
     def coordinator_argv(self, transport: str = "direct") -> list[str]:
-        argv = [self.python, "-m", "slashcompute.coordinator.main", "serve",
+        argv = [self.python, "-m", COORDINATOR_MODULE, "serve",
                 "--home", str(self.home)]
         if transport != "direct":
             argv.extend(["--inference-transport", transport])
@@ -356,7 +538,27 @@ class Launcher:
             pid = int(self.inference_pid_path.read_text().strip())
         except (OSError, ValueError):
             return None
-        return pid if process_alive(pid) else None
+        if not process_alive(pid):
+            return None
+        if not self._owned_process(pid, INFERENCE_MODULE):
+            self.inference_pid_path.unlink(missing_ok=True)   # another program has the pid now
+            return None
+        return pid
+
+    def _owned_process(self, pid: Optional[int], module: str) -> bool:
+        """Whether `pid` is alive and is our `module` serving this home. After a crash or a reboot
+        the pid in a left-over pid file can belong to any other program: the UI must not call it
+        ours and Stop must not SIGTERM it."""
+        if not pid or not process_alive(pid):
+            return False
+        argv = process_cmdline(pid)
+        if argv is None:
+            return True   # alive, but its command line is out of reach: the pid file is all we have
+        if not any(module in arg for arg in argv):
+            return False
+        if "--home" in argv[:-1]:
+            return same_path(argv[argv.index("--home") + 1], self.home)
+        return same_path(str(EngineConfig.from_env().home), self.home)   # started with the default home
 
     def inference_status(self) -> dict:
         try:
@@ -436,6 +638,10 @@ class Launcher:
         Start serving used to resend every setting through ``start``. A training setting saved
         since the agent started (its memory, say) then restarted the training agent, which can't
         stop while it downloads a model, so the click failed with "still stopping"."""
+        with self._lock:
+            return self._set_inference(on, **changes)
+
+    def _set_inference(self, on: bool, **changes: Any) -> StatusSnapshot:
         allowed = {k: v for k, v in changes.items() if k in INFERENCE_SETTINGS}
         s = replace(self.load_settings(), **allowed)
         # Lending to LLMs is contributing; fine-tuning stays as it is right now.
@@ -445,6 +651,7 @@ class Launcher:
         self.save_settings(s)
         self.last_error = ""
         if not on:
+            self._pending_inference = None
             self._stop_inference()
             return self.snapshot(s)
         url = self.coordinator_url(s)
@@ -485,6 +692,9 @@ class Launcher:
         self.wait_health(self.proxy_url(settings))
 
     def read_coordinator_pid(self) -> Optional[int]:
+        """Our coordinator's pid from coordinator.pid, or None (and no file) when the process it
+        names is gone, began after the file was written, or is not our coordinator for this home:
+        a stale pid reused by another program is neither reported as ours nor ever signalled."""
         if not self.coordinator_pid_path.exists():
             return None
         try:
@@ -492,7 +702,8 @@ class Launcher:
             written = self.coordinator_pid_path.stat().st_mtime
         except (OSError, ValueError):
             return None
-        if process_alive(pid) and not started_after(pid, written):
+        if (process_alive(pid) and not started_after(pid, written)
+                and self._owned_process(pid, COORDINATOR_MODULE)):
             return pid
         self.coordinator_pid_path.unlink(missing_ok=True)
         return None
@@ -503,7 +714,7 @@ class Launcher:
         pids = []
         for proc in psutil.process_iter(["cmdline", "status"]):
             argv = proc.info["cmdline"] or []
-            if (proc.info["status"] != psutil.STATUS_ZOMBIE and "slashcompute.coordinator.main" in argv
+            if (proc.info["status"] != psutil.STATUS_ZOMBIE and COORDINATOR_MODULE in argv
                     and "serve" in argv and "--home" in argv[:-1]
                     and argv[argv.index("--home") + 1] == str(self.home)):
                 pids.append(proc.pid)
@@ -565,7 +776,9 @@ class Launcher:
             r = self._http.get(f"{url.rstrip('/')}/health", timeout=health_timeout(url))
             if r.status_code == 200:
                 data = r.json()
-                return data if isinstance(data, dict) else {"ok": True}
+                if not isinstance(data, dict):
+                    return {"ok": True}
+                return data if valid_health(data) else None   # malformed counts: unhealthy
         except Exception:
             return None
         return None
@@ -581,8 +794,30 @@ class Launcher:
         return False
 
     def find_on_lan(self, timeout: float = 5.0) -> Optional[str]:
+        """The first coordinator advertised on the LAN that is not the one hosted on this Mac
+        (Connect would join it only for start(join) to stop hosting it). While hosting, ours is
+        the first to answer: discovery keeps listening past it until `timeout`."""
         found = self._discover(timeout)
-        return normalize_url(found) if found else None
+        if not found:
+            return None
+        url = normalize_url(found)
+        return None if self.is_own_url(url) else url
+
+    def is_own_url(self, url: str) -> bool:
+        """Whether `url` is this Mac's own coordinator: on our port, at any address or name this
+        Mac answers on — an interface (LAN, VPN), loopback, 0.0.0.0, `my-mac.local` or another
+        name resolving to one of them. The LAN ip and loopback alone missed the rest, and
+        start(join) then stopped the very pool it had just joined."""
+        try:
+            parts = urlsplit(normalize_url(url, self.cfg.coordinator_port))
+            port = parts.port or {"https": 443}.get(parts.scheme, 80)
+        except ValueError:
+            return False
+        host = (parts.hostname or "").lower()
+        if not host or port != self.cfg.coordinator_port:
+            return False
+        own = local_addresses() | {self._lan_ip()}
+        return (canonical_ip(host) or host) in own or bool(resolve_host(host) & own)
 
     def _ensure_coordinator(self, s: LauncherSettings, url: str) -> None:
         """Hosting: run our coordinator (with the chosen LLM transport) and wait for it to answer."""
@@ -608,6 +843,17 @@ class Launcher:
             self._restart_coordinator(s)
 
     def start(self, settings: LauncherSettings) -> StatusSnapshot:
+        with self._lock:
+            return self._start(settings)
+
+    def start_with(self, changes: Optional[dict] = None, edit: Optional[SettingsEdit] = None) -> StatusSnapshot:
+        """Start with the saved settings changed by `changes` (and `edit`, as update_settings takes
+        them). Merged under the lock: a Start that merged the body first and took the lock after
+        overwrote a slider save that landed in between."""
+        with self._lock:
+            return self._start(self.update_settings(changes, edit))
+
+    def _start(self, settings: LauncherSettings) -> StatusSnapshot:
         s = settings.clamp()
         self.save_settings(s)
         self.last_error = ""
@@ -634,10 +880,12 @@ class Launcher:
         if s.mode in ("join", "public") and not self.poll_health(url):
             self.last_error = f"No coordinator at {url}."
             raise LauncherError(self.last_error)
-        if s.mode in ("join", "public"):
+        if s.mode in ("join", "public") and not self.is_own_url(url):
             self._stop_coordinator()   # the new pool answers: stop hosting ours, nothing here dials it now
-        if not want_agent and self._agent_running():
-            request_stop(self.paths)
+        if not want_agent:
+            self._pending_agent = None
+            if self._agent_running():
+                self._request_agent_stop()
         if want_agent:
             self._ensure_agent(self.agent_argv(agent_url, s.gpu_percent, s.memory_gb),
                                self._agent_session(s, agent_url))
@@ -654,12 +902,24 @@ class Launcher:
 
     def rebind_session(self) -> StatusSnapshot:
         """After a sign-in or sign-out: restart the agent and LLM node running here with the session
-        now stored for their pool, so they earn for the signed-in account without another Start."""
+        now stored for their pool, so they earn for the signed-in account without another Start.
+        One that cannot stop yet is restarted from a later snapshot(): this Mac never silently
+        stops contributing over a sign-in."""
+        with self._lock:
+            return self._rebind_session()
+
+    def _rebind_session(self) -> StatusSnapshot:
         s = self.load_settings()
         try:
-            if self._agent_running() and (argv := recorded_argv(self._read_agent_args())):
+            if self._pending_agent is not None:   # restarting anyway: with the session stored now
+                argv, _ = self._pending_agent
+                self._pending_agent = (argv, self._agent_session(s, argv[argv.index("--url") + 1]))
+            elif self._agent_running() and (argv := recorded_argv(self._read_agent_args())):
                 self._ensure_agent(argv, self._agent_session(s, argv[argv.index("--url") + 1]))
-            if self.read_inference_pid() is not None and (argv := recorded_argv(self._read_inference_args())):
+            if self._pending_inference is not None:
+                argv, _ = self._pending_inference
+                self._pending_inference = (argv, self.session_for(s, argv[argv.index("--url") + 1]))
+            elif self.read_inference_pid() is not None and (argv := recorded_argv(self._read_inference_args())):
                 self._ensure_inference(argv, self.session_for(s, argv[argv.index("--url") + 1]))
         except LauncherError:
             pass   # last_error says why
@@ -668,29 +928,51 @@ class Launcher:
     def _agent_session(self, s: LauncherSettings, url: str) -> str:
         return self.session_for(s, url) or os.environ.get("SLASHCOMPUTE_SESSION", "")
 
+    def _request_agent_stop(self) -> None:
+        """Ask our training agent to stop (it drains its step first); its exit is expected now."""
+        proc, self._agent_proc = self._agent_proc, None
+        if proc is not None:
+            self._stopping.append(proc)
+        self._agent_stop_pid = self.paths.read_pid()
+        self._agent_stop_at = time.monotonic()
+        if self._agent_stop_pid is None and proc is not None and proc.poll() is None:
+            # Spawned moments ago, agent.pid not written yet: only its Popen can name it.
+            self._agent_stop_pid = int(proc.pid)
+            signal_child(proc, signal.SIGTERM)
+            return
+        request_stop(self.paths)
+
     def _ensure_agent(self, argv: list[str], session: str) -> None:
-        """Run the training agent as `argv` with `session`, restarting one started differently."""
+        """Run the training agent as `argv` with `session`, restarting one started differently.
+        One still draining after a short wait is restarted later, from snapshot(), once it is gone:
+        a settings change or sign-in must never leave this Mac quietly not contributing."""
         record = launch_record(argv, session)
         if self._agent_running() and self._read_agent_args() != record:
-            request_stop(self.paths)
+            self._request_agent_stop()
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline and self._agent_running():
                 time.sleep(0.05)
             if self._agent_running():
-                self.last_error = (
-                    "Training agent is still stopping. Settings have not been applied; "
-                    "start again after its current work finishes."
-                )
+                self._pending_agent = (argv, session)
+                self.last_error = AGENT_RESTARTING
+                return
+        self._pending_agent = None
         if not self._agent_running():
-            self._spawn(argv, self.log_dir / "agent.log", session=session)
+            self._agent_proc = self._spawn(argv, self.log_dir / "agent.log", session=session)
             write_private(self._agent_args_path(), json.dumps(record))
 
     def _ensure_inference(self, argv: list[str], session: str) -> Any:
         """Run the LLM node as `argv` with `session`, restarting one started differently.
-        Returns the process when it started one."""
+        Returns the process when it started one. One still draining after the wait is restarted
+        later, from snapshot()."""
         record = launch_record(argv, session)
         if self.read_inference_pid() is not None and self._read_inference_args() != record:
             self._stop_inference(wait=10.0)   # settings changed: drain, then rejoin with the new ones
+            if self.read_inference_pid() is not None:
+                self._pending_inference = (argv, session)
+                self.last_error = NODE_RESTARTING
+                return None
+        self._pending_inference = None
         if self.read_inference_pid() is not None:
             return None
         log = self.log_dir / "inference.log"
@@ -702,17 +984,23 @@ class Launcher:
         return self._inference_proc
 
     def stop(self) -> StatusSnapshot:
-        self.last_error = ""
-        request_stop(self.paths)
-        self._stop_inference()
-        self._stop_coordinator()
-        return self.snapshot()
+        with self._lock:
+            self.last_error = ""
+            self._pending_agent = self._pending_inference = None
+            if self._agent_running():   # never SIGTERM a stranger that was given a stale pid
+                self._request_agent_stop()
+            self._stop_inference()
+            self._stop_coordinator()
+            return self.snapshot()
 
     def _stop_coordinator(self) -> None:
+        """Stop the coordinator hosted from this home, and only that: a pid from the pid file or
+        a command line is signalled only once it is confirmed ours (another home's pool, or a
+        program that inherited a stale pid, is never SIGTERMed)."""
         self._forget_coordinator()
         # Also those found by command line: Stop must not leave ours up when its pid file was lost.
         for pid in dict.fromkeys([self.read_coordinator_pid(), *self.find_coordinators()]):
-            if pid is None:
+            if pid is None or not self._owned_process(pid, COORDINATOR_MODULE):
                 continue
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -721,9 +1009,12 @@ class Launcher:
 
     def stop_agent(self) -> StatusSnapshot:
         """Stop contributing; a coordinator hosted here keeps running."""
-        self.last_error = ""
-        request_stop(self.paths)
-        return self.snapshot()
+        with self._lock:
+            self.last_error = ""
+            self._pending_agent = None
+            if self._agent_running():
+                self._request_agent_stop()
+            return self.snapshot()
 
     def my_node_id(self) -> Optional[str]:
         """This Mac's agent id, once it has registered. Never creates one."""
@@ -747,45 +1038,103 @@ class Launcher:
             return []
         return data if isinstance(data, list) else []
 
-    def snapshot(self, settings: Optional[LauncherSettings] = None) -> StatusSnapshot:
-        s = settings.clamp() if settings is not None else self.load_settings()
-        self._check_coordinator()
-        self._check_inference()
+    def snapshot(self, settings: Optional[LauncherSettings] = None,
+                 wait: Optional[float] = None) -> StatusSnapshot:
+        """What runs here and whether the pool answers. `wait` bounds how long a poll waits for the
+        lock (a Start or Start serving holds it for up to ~25 s): when it is not free in time the
+        last snapshot taken is returned as it was, so the window keeps polling instead of hanging.
+        Without `wait` the call waits, as start() does for the snapshot it ends in."""
+        timeout = -1 if wait is None else wait
+        if not self._lock.acquire(timeout=timeout):
+            return self._last_snapshot
+        try:   # what reaps, restarts or forgets processes; the network polls run outside
+            s = settings.clamp() if settings is not None else self.load_settings()
+            self._check_coordinator()
+            self._check_inference()
+            self._check_agent()
+            self._finish_pending()
+            agent = self.paths.read_status()
+            agent_pid = self._agent_pid()
+            agent_running = agent_pid is not None
+            if agent_running and self.paths.read_pid() != agent_pid:
+                agent = {}   # spawned moments ago: status.json is still the last run's
+            restart_pending = self._pending_agent is not None
+            draining = agent_running and (
+                bool(agent.get("draining")) or restart_pending or self._agent_stop_pid == agent_pid)
+            inference_pid = self.read_inference_pid()
+            inference_status = self.inference_status() if inference_pid is not None else {}
+            coordinator_pid = self.read_coordinator_pid()
+        finally:
+            self._lock.release()
         url = self.coordinator_url(s)
         health = self.poll_health(self.proxy_url(s)) if s.mode == "host" else None
         health = health or self.poll_health(url) or {}
-        if health and self.last_error.startswith(UNREACHABLE_ERRORS):
-            self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
-        agent = self.paths.read_status()
-        agent_pid = self.paths.read_pid()
-        agent_running = bool(agent_pid and process_alive(agent_pid))
-        if agent_pid and not agent_running:
-            self.paths.clear_pid()
-            agent_pid = None
-        inference_pid = self.read_inference_pid()
         mem_total, mem_free = self._memory()
-        return StatusSnapshot(
+        if self._lock.acquire(timeout=timeout):
+            try:
+                if health and self.last_error.startswith(UNREACHABLE_ERRORS):
+                    self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
+                last_error = self.last_error
+            finally:
+                self._lock.release()
+        else:
+            last_error = self.last_error   # a Start took the lock meanwhile: report, never clear
+        snap = StatusSnapshot(
             coordinator_up=bool(health),
-            nodes=int(health.get("nodes", 0) or 0),
-            jobs=int(health.get("jobs", 0) or 0),
+            nodes=health_count(health, "nodes"),
+            jobs=health_count(health, "jobs"),
             agent_running=agent_running,
             agent_status=str(agent.get("status", "") or ""),
             agent_job_id=agent.get("job_id"),
             agent_fetch_done_bytes=agent.get("fetch_done_bytes") if agent_running else None,
             agent_fetch_total_bytes=agent.get("fetch_total_bytes") if agent_running else None,
-            coordinator_pid=self.read_coordinator_pid(),
-            agent_pid=agent_pid if agent_running else None,
+            agent_draining=draining,
+            agent_restart_pending=restart_pending,
+            agent_gpu_percent=agent_gpu_percent(agent) if agent_running else None,
+            coordinator_pid=coordinator_pid,
+            agent_pid=agent_pid,
             lan_ip=self._lan_ip(),
-            last_error=self.last_error,
+            last_error=last_error,
             inference_running=inference_pid is not None,
             inference_pid=inference_pid,
-            inference_status=self.inference_status() if inference_pid is not None else {},
-            inference_nodes=int(health.get("inference_nodes", 0) or 0),
+            inference_status=inference_status,
+            inference_nodes=health_count(health, "inference_nodes"),
             inference_transport=str(health.get("inference_transport", "") or ""),
             inference_supported=supports_inference(health),
             memory_total_bytes=mem_total,
             memory_available_bytes=mem_free,
         )
+        self._last_snapshot = snap
+        return snap
+
+    def _check_agent(self) -> None:
+        """Reap the training agent we spawned once it exits (a zombie until then, and the
+        coordinators and nodes we stopped along with it)."""
+        self._stopping = [p for p in self._stopping if p.poll() is None]
+        if self._agent_proc is not None and self._agent_proc.poll() is not None:
+            self._agent_proc = None
+        self._force_stop_hung_agent()
+
+    def _finish_pending(self) -> None:
+        """Complete a restart that waited for the old agent or LLM node to finish its step."""
+        if self._pending_agent is not None and not self._agent_running():
+            argv, session = self._pending_agent
+            self._pending_agent = None   # one attempt: if it fails, last_error says why
+            try:
+                self._ensure_agent(argv, session)
+            except LauncherError:
+                return
+            if self.last_error == AGENT_RESTARTING:
+                self.last_error = ""
+        if self._pending_inference is not None and self.read_inference_pid() is None:
+            argv, session = self._pending_inference
+            self._pending_inference = None
+            try:
+                self._ensure_inference(argv, session)
+            except LauncherError:
+                return
+            if self.last_error == NODE_RESTARTING:
+                self.last_error = ""
 
     def _read_inference_args(self) -> Any:
         try:
@@ -802,9 +1151,49 @@ class Launcher:
         except (OSError, ValueError):
             return []
 
-    def _agent_running(self) -> bool:
+    def _agent_pid(self) -> Optional[int]:
+        """The pid of our running training agent: the one agent.pid names when that is ours, else
+        the one we spawned and have not asked to stop while it still runs (it writes agent.pid
+        only once its imports are done, seconds in which a second Start used to spawn another).
+        A pid file left by one that is gone, or that now names another program, is removed."""
         pid = self.paths.read_pid()
-        return bool(pid and process_alive(pid))
+        if pid is not None and self._owned_process(pid, AGENT_MODULE):
+            return pid
+        if pid is not None:
+            self.paths.clear_pid()
+            if self._agent_stop_pid == pid:
+                self._agent_stop_pid = self._agent_stop_at = None
+        proc = self._agent_proc
+        return int(proc.pid) if proc is not None and proc.poll() is None else None
+
+    def _agent_running(self) -> bool:
+        return self._agent_pid() is not None
+
+    def _force_stop_hung_agent(self) -> None:
+        """An agent asked to stop drains its step for the grace period (daemon.shutdown waits that
+        long) and then exits; one still alive a margin later is hung and is killed, so the shell
+        does not say "Stopping…" for ever. Only our own agent is signalled (_agent_pid vouches for
+        the pid), and a restart that waited on it is dropped: last_error says what happened."""
+        pid, asked = self._agent_stop_pid, self._agent_stop_at
+        if pid is None or asked is None:
+            return
+        if self._agent_pid() != pid:                  # it is gone (or another agent runs now)
+            self._agent_stop_pid = self._agent_stop_at = None
+            return
+        limit = self.cfg.grace_period_s + AGENT_STOP_MARGIN_S
+        if time.monotonic() - asked < limit:
+            return
+        # The agent leads its own session (_spawn: start_new_session), so its pid is its group's:
+        # killing the group takes the children it hung on (a model download) with it. One that
+        # leads no group of ours (started by hand) is killed by itself.
+        with contextlib.suppress(OSError):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+        self._agent_stop_pid = self._agent_stop_at = None
+        self._pending_agent = None
+        self.last_error = AGENT_FORCE_STOPPED.format(seconds=limit)
 
     def _spawn(self, argv: list[str], log_path: Path,
                pid_writer: Optional[Callable[[int], None]] = None, session: Optional[str] = None) -> Any:

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import queue
 import socket
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from slashcompute.common.config import MDNS_SERVICE_TYPE
 
@@ -63,17 +64,19 @@ class Advertiser:
         self._azc = None
 
 
-def discover(timeout: float = 5.0) -> Optional[str]:
-    """Return ``http://host:port`` of the first coordinator found, or None."""
+def discover(timeout: float = 5.0, exclude: Optional[Callable[[str], bool]] = None) -> Optional[str]:
+    """Return ``http://host:port`` of the first coordinator advertised on the LAN that ``exclude``
+    does not reject (any, by default), or None once ``timeout`` has passed. Advertisements are
+    taken as they arrive until then: while hosting, the first one is this Mac's own pool."""
     from zeroconf import ServiceBrowser, Zeroconf
 
-    found: list[str] = []
+    found: queue.Queue[str] = queue.Queue()   # filled from zeroconf's thread
 
     class _Listener:
         def add_service(self, zc, type_, name):
             info = zc.get_service_info(type_, name, timeout=2000)
             if info and info.addresses:
-                found.append(f"http://{socket.inet_ntoa(info.addresses[0])}:{info.port}")
+                found.put(f"http://{socket.inet_ntoa(info.addresses[0])}:{info.port}")
 
         def update_service(self, *a):
             pass
@@ -85,8 +88,13 @@ def discover(timeout: float = 5.0) -> Optional[str]:
     try:
         ServiceBrowser(zc, MDNS_SERVICE_TYPE, _Listener())
         deadline = time.monotonic() + timeout
-        while not found and time.monotonic() < deadline:
-            time.sleep(0.1)
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                url = found.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if exclude is None or not exclude(url):
+                return url
     finally:
         zc.close()
-    return found[0] if found else None
+    return None

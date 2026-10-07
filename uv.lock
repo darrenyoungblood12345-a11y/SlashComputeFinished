@@ -1531,7 +1531,7 @@ requires-dist = [
     { name = "mlx-lm", specifier = ">=0.21" },
     { name = "msgpack", specifier = ">=1.0" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "psutil", specifier = ">=5.9" },
+    { name = "psutil", specifier = ">=6.0" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "pywebview", specifier = ">=5.0" },

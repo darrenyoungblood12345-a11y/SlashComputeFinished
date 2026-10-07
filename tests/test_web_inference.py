@@ -1,8 +1,11 @@
 """Shell + launcher side of LLM inference: the LLMs view, streaming chat/upload passthrough, the inference node."""
 
+import asyncio
 import json
 import os
 import re
+import threading
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -10,9 +13,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from slashcompute.launcher.controller import Launcher, LauncherSettings
-from slashcompute.web.server import create_shell
+from slashcompute.web.server import _drop_upstream, create_shell
 
 SHELL = "http://127.0.0.1:8766"   # the shell refuses any Host but loopback
+
+
+@pytest.fixture(autouse=True)
+def _unknown_cmdlines(monkeypatch):
+    """The fake pids in these tests belong to no process (or, worse, to some unrelated real one):
+    their command lines are unreadable, which leaves the pid files trusted as before."""
+    monkeypatch.setattr("slashcompute.launcher.controller.process_cmdline", lambda pid: None)
 
 
 class FakeProc:
@@ -88,17 +98,150 @@ def test_chat_streams_sse_through_with_session(tmp_path):
         seen["url"] = str(request.url)
         seen["body"] = json.loads(request.content)
         seen["cookie"] = request.headers.get("cookie")
+        seen["authorization"] = request.headers.get("authorization")
         sse = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
         return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
 
-    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
-        c.cookies.set("slashcompute_session", "tok")
+    app = _shell(tmp_path, handler)
+    launcher = app.state.launcher
+    launcher.save_settings(launcher.with_session(launcher.load_settings(), "tok"))   # signed in to this pool
+    with TestClient(app, base_url=SHELL) as c:
+        c.cookies.set("slashcompute_session", "stale-from-another-home")   # the shared WKWebView jar
         r = c.post("/api/chat", json={"model": "m.gguf", "messages": [{"role": "user", "content": "x"}]})
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
     assert r.text.endswith("data: [DONE]\n\n")
     assert seen["url"] == "http://127.0.0.1:8765/v1/chat/completions"
     assert seen["body"]["stream"] is True
-    assert "slashcompute_session=tok" in seen["cookie"]
+    # The stored session signs the chat in; the browser's cookie is never forwarded.
+    assert seen["authorization"] == "Bearer tok" and seen["cookie"] is None
+
+
+def test_chat_reads_the_settings_off_the_event_loop(tmp_path):
+    """A Start holding the launcher's lock must not freeze the shell for a chat that is only reading
+    the settings on its way to the coordinator."""
+    app = _shell(tmp_path, lambda r: httpx.Response(200, content=b"data: [DONE]\n\n",
+                                                    headers={"content-type": "text/event-stream"}))
+    launcher = app.state.launcher
+    real, inside = launcher.load_settings, threading.Event()
+
+    def held_up():
+        inside.set()
+        time.sleep(0.4)
+        return real()
+
+    launcher.load_settings = held_up
+    with TestClient(app, base_url=SHELL) as c:
+        stuck = threading.Thread(target=lambda: c.post("/api/chat", json={"model": "m", "messages": []}))
+        stuck.start()
+        assert inside.wait(5)
+        t0 = time.monotonic()
+        assert c.get("/api/shell").status_code == 200
+        quick = time.monotonic() - t0
+        stuck.join()
+    assert quick < 0.15, f"the shell froze for {quick:.2f}s while a handler waited on the launcher"
+
+
+async def test_an_upstream_response_that_will_not_be_relayed_is_closed():
+    """send_upstream lets go of a coordinator response that arrived just as the window left (or just
+    as the cancel did): the response must still be closed, or its connection stays leased."""
+    closed = []
+
+    class Arrived:
+        async def aclose(self):
+            closed.append(True)
+
+    loop = asyncio.get_running_loop()
+    arrived = loop.create_future()
+    arrived.set_result(Arrived())
+    await _drop_upstream(arrived)
+    assert closed == [True]
+    failed = loop.create_future()
+    failed.set_exception(httpx.ConnectError("refused"))
+    await _drop_upstream(failed)                         # nothing to close, nothing raised
+    pending = asyncio.ensure_future(asyncio.sleep(60))
+    await _drop_upstream(pending)
+    assert pending.cancelled()
+
+
+class BreaksMidStream(httpx.AsyncByteStream):
+    """A coordinator answer that dies after the first token (the coordinator restarted, a node died)."""
+
+    async def __aiter__(self):
+        yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        raise httpx.ReadError("connection lost")
+
+
+def test_chat_turns_a_mid_stream_failure_into_an_error_event(tmp_path):
+    def handler(request):
+        return httpx.Response(200, stream=BreaksMidStream(), headers={"content-type": "text/event-stream"})
+
+    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
+        r = c.post("/api/chat", json={"model": "m", "messages": []})
+    assert r.status_code == 200
+    events = [e for e in r.text.split("\n\n") if e]
+    assert events[0] == 'data: {"choices":[{"delta":{"content":"hi"}}]}'
+    assert "connection lost" in json.loads(events[1][len("data: "):])["error"]["message"]
+    assert events[2] == "data: [DONE]"
+
+
+async def test_chat_stops_waiting_for_the_pipeline_when_the_window_leaves(tmp_path):
+    """Forming a pipeline can take minutes before the first byte. A window that gave up meanwhile
+    (Stop, a closed tab) must not keep the coordinator request open until then."""
+    import asyncio
+
+    asked, cancelled = asyncio.Event(), []
+
+    async def handler(request):
+        asked.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return httpx.Response(200)
+
+    app = _shell(tmp_path, handler)
+    body = json.dumps({"model": "m", "messages": []}).encode()
+    inbox = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        if inbox:
+            return inbox.pop(0)
+        await asked.wait()                 # the window leaves once the coordinator has the request
+        return {"type": "http.disconnect"}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "http_version": "1.1", "method": "POST", "scheme": "http",
+             "path": "/api/chat", "raw_path": b"/api/chat", "root_path": "", "query_string": b"",
+             "headers": [(b"host", b"127.0.0.1:8766"), (b"content-type", b"application/json"),
+                         (b"content-length", str(len(body)).encode())],
+             "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8766)}
+    await asyncio.wait_for(app(scope, receive, send), 10)
+    assert cancelled and sent[0]["status"] == 499
+
+
+def test_multipart_forms_stream_through_the_proxy(tmp_path):
+    """A job's dataset goes to the coordinator as it arrives, boundary and all, off the event loop."""
+    seen = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["content_type"] = request.headers["content-type"]
+        seen["body"] = await request.aread()
+        return httpx.Response(200, json={"id": "job-1"})
+
+    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
+        r = c.post("/api/coord/jobs/upload", files={"dataset": ("d.jsonl", b'{"text":"a"}\n')},
+                   data={"model": "m", "steps": "3"})
+    assert r.status_code == 200 and r.json() == {"id": "job-1"}
+    assert seen["url"] == "http://127.0.0.1:8765/jobs/upload"
+    assert seen["content_type"].startswith("multipart/form-data; boundary=")
+    assert b'name="dataset"; filename="d.jsonl"' in seen["body"] and b'{"text":"a"}' in seen["body"]
+    assert b'name="steps"' in seen["body"]
 
 
 def test_chat_errors_keep_their_status(tmp_path):
@@ -144,9 +287,27 @@ def test_upload_streams_the_file_to_the_coordinator(tmp_path):
     data = os.urandom(300_000)
     with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
         r = c.post("/api/models/upload", content=data, headers={"x-filename": "m.gguf"})
-    assert r.status_code == 200 and r.json()["size"] == len(data)
-    assert seen["url"] == "http://127.0.0.1:8765/inference/models/upload?name=m.gguf"
-    assert seen["body"] == data
+        assert r.status_code == 200 and r.json()["size"] == len(data)
+        assert seen["url"] == "http://127.0.0.1:8765/inference/models/upload?name=m.gguf"
+        assert seen["body"] == data
+        # The window sends the name as a query parameter (headers mangle non-ASCII); it wins.
+        r = c.post("/api/models/upload?name=Qwen2.5-7B.gguf", content=data, headers={"x-filename": "old.gguf"})
+        assert r.status_code == 200
+        assert httpx.URL(seen["url"]).params["name"] == "Qwen2.5-7B.gguf"
+
+
+def test_upload_too_big_for_any_pool_is_refused_with_a_reason(tmp_path):
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(200, json={})
+
+    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
+        r = c.post("/api/models/upload?name=huge.gguf", content=b"GGUF",
+                   headers={"content-length": str((64 << 30) + 1)})
+    assert r.status_code == 413 and "huge.gguf" in r.json()["detail"] and "64 GiB" in r.json()["detail"]
+    assert sent == []
 
 
 def test_outdated_coordinator_is_explained_before_anything_is_sent(tmp_path):
