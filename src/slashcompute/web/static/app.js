@@ -8,6 +8,9 @@ const SETTING_KEYS = [
 ];
 const GIB = 1024 ** 3;
 const GRANTS_REFRESH_MS = 20000;
+const POLL_MS = 2000;
+const API_TIMEOUT_MS = 20000;
+const RATE_WINDOW = 5;          // polls averaged into the "now" rate
 const OUTDATED_COORDINATOR = "This pool's coordinator has no LLM inference: it runs an older /compute. "
   + "Ask whoever hosts it to update and restart it, or host a pool on this Mac.";
 const STATUS_TONE = {
@@ -19,9 +22,14 @@ const state = {
   tab: "contributions",
   ov: null,
   settings: null,
-  saving: 0,
+  saving: 0,          // saves queued or in flight
+  settingsVersion: 0, // bumped when a save starts: a poll begun earlier may not overwrite it
+  polling: false,
+  pollSeq: 0,         // the latest poll sent
+  pollApplied: 0,     // the latest poll whose answer was applied; older answers are dropped
   rates: [],
   last: null,
+  rateKey: "",        // pool + node the FLOPs counter belongs to; a change restarts the samples
   grants: null,
   grantsUp: null,     // coordinator_up when the board was last loaded
   grantsAt: 0,
@@ -31,6 +39,9 @@ const state = {
   fundOpen: null,
   fundMsg: "",
   busy: new Set(),
+  dirty: { url: false, publicUrl: false },   // address fields being edited: polls leave them alone
+  dragging: new Set(),                        // slider ids mid-drag: polls leave them alone
+  grantsWho: "",      // user id + admin flag the grant board was rendered for
   dataset: null,
   modelsShown: "",
   keys: {},
@@ -55,8 +66,27 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+// Gives up on a request that gets no answer: a hung poll must not block the next one.
+function timeoutSignal(ms) {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") return AbortSignal.timeout(ms);
+  if (typeof AbortController === "undefined") return undefined;   // no abort support: just no timeout
+  const ctl = new AbortController();
+  window.setTimeout(() => ctl.abort(), ms);
+  return ctl.signal;
+}
+
+// The message in an error body: {"detail": "..."} from the shell, FastAPI's 422 list of {msg},
+// or an OpenAI-style {"error": {"message"}} from the coordinator.
+function detailText(data, fallback) {
+  const d = data && typeof data === "object" ? (data.detail ?? (data.error && data.error.message)) : null;
+  if (typeof d === "string" && d) return d;
+  if (Array.isArray(d)) return d.map((x) => (x && x.msg) || JSON.stringify(x)).join("; ");
+  if (d != null) return JSON.stringify(d);
+  return fallback;
+}
+
 async function api(path, opts = {}) {
-  const next = { ...opts, credentials: "include", headers: { ...(opts.headers || {}) } };
+  const next = { signal: timeoutSignal(API_TIMEOUT_MS), ...opts, credentials: "include", headers: { ...(opts.headers || {}) } };
   if (next.body && !(next.body instanceof FormData) && !next.headers["content-type"]) {
     next.headers["content-type"] = "application/json";
   }
@@ -65,10 +95,9 @@ async function api(path, opts = {}) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!r.ok) {
-    const msg = (data && data.detail)
-      ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail))
-      : (text || r.statusText);
-    throw new Error(msg);
+    const err = new Error(detailText(data, text || r.statusText));
+    err.status = r.status;
+    throw err;
   }
   return data;
 }
@@ -85,15 +114,24 @@ function esc(s) {
 
 // ------------------------------------------------------------ formatting
 
-function fmtFlops(x) {
-  let v = Number(x) || 0;
-  let unit = "";
-  for (const u of ["K", "M", "G", "T", "P", "E"]) {
-    if (Math.abs(v) < 1000) break;
-    v /= 1000;
-    unit = u;
+// Scale |x| by `base` through `units`, rounding before the unit is chosen: 999.6 reads "1.00 K",
+// never "1000", and 1023.99 bytes read "1.0 KB", never "1024.0 B".
+function scaled(x, base, units, fmt) {
+  const n = Number(x) || 0;
+  let v = Math.abs(n);
+  let i = 0;
+  while (i < units.length - 1 && Number(fmt(v)) >= base) {
+    v /= base;
+    i += 1;
   }
-  const text = v === 0 ? "0" : Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+  return { text: `${n < 0 ? "-" : ""}${fmt(v)}`, unit: units[i] };
+}
+
+const sigFigs = (v) => (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2));
+
+function fmtFlops(x) {
+  if (!(Number(x) || 0)) return "0";
+  const { text, unit } = scaled(x, 1000, ["", "K", "M", "G", "T", "P", "E"], sigFigs);
   return unit ? `${text} ${unit}` : text;
 }
 
@@ -103,14 +141,9 @@ function withUnit(x, unit = "FLOPs") {
 }
 
 function fmtBytes(n) {
-  let v = Number(n) || 0;
-  let unit = "B";
-  for (const u of ["KB", "MB", "GB", "TB"]) {
-    if (Math.abs(v) < 1024) break;
-    v /= 1024;
-    unit = u;
-  }
-  return v === 0 ? "0" : `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${unit}`;
+  if (!(Number(n) || 0)) return "0 B";
+  const { text, unit } = scaled(n, 1024, ["B", "KB", "MB", "GB", "TB"], (v) => (v >= 100 ? v.toFixed(0) : v.toFixed(1)));
+  return `${text} ${unit}`;
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -132,9 +165,10 @@ function setDot(sel, tone, live = false) {
 // Re-render a list only when its data changed, so hover and focus survive polls.
 function renderOnce(key, data, el, html) {
   const sig = JSON.stringify(data);
-  if (state.keys[key] === sig) return;
+  if (state.keys[key] === sig) return false;
   state.keys[key] = sig;
   el.innerHTML = html();
+  return true;
 }
 
 function rangeFill(el) {
@@ -144,20 +178,24 @@ function rangeFill(el) {
 
 // ------------------------------------------------------------ memory sliders
 
-// Both sliders stop at the GPU working set (75% of RAM); 0 is "Auto".
+// Both sliders stop at the GPU working set (75% of RAM); 0 is "Auto". Until the service has
+// reported this Mac's memory nothing is assumed: `known` is false and the labels say a plain "Auto".
 function memoryLimits() {
   const st = status();
-  const total = (Number(st.memory_total_bytes) || 16 * GIB) / GIB;
-  return { total, cap: Math.max(1, Math.round(total * 0.75)), free: (Number(st.memory_available_bytes) || 0) / GIB };
+  const total = (Number(st.memory_total_bytes) || 0) / GIB;
+  const known = total > 0;
+  return { total, known, cap: known ? Math.max(1, Math.round(total * 0.75)) : 0, free: (Number(st.memory_available_bytes) || 0) / GIB };
 }
 
-const trainingAutoGb = () => Math.min(memoryLimits().free, memoryLimits().cap);   // what is free at start
-const inferenceAutoGb = () => Math.max(2, Math.round(memoryLimits().total * 0.75 - 4));
-const memLabel = (gb, autoGb) => (gb ? `${gb} GB` : `Auto · ≈${Math.round(autoGb)} GB`);
+const trainingAutoGb = () => { const m = memoryLimits(); return m.known && m.free > 0 ? Math.min(m.free, m.cap) : 0; };   // what is free at start
+const inferenceAutoGb = () => { const m = memoryLimits(); return m.known ? Math.max(2, Math.round(m.total * 0.75 - 4)) : 0; };
+const memLabel = (gb, autoGb) => (gb ? `${gb} GB` : autoGb > 0 ? `Auto · ≈${Math.round(autoGb)} GB` : "Auto");
+const upTo = () => (memoryLimits().known ? ` Up to ${memoryLimits().cap} GB.` : "");
 
 function syncMemSlider(el, out, saved, autoGb) {
-  el.max = String(Math.max(memoryLimits().cap, Number(saved) || 0));
-  if (document.activeElement !== el && saved != null) el.value = saved;
+  const { cap } = memoryLimits();
+  el.max = String(Math.max(cap || Number(el.max) || 12, Number(saved) || 0));
+  if (!state.dragging.has(el.id) && saved != null) el.value = saved;
   rangeFill(el);
   out.textContent = memLabel(Number(el.value), autoGb);
 }
@@ -176,12 +214,15 @@ function toast(text, tone = "ok") {
 const status = () => (state.ov && state.ov.status) || {};
 const pool = () => (state.ov && state.ov.pool) || { online: false, nodes: [], jobs: [], capacity: {} };
 const me = () => (state.ov && state.ov.me) || { flops: 0 };
-// The share the running agent was started with; a slider move only saves the next one.
-const liveGpuPercent = () => (me().node || {}).gpu_percent ?? (state.settings || {}).gpu_percent ?? 0;
+// The share the running agent actually uses; a slider move only saves the next one.
+const liveGpuPercent = () => status().agent_gpu_percent
+  ?? (me().node || {}).gpu_percent ?? (state.settings || {}).gpu_percent ?? 0;
 
 function credits() {
-  const split = Number((state.user && state.user.grant_split)
-    ?? (state.settings || {}).grant_split) || 0;
+  const s = state.settings || {};
+  // Mid-drag the split under the thumb is the one on screen, before the account has saved it.
+  const split = Number(state.dragging.has("split") ? s.grant_split
+    : ((state.user && state.user.grant_split) ?? s.grant_split)) || 0;
   if (state.credits) {
     const earned = Math.max(0, Number(state.credits.lifetime_earned) || 0);
     const toGrants = earned * split / 100;
@@ -221,42 +262,110 @@ function pickSettings(src) {
   return Object.fromEntries(SETTING_KEYS.map((k) => [k, src[k]]));
 }
 
-async function saveSettings(changes) {
+// Saves run one after another, each posting the settings as they stand when its turn comes, so
+// the value set last is the one stored last. Only the final answer in the chain is applied: an
+// earlier one would briefly undo a change still waiting its turn.
+const saveQueue = { tail: Promise.resolve(), seq: 0 };
+
+function saveSettings(changes) {
+  if (!state.settings) return Promise.resolve();   // nothing to merge into before the first overview
   state.settings = { ...state.settings, ...changes };
+  state.settingsVersion += 1;
   state.saving += 1;
-  try {
-    state.settings = pickSettings(await post("/api/settings", state.settings));
-  } catch (e) {
-    toast(e.message, "bad");
-  } finally {
-    state.saving -= 1;
-  }
+  const seq = ++saveQueue.seq;
+  saveQueue.tail = saveQueue.tail.then(async () => {
+    try {
+      const saved = pickSettings(await post("/api/settings", state.settings));
+      if (seq === saveQueue.seq) state.settings = saved;
+    } catch (e) {
+      toast(e.message, "bad");
+    } finally {
+      state.saving -= 1;
+    }
+  });
+  return saveQueue.tail;
+}
+
+// Settings from a poll replace ours only when no save began after the poll did and none is in
+// flight: the save's own answer is the newer truth. A split slider mid-drag keeps its value.
+function applySettings(st, version) {
+  if (!st) return;
+  if (state.settings && (version !== state.settingsVersion || state.saving > 0)) return;
+  const next = pickSettings(st);
+  if (state.settings && state.dragging.has("split")) next.grant_split = state.settings.grant_split;
+  state.settings = next;
 }
 
 // ------------------------------------------------------------ polling
 
-async function poll() {
+// One poll in flight at a time, the next scheduled once it has finished, so a hung request never
+// piles up behind itself. poll() while one is running waits for it and then runs a fresh one: an
+// action that awaits poll() sees the state after it, not an answer fetched before it.
+const pollRun = { inflight: null, next: null, timer: null };
+
+function poll() {
+  if (pollRun.inflight) {
+    if (!pollRun.next) {
+      pollRun.next = pollRun.inflight.catch(() => {}).then(() => {
+        pollRun.next = null;
+        return poll();
+      });
+    }
+    return pollRun.next;
+  }
+  window.clearTimeout(pollRun.timer);
+  state.polling = true;
+  pollRun.inflight = pollOnce().finally(() => {
+    pollRun.inflight = null;
+    state.polling = false;
+    pollRun.timer = window.setTimeout(poll, POLL_MS);
+  });
+  return pollRun.inflight;
+}
+
+async function pollOnce() {
+  const seq = ++state.pollSeq;
+  const version = state.settingsVersion;
   try {
     const ov = await api("/api/overview");
+    if (seq < state.pollApplied) return;   // a later poll has already answered
+    state.pollApplied = seq;
     trackRate(ov);
     state.ov = ov;
-    if (!state.settings || state.saving === 0) state.settings = pickSettings(ov.status);
+    applySettings(ov.status, version);
     if (ov.status && ov.status.coordinator_up) {
       await loadAuth();
       if (state.tab === "llm") await loadLlm();
+    } else {
+      dropPool();
     }
-    else { state.user = null; state.credits = null; }
   } catch (e) {
+    if (seq < state.pollApplied) return;
+    state.pollApplied = seq;
     state.ov = null;
-    state.user = null;
-    state.credits = null;
+    dropPool();
   }
   // The board comes from the coordinator: reload it when the pool comes or goes,
   // and now and then while the tab is open, so it never reads Live while offline.
   const up = !!status().coordinator_up;
   const stale = state.tab === "grants" && Date.now() - state.grantsAt > GRANTS_REFRESH_MS;
-  if (up !== state.grantsUp || stale) loadGrants(true);
+  // It is also per account (pledges, the admin's review queue): a session that ended or began
+  // elsewhere redraws it at once and reloads it.
+  const who = `${(state.user || {}).id || ""}:${!!(state.user && state.user.admin)}`;
+  const whoChanged = who !== state.grantsWho;
+  state.grantsWho = who;
+  if (whoChanged && state.grants) renderGrants();
+  if (up !== state.grantsUp || stale || (whoChanged && up)) loadGrants(true);
   render();
+}
+
+// The coordinator is gone: nothing read from it is current any more.
+function dropPool() {
+  state.user = null;
+  state.credits = null;
+  state.llm.net = null;
+  state.llm.models = [];
+  state.llm.error = "";
 }
 
 async function loadAuth() {
@@ -268,14 +377,24 @@ async function loadAuth() {
       const t = await api("/api/coord/auth/terms");
       state.terms = (t && t.text) || "";
     }
-  } catch {
-    state.user = null;
-    state.credits = null;
+  } catch (e) {
+    // Only a refused session signs us out; a timeout or a proxy hiccup keeps what we know.
+    if (e.status === 401) {
+      state.user = null;
+      state.credits = null;
+    }
   }
 }
 
 function trackRate(ov) {
   if (!ov.pool.online) return;
+  // The counter belongs to one pool and one node id: another pool's ledger would read as a burst.
+  const key = `${(ov.status || {}).coordinator_url || ""}|${(ov.me || {}).node_id || ""}`;
+  if (key !== state.rateKey) {
+    state.rateKey = key;
+    state.last = null;
+    state.rates = [];
+  }
   const now = Date.now() / 1000;
   const flops = Number(ov.me.flops) || 0;
   if (state.last && now > state.last[0]) {
@@ -285,7 +404,14 @@ function trackRate(ov) {
   state.last = [now, flops];
 }
 
+// The rate shown as "now": the mean of the last few samples, since one poll's step is noisy.
+function currentRate() {
+  const recent = state.rates.slice(-RATE_WINDOW);
+  return recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : 0;
+}
+
 function render() {
+  renderGate();
   renderSidebar();
   renderAuth();
   renderContributions();
@@ -293,6 +419,13 @@ function render() {
   renderGrantsLive();
   renderPool();
   renderLlm();
+}
+
+// Nothing that saves a setting is usable before the first overview: there is nothing to merge into.
+function renderGate() {
+  const locked = !state.settings;
+  $$("#gpu, #mem, #split, #l-mem, #l-dir, #p-mode button, #l-role button, #l-transport-seg button")
+    .forEach((el) => { el.disabled = locked; });
 }
 
 // ------------------------------------------------------------ sidebar + tabs
@@ -330,10 +463,11 @@ function renderSidebar() {
   }
   const agent = $("#side-agent");
   agent.hidden = !st.agent_running;
-  agent.textContent = `Contributing · ${liveGpuPercent()}%`;
+  agent.textContent = st.agent_draining ? "Stopping…" : `Contributing · ${liveGpuPercent()}%`;
 }
 
 function renderAuth() {
+  if (state.busy.has("auth")) return;   // a sign-in or sign-out owns the form meanwhile
   const gate = $("#auth-gate");
   const form = $("#auth-form");
   const terms = $("#auth-terms");
@@ -361,8 +495,10 @@ function renderAuth() {
   terms.hidden = true;
   if (!form.hidden) {
     gate.hidden = true;
-    $("#auth-submit").textContent = state.authMode === "register" ? "Create account" : "Sign in";
-    $("#auth-name").hidden = state.authMode !== "register";
+    const register = state.authMode === "register";
+    $("#auth-submit").textContent = register ? "Create account" : "Sign in";
+    $("#auth-name").hidden = !register;
+    $("#auth-password").setAttribute("autocomplete", register ? "new-password" : "current-password");
   } else {
     gate.hidden = false;
   }
@@ -389,10 +525,11 @@ function renderContributions() {
   const st = status();
   const m = me();
   const c = credits();
-  const rate = state.rates.length ? state.rates[state.rates.length - 1] : 0;
+  const rate = currentRate();
 
-  setText("#c-flops", fmtFlops(c.earned));
-  setText("#c-flops-sub", c.earned
+  const given = Math.max(0, Number(m.flops) || 0);   // this Mac's work; the account's credits are the next tile
+  setText("#c-flops", fmtFlops(given));
+  setText("#c-flops-sub", given
     ? `FLOPs total · ${rate > 0 ? withUnit(rate, "FLOP/s") + " now" : "idle right now"}`
     : "Nothing yet. Start contributing to earn.");
   sparkline($("#c-spark"), state.rates);
@@ -408,10 +545,15 @@ function renderContributions() {
   setText("#c-rank-sub", m.rank ? `of ${plural(m.of, "Mac")} in the pool` : "Not ranked yet");
 
   const running = !!st.agent_running;
+  const draining = running && !!st.agent_draining;   // Stop was pressed; the agent exits after its step
   const s = state.settings || {};
-  setTag("#c-pill", running ? `Contributing · ${liveGpuPercent()}%` : "Not contributing", running ? "ok" : "");
-  setDot("#c-dot", running ? "ok" : "", running);
-  if (running) {
+  setTag("#c-pill", draining ? "Stopping" : running ? `Contributing · ${liveGpuPercent()}%` : "Not contributing",
+    running && !draining ? "ok" : "");
+  setDot("#c-dot", running ? "ok" : "", running && !draining);
+  if (draining) {
+    setText("#c-state", "Stopping");
+    setText("#c-detail", "The current step finishes, then this Mac is released.");
+  } else if (running) {
     const job = st.agent_job_id ? ` · job ${String(st.agent_job_id).slice(0, 8)}` : "";
     setText("#c-state", `Contributing${job}`);
     setText("#c-detail", `Agent is ${agentActivity(st)}. Earning whenever the pool has work.`);
@@ -423,18 +565,22 @@ function renderContributions() {
     setText("#c-detail", `Start to lend this Mac to the pool (${where}). It runs in the background.`);
   }
   const toggle = $("#c-toggle");
-  if (!state.busy.has("contribute")) {
+  if (draining) {
+    toggle.textContent = "Stopping…";
+    toggle.className = "btn block ghost";
+    toggle.disabled = true;
+  } else if (!state.busy.has("contribute")) {
     toggle.textContent = running ? "Stop contributing" : "Start contributing";
     toggle.className = `btn block ${running ? "ghost" : "primary"}`;
     toggle.disabled = !state.ov;
   }
 
   const gpu = $("#gpu");
-  if (document.activeElement !== gpu && s.gpu_percent != null) gpu.value = s.gpu_percent;
+  if (!state.dragging.has("gpu") && s.gpu_percent != null) gpu.value = s.gpu_percent;
   rangeFill(gpu);
   setText("#gpu-out", `${gpu.value}%`);
-  const live = m.node && m.node.gpu_percent;
-  setText("#gpu-hint", running && live && live !== Number(gpu.value)
+  const live = st.agent_gpu_percent ?? (m.node || {}).gpu_percent;
+  setText("#gpu-hint", running && live != null && Number(live) !== Number(gpu.value)
     ? `Running at ${live}%. The new share applies next time you start.`
     : "Higher shares earn credits faster but leave less GPU for you.");
 
@@ -442,10 +588,10 @@ function renderContributions() {
   const lent = m.node && m.node.memory_contrib_bytes;
   setText("#mem-hint", running && lent
     ? `Lending ${fmtBytes(lent)} now. A new amount applies next time you start.`
-    : `Auto lends what is free when you start. Up to ${memoryLimits().cap} GB; more than is free makes macOS squeeze other apps.`);
+    : `Auto lends what is free when you start.${upTo()} More than is free makes macOS squeeze other apps.`);
 
   const split = $("#split");
-  if (document.activeElement !== split) split.value = c.split;
+  if (!state.dragging.has("split")) split.value = c.split;
   rangeFill(split);
   setText("#split-grants", `${split.value}%`);
   setText("#split-keep", `${100 - split.value}%`);
@@ -629,7 +775,7 @@ function renderGrantsLive() {
       return `<li class="empty">${online ? "No contributions yet." : "Start or join a pool to see who is giving the most."}</li>`;
     }
     return board.slice(0, 8).map((r) => `<li class="${r.is_me ? "is-me" : ""}">
-      <span class="rank">${r.rank}</span>
+      <span class="rank">${esc(Number(r.rank))}</span>
       <span class="name">${esc(r.name)}${r.is_me ? ` <span class="tag ok">You</span>` : ""}</span>
       <span class="flops">${esc(withUnit(r.flops))}</span>
     </li>`).join("");
@@ -644,10 +790,19 @@ function renderGrants() {
   const grants = g ? g.grants : [];
   const pending = g ? g.pending : [];
 
-  renderOnce("grants", [grants, online, !!(g && g.sample), state.fundOpen, state.fundMsg], $("#g-list"), () => grants.length
+  // Rebuilding the cards would reset the pledge being typed: carry its value (and the focus) over.
+  const fund = state.fundOpen ? document.getElementById(`fund-${state.fundOpen}`) : null;
+  const typed = fund ? { id: fund.id, value: fund.value, focused: document.activeElement === fund } : null;
+  const rebuilt = renderOnce("grants", [grants, online, !!(g && g.sample), state.fundOpen, state.fundMsg], $("#g-list"), () => grants.length
     ? grants.map(grantCard).join("")
     : `<article class="card"><p class="empty">${online ? "No public grants yet." : "Start or join a pool to see live grants."}</p></article>`);
+  const again = rebuilt && typed ? document.getElementById(typed.id) : null;
+  if (again) {
+    again.value = typed.value;
+    if (typed.focused) again.focus();
+  }
 
+  if (!signedIn()) $("#g-request").hidden = true;   // the request form belongs to a session
   $("#g-review").hidden = !admin || !!(g && g.sample);
   setTag("#g-review-count", String(pending.length), pending.length ? "hot" : "");
   renderOnce("pending", pending, $("#g-pending"), () => pending.length ? pending.map((p) => `<div class="pending">
@@ -709,11 +864,15 @@ function renderPool() {
   $("#p-join").hidden = mode !== "join";
   $("#p-public").hidden = mode !== "public";
   setText("#p-ip", st.lan_ip || "—");
+  // An address being typed is left alone until Connect, or until what is stored matches it.
   const url = $("#url");
-  if (document.activeElement !== url && url.value !== (s.url || "")) url.value = s.url || "";
+  const urlVal = s.url || "";
+  if (state.dirty.url && url.value.trim() === urlVal) state.dirty.url = false;
+  if (!state.dirty.url && url.value !== urlVal) url.value = urlVal;
   const pub = $("#public-url");
   const pubVal = s.url || st.public_url || "";
-  if (pub && document.activeElement !== pub && pub.value !== pubVal) pub.value = pubVal;
+  if (state.dirty.publicUrl && pub.value.trim() === pubVal) state.dirty.publicUrl = false;
+  if (!state.dirty.publicUrl && pub.value !== pubVal) pub.value = pubVal;
 
   const banner = $("#p-banner");
   banner.hidden = !st.last_error;
@@ -724,13 +883,15 @@ function renderPool() {
     const hosting = st.coordinator_pid != null && !(st.last_error && !st.coordinator_up);
     $("#p-start").textContent = hosting ? "Hosting" : "Start hosting";
     $("#p-start").disabled = hosting || !state.ov;
-    $("#p-stop").disabled = !(st.coordinator_up || st.agent_running);
+    // Anything of ours still running (a coordinator process, the agent, the LLM node) can be stopped.
+    $("#p-stop").disabled = !(st.coordinator_up || st.agent_running || st.coordinator_pid != null || st.inference_running);
   }
 
   const job = st.agent_job_id ? ` · job ${String(st.agent_job_id).slice(0, 8)}` : "";
   const rows = [
     ["Coordinator", st.coordinator_up, st.coordinator_up ? (hostingHere(st) ? "hosting here" : "reachable") : "offline"],
-    ["This Mac's agent", st.agent_running, st.agent_running ? `${agentActivity(st)}${job}` : "not contributing"],
+    ["This Mac's agent", st.agent_running,
+      !st.agent_running ? "not contributing" : st.agent_draining ? "stopping" : `${agentActivity(st)}${job}`],
     ["Macs in pool", (st.nodes || 0) > 0, st.coordinator_up ? String(st.nodes || 0) : "—"],
     ["Jobs", (st.jobs || 0) > 0, st.coordinator_up ? String(st.jobs || 0) : "—"],
     ["LLM node", !!st.inference_running, st.inference_running ? llmNodeState(st) : "not serving"],
@@ -777,13 +938,16 @@ function llmNodeState(st) {
 async function loadLlm() {
   const l = state.llm;
   try {
-    l.net = await api("/api/coord/inference/status");
-    l.models = ((await api("/api/coord/v1/models")) || {}).data || [];
+    const net = await api("/api/coord/inference/status");
+    const models = ((await api("/api/coord/v1/models")) || {}).data || [];
+    l.net = net;
+    l.models = models;
     l.error = "";
   } catch (e) {
     l.net = null;
     l.models = [];
     l.error = e.message || String(e);   // said under Send, not hidden behind "No models yet"
+    return;   // the pick stands: a blip must not switch models under the user
   }
   const choices = llmChoices(l);
   if (!choices.some((m) => m.id === l.model)) {
@@ -815,7 +979,7 @@ function llmWhy(st, s, l, unsupported) {
   const lent = me ? Number(me.committed_gb) || 0 : 0;
   const need = Number(m.min_memory_gb) || 0;
   const short = running && need > 0 && lent > 0 && lent < need;
-  const lend = need > memoryLimits().cap
+  const lend = memoryLimits().known && need > memoryLimits().cap
     ? { text: `${m.id} needs ${need} GB lent to run on one Mac, more than this Mac can lend (${memoryLimits().cap} GB). Add a Mac to the pool to split it.` }
     : { text: `${m.id} needs ${need} GB lent to run on one Mac; this Mac lends ${lent} GB.`,
         action: { label: `Lend ${need} GB and restart serving`, act: "llm-lend", gb: need } };
@@ -886,7 +1050,7 @@ function renderLlm() {
   setTag("#l-chat-tag", l.streaming ? "Replying" : pipe ? pipe.state : "Idle", l.streaming ? "ok" : "");
 
   const sel = $("#l-model");
-  renderOnce("llm-models", [choices.map((m) => [m.id, llmServable(l, m.id)]), l.model], sel, () => choices.length
+  renderOnce("llm-models", [choices.map((m) => [m.id, m.size_gb, llmServable(l, m.id)]), l.model], sel, () => choices.length
     ? choices.map((m) => `<option value="${esc(m.id)}"${m.id === l.model ? " selected" : ""}>${esc(m.id)} · ${esc(m.size_gb)} GB${llmServable(l, m.id) ? "" : " · not served yet"}</option>`).join("")
     : `<option value="">No models yet</option>`);
   $("#l-send").disabled = l.streaming || !llmServable(l, l.model) || !up;
@@ -909,7 +1073,10 @@ function renderLlm() {
 
   const up_ = l.upload;
   $("#l-upbar").hidden = !up_;
-  if (up_) $("#l-upbar i").style.width = `${Math.round(up_.pct * 100)}%`;
+  if (up_) {
+    $("#l-upbar i").style.width = `${Math.round(up_.pct * 100)}%`;
+    setText("#l-file-name", up_.processing ? `${up_.name} · processing on the pool…` : up_.name);
+  }
   $("#l-pick").classList.toggle("is-disabled", !!up_ || !up || unsupported);
 
   setTag("#l-pipe-tag", pipe ? pipe.state : "None", pipe && pipe.state === "active" ? "ok" : "");
@@ -918,7 +1085,7 @@ function renderLlm() {
       <thead><tr><th>Mac</th><th>Role</th><th>Layers</th><th>Share</th><th>Memory</th></tr></thead>
       <tbody>${pipe.members.map((m) => `<tr>
         <td><span class="who"><i class="sq ok"></i>${esc(m.node)}</span></td><td>${esc(m.role)}</td>
-        <td class="num">${m.layer_start}–${m.layer_end - 1}</td><td class="num">${Math.round(m.share * 100)}%</td>
+        <td class="num">${esc(Number(m.layer_start))}–${esc(Number(m.layer_end) - 1)}</td><td class="num">${Math.round(m.share * 100)}%</td>
         <td class="num">${esc(m.memory_gb)} GB</td></tr>`).join("")}</tbody></table>
     <p class="hint">${esc(pipe.explanation || "")}</p>
     <button type="button" class="btn ghost sm" data-act="llm-unload" data-pipeline="${esc(pipe.id)}">Unload</button>`
@@ -934,11 +1101,11 @@ function renderLlm() {
   syncMemSlider($("#l-mem"), $("#l-mem-out"), s.inference_memory_gb, inferenceAutoGb());
   setText("#l-mem-hint", running
     ? "A new amount applies next time you start serving."
-    : `Auto lends 75% of RAM minus 4 GB. Up to ${memoryLimits().cap} GB.`);
+    : `Auto lends 75% of RAM minus 4 GB.${upTo()}`);
   const dir = $("#l-dir");
   if (document.activeElement !== dir && s.models_dir) dir.value = s.models_dir;
   $$("#l-role button").forEach((b) => b.classList.toggle("is-on", (b.dataset.llmHead === "1") === (s.inference_head !== false)));
-  $("#l-transport-field").hidden = s.mode === "join";
+  $("#l-transport-field").hidden = s.mode !== "host";   // the transport is the hosted pool's
   $$("#l-transport-seg button").forEach((b) => b.classList.toggle("is-on", b.dataset.transport === (s.transport || "direct")));
   const toggle = $("#l-toggle");
   if (!state.busy.has("llm")) {
@@ -980,10 +1147,14 @@ function thinkBlock(m, i) {
 }
 
 function replyText(m) {
-  if (m.error) return `<p><span class="hot">${esc(m.error)}</span></p>`;
-  if (m.content || m.role === "user") return `<p>${esc(m.content)}</p>`;
-  if (!m.reasoning) return `<p>…</p>`;
-  return !m.live && m.finish === "length" ? `<p class="empty">Ran out of tokens while thinking, before answering.</p>` : "";
+  if (m.role === "user") return `<p>${esc(m.content)}</p>`;
+  // A failure mid-stream keeps what did arrive, with the error under it.
+  const body = m.content ? `<p>${esc(m.content)}</p>` : "";
+  const error = m.error ? `<p><span class="hot">${esc(m.error)}</span></p>` : "";
+  if (body || error) return body + error;
+  if (m.live) return m.reasoning ? "" : `<p>…</p>`;
+  if (m.reasoning && m.finish === "length") return `<p class="empty">Ran out of tokens while thinking, before answering.</p>`;
+  return `<p class="empty">(no reply)</p>`;
 }
 
 function renderChat() {
@@ -995,8 +1166,60 @@ function renderChat() {
       ${thinkBlock(m, i)}${replyText(m)}
       ${m.meta ? `<small>${esc(m.meta)}</small>` : ""}</div>`).join("")
     : `<p class="empty">Replies stream in here, token by token.</p>`;
-  if (log.innerHTML !== html) log.innerHTML = html;
+  // Compared with what we last set, not innerHTML: the browser re-serialises entities, so the
+  // two never matched and every poll rebuilt the log (losing the selection and open Thoughts).
+  if (log.dataset.html !== html) {
+    log.innerHTML = html;
+    log.dataset.html = html;
+  }
   if (stick) log.scrollTop = log.scrollHeight;
+}
+
+// The turns a request carries. A question whose reply failed or came back empty is asked again by
+// its retry, not twice; an empty assistant turn says nothing worth a model's attention.
+function chatHistory(msgs, reply) {
+  const dead = (m) => m && m.role === "assistant" && (m.error || !m.content);
+  return msgs.flatMap((m, i) => {
+    if (m === reply) return [];
+    if (m.role === "assistant") return dead(m) ? [] : [{ role: m.role, content: m.content }];
+    const next = msgs[i + 1];
+    if (next && next !== reply && dead(next)) return [];
+    return [{ role: m.role, content: m.content }];
+  });
+}
+
+// One SSE event (the lines between blank lines): each data: line is a JSON chunk, or [DONE].
+function foldChatEvent(reply, event) {
+  for (const ln of event.split("\n")) {
+    const payload = ln.startsWith("data:") ? ln.slice(5).trim() : "";
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      applyChatEvent(reply, JSON.parse(payload));
+    } catch { /* a truncated or non-JSON chunk: skip it, keep streaming */ }
+  }
+}
+
+async function readChatStream(body, reply) {
+  const reader = body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        foldChatEvent(reply, buf.slice(0, cut));
+        buf = buf.slice(cut + 2);
+        renderChat();
+      }
+    }
+    buf += dec.decode();
+    if (buf.trim()) foldChatEvent(reply, buf);   // a last event that came without its blank line
+  } finally {
+    reader.cancel().catch(() => {});   // Stop (or an error) must release the connection
+  }
 }
 
 async function sendChat() {
@@ -1013,7 +1236,7 @@ async function sendChat() {
   l.streaming = true;
   l.abort = new AbortController();
   renderLlm();
-  const history = l.messages.filter((m) => m !== reply && !m.error).map((m) => ({ role: m.role, content: m.content }));
+  const history = chatHistory(l.messages, reply);
   try {
     const r = await fetch("/api/chat", {
       method: "POST", credentials: "include", signal: l.abort.signal,
@@ -1022,29 +1245,11 @@ async function sendChat() {
     });
     if (!r.ok) {
       const t = await r.text();
-      let msg = t;
-      try { const d = JSON.parse(t); msg = (d.error && d.error.message) || d.detail || t; } catch { /* plain text */ }
-      throw new Error(msg || r.statusText);
+      let data = null;
+      try { data = JSON.parse(t); } catch { /* plain text */ }
+      throw new Error(detailText(data, t || r.statusText));
     }
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let cut;
-      while ((cut = buf.indexOf("\n\n")) >= 0) {
-        const event = buf.slice(0, cut);
-        buf = buf.slice(cut + 2);
-        for (const ln of event.split("\n")) {
-          const payload = ln.startsWith("data:") ? ln.slice(5).trim() : "";
-          if (!payload || payload === "[DONE]") continue;
-          applyChatEvent(reply, JSON.parse(payload));
-        }
-        renderChat();
-      }
-    }
+    await readChatStream(r.body, reply);
   } catch (e) {
     if (e.name === "AbortError") reply.meta = "Stopped.";
     else reply.error = e.message;
@@ -1059,6 +1264,7 @@ async function sendChat() {
 
 function uploadModel(file) {
   const l = state.llm;
+  if (l.upload) return setMsg("#l-upmsg", `Still sending ${l.upload.name}; one upload at a time.`, "bad");
   if (!/\.gguf$/i.test(file.name)) return setMsg("#l-upmsg", "Pick a .gguf model file.", "bad");
   if (status().inference_supported === false) return setMsg("#l-upmsg", OUTDATED_COORDINATOR, "bad");
   const pooled = ((l.net && l.net.nodes) || []).filter((n) => n.online).reduce((sum, n) => sum + (Number(n.committed_gb) || 0), 0);
@@ -1066,29 +1272,42 @@ function uploadModel(file) {
   const tooBig = l.net && needs > pooled
     ? `Heads-up: its weights alone need ≈${needs.toFixed(1)} GB but the pool's Macs lend ${pooled.toFixed(1)} GB in total. `
       + "It will upload, but won't load until more memory joins." : "";
-  l.upload = { name: file.name, pct: 0 };
+  l.upload = { name: file.name, pct: 0, processing: false };
   setText("#l-file-name", file.name);
   setMsg("#l-upmsg", tooBig, tooBig ? "warn" : "");
   const xhr = new XMLHttpRequest();   // fetch() has no upload progress
-  xhr.open("POST", "/api/models/upload");
+  // The name travels as a query parameter (any Unicode); the header stays for older shells, but
+  // only when it can carry the name (headers take ASCII).
+  xhr.open("POST", `/api/models/upload?name=${encodeURIComponent(file.name)}`);
   xhr.withCredentials = true;
-  xhr.setRequestHeader("x-filename", file.name);
-  xhr.upload.onprogress = (e) => { if (e.lengthComputable) { l.upload.pct = e.loaded / e.total; renderLlm(); } };
+  if (/^[\x20-\x7e]+$/.test(file.name)) xhr.setRequestHeader("x-filename", file.name);
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable && l.upload) { l.upload.pct = e.loaded / e.total; renderLlm(); } };
+  // Every byte is sent: the coordinator now reads the GGUF and pushes it to the heads.
+  xhr.upload.onload = () => { if (l.upload) { l.upload.pct = 1; l.upload.processing = true; renderLlm(); } };
+  const fail = (text) => { l.upload = null; setMsg("#l-upmsg", text, "bad"); renderLlm(); };
   xhr.onload = async () => {
     let data = null;
     try { data = JSON.parse(xhr.responseText); } catch { /* plain text */ }
     l.upload = null;
     if (xhr.status >= 200 && xhr.status < 300) {
-      const none = data.pushed ? "" : "No Mac is serving yet: start serving on this Mac to host it.";
-      setMsg("#l-upmsg", `${data.name}: ${data.layers} layers, sent to ${plural(data.pushed, "head")}. ${none} ${tooBig}`.trim(),
-        tooBig ? "warn" : "ok");
+      if (data && typeof data === "object") {
+        const pushed = Number(data.pushed) || 0;
+        const none = pushed ? "" : "No Mac is serving yet: start serving on this Mac to host it.";
+        setMsg("#l-upmsg", `${data.name || file.name}: ${data.layers ?? "?"} layers, sent to ${plural(pushed, "head")}. ${none} ${tooBig}`.trim(),
+          tooBig ? "warn" : "ok");
+      } else {
+        setMsg("#l-upmsg", `${file.name} uploaded. ${tooBig}`.trim(), tooBig ? "warn" : "ok");
+      }
     } else {
-      setMsg("#l-upmsg", (data && (data.detail || (data.error && data.error.message))) || xhr.statusText || "Upload failed.", "bad");
+      // 409 (older coordinator) and 503 (no pool) come with a reason: say it, not the status line.
+      setMsg("#l-upmsg", detailText(data, xhr.responseText || xhr.statusText || "Upload failed."), "bad");
     }
     await loadLlm();
     renderLlm();
   };
-  xhr.onerror = () => { l.upload = null; setMsg("#l-upmsg", "Upload failed: the pool is not reachable.", "bad"); renderLlm(); };
+  xhr.onerror = () => fail("Upload failed: the pool is not reachable.");
+  xhr.onabort = () => fail("Upload cancelled.");
+  xhr.ontimeout = () => fail("Upload timed out before the pool answered.");
   xhr.send(file);
   renderLlm();
 }
@@ -1105,11 +1324,27 @@ async function withBusy(key, button, busyText, fn) {
   } catch (e) {
     toast(e.message, "bad");
   } finally {
+    // Fresh state first, then the button: its label must say what is true now, and a second click
+    // must not repeat an action whose effect is still on its way.
+    try { await poll(); } catch { /* the next tick polls again */ }
     state.busy.delete(key);
     if (button) { button.disabled = false; button.textContent = idle; }
-    await poll();
+    render();
   }
 }
+
+// /api/start stores the settings it is given: a poll begun before it may not bring the old ones back.
+function startWith(body) {
+  state.settingsVersion += 1;
+  return post("/api/start", { ...state.settings, ...body });
+}
+
+// What this Mac lends right now, kept as it is when the pool it lends to changes.
+const lending = (st) => ({
+  contribute: !!(st.agent_running || st.inference_running),
+  training: !!st.agent_running,
+  inference: !!st.inference_running,
+});
 
 // Start or stop serving LLMs on this Mac. Only the LLM node changes: the training agent is left
 // alone (resending every setting through /api/start used to restart it, and it hung mid-download).
@@ -1121,6 +1356,7 @@ function serveLlm(btn, on, changes = {}) {
       on, inference_memory_gb: s.inference_memory_gb, inference_head: s.inference_head !== false,
       models_dir: s.models_dir, transport: s.transport, ...changes,
     });
+    state.settingsVersion += 1;   // a poll begun before this answer may not undo it
     state.settings = pickSettings(snap);
     if (snap.last_error) toast(snap.last_error, "bad");
     else if (on && !snap.inference_running) toast("The LLM node did not start: see ~/.slashcompute/logs/inference.log.", "bad");
@@ -1141,7 +1377,11 @@ const actions = {
   "llm-lend": (btn) => serveLlm(btn, true, { inference_memory_gb: Number(btn.dataset.gb) }),
   "llm-head": (btn) => serveLlm(btn, true, { inference_head: true }),
   "llm-stop": () => { if (state.llm.abort) state.llm.abort.abort(); },
-  "llm-clear": () => { state.llm.messages = []; renderChat(); },
+  "llm-clear": () => {
+    if (state.llm.abort) state.llm.abort.abort();   // the reply under way would land in an empty log
+    state.llm.messages = [];
+    renderChat();
+  },
   "llm-unload": (btn) => withBusy("llm-unload", btn, "Unloading…", async () => {
     await post(`/api/coord/inference/pipelines/${encodeURIComponent(btn.dataset.pipeline)}/stop`);
     toast("Unloading after the current reply.");
@@ -1152,29 +1392,26 @@ const actions = {
     await loadLlm();
   }),
   "toggle-contribute": (btn) => {
-    const running = !!status().agent_running;
+    const st = status();
+    if (st.agent_draining) return;   // already stopping: the agent exits on its own
+    const running = !!st.agent_running;
     return withBusy("contribute", btn, running ? "Stopping…" : "Starting…", async () => {
       if (running) {
         await post("/api/stop-agent");
         toast("Stopped contributing. The current step finishes first.");
         return;
       }
-      const snap = await post("/api/start", { ...state.settings, contribute: true, training: true });
+      const snap = await startWith({ contribute: true, training: true });
       if (snap.last_error) toast(snap.last_error, "bad");
       else toast("Contributing. This Mac picks up work whenever the pool has some.");
     });
   },
 
   host: (btn) => {
-    const st = status();
     // Hosting only switches the mode: whatever this Mac already lends keeps running, now to its own pool.
-    const keep = {
-      contribute: !!(st.agent_running || st.inference_running),
-      training: !!st.agent_running,
-      inference: !!st.inference_running,
-    };
+    const keep = lending(status());
     return withBusy("pool", btn, "Starting…", async () => {
-      const snap = await post("/api/start", { ...state.settings, ...keep, mode: "host" });
+      const snap = await startWith({ ...keep, mode: "host" });
       if (snap.last_error) toast(snap.last_error, "bad");
       else toast("Pool is up. Share this Mac's address with the others.");
     });
@@ -1186,18 +1423,14 @@ const actions = {
   }),
 
   connect: (btn) => {
-    const st = status();
     // Joining moves whatever this Mac lends to the new pool (and stops a pool hosted here).
-    const keep = {
-      contribute: !!(st.agent_running || st.inference_running),
-      training: !!st.agent_running,
-      inference: !!st.inference_running,
-    };
+    const keep = lending(status());
     return withBusy("connect", btn, "Connecting…", async () => {
       const url = $("#url").value.trim();
       if (!url) throw new Error("Enter the host Mac's address, or press Find on LAN.");
+      state.dirty.url = false;
       if (!leaveHostedPool()) return;
-      const snap = await post("/api/start", { ...state.settings, ...keep, mode: "join", url });
+      const snap = await startWith({ ...keep, mode: "join", url });
       if (snap.last_error) throw new Error(snap.last_error);
       const ov = await api("/api/overview");
       if (!ov.status.coordinator_up) throw new Error(`No coordinator answering at ${ov.status.coordinator_url}.`);
@@ -1205,21 +1438,29 @@ const actions = {
     });
   },
 
-  "connect-public": (btn) => withBusy("connect", btn, "Connecting…", async () => {
-    if (!signedIn()) throw new Error("Sign in first.");
-    const url = $("#public-url").value.trim() || status().public_url || "";
-    if (!url) throw new Error("Enter the public coordinator URL.");
-    if (!leaveHostedPool()) return;
-    const snap = await post("/api/start", { ...state.settings, mode: "public", url });
-    if (snap.last_error) throw new Error(snap.last_error);
-    const ov = await api("/api/overview");
-    if (!ov.status.coordinator_up) throw new Error(`No coordinator answering at ${ov.status.coordinator_url}.`);
-    toast(`Connected to ${ov.status.coordinator_url}`);
-  }),
+  "connect-public": (btn) => {
+    const keep = lending(status());
+    return withBusy("connect", btn, "Connecting…", async () => {
+      const url = $("#public-url").value.trim() || status().public_url || "";
+      if (!url) throw new Error("Enter the public coordinator URL.");
+      state.dirty.publicUrl = false;
+      // The sign-in goes to the pool at this address: store it first, or there is nothing to sign in to.
+      await saveSettings({ mode: "public", url });
+      if (!signedIn()) throw new Error("Sign in first (in the sidebar), then press Connect.");
+      if (!leaveHostedPool()) return;
+      const snap = await startWith({ ...keep, mode: "public", url });
+      if (snap.last_error) throw new Error(snap.last_error);
+      const ov = await api("/api/overview");
+      if (!ov.status.coordinator_up) throw new Error(`No coordinator answering at ${ov.status.coordinator_url}.`);
+      toast(`Connected to ${ov.status.coordinator_url}`);
+    });
+  },
 
   discover: (btn) => withBusy("discover", btn, "Searching…", async () => {
     const r = await post("/api/discover");
+    state.settingsVersion += 1;   // the shell stored the address: a poll begun earlier may not undo it
     state.settings = { ...state.settings, url: r.url };
+    state.dirty.url = false;
     $("#url").value = r.url;
     toast(`Found a pool at ${r.url}`);
   }),
@@ -1264,6 +1505,7 @@ const actions = {
     await saveSettings({ session_token: "" });
     state.user = null;
     state.credits = null;
+    $("#auth-password").value = "";
     // Back to the sign-in form, even if this session started with a registration.
     state.authMode = "login";
     const mode = document.querySelector("[data-act='auth-mode']");
@@ -1326,64 +1568,93 @@ document.addEventListener("click", async (e) => {
   }
   if ((d.fundGo || d.review) && state.grants && state.grants.sample) return;
   if (d.fundGo) {
-    const tflops = Number($(`#fund-${CSS.escape(d.fundGo)}`).value);
+    const input = $(`#fund-${CSS.escape(d.fundGo)}`);
+    const tflops = Number(input ? input.value : 0);
     const grant = state.grants.grants.find((g) => g.id === d.fundGo);
-    const res = await grantAction(`/api/grants/${encodeURIComponent(d.fundGo)}/fund`,
-      { amount: tflops * T }, `Pledged ${withUnit(tflops * T)} to ${grant ? grant.title : "the grant"}`);
-    state.fundMsg = res === true ? "" : res;
-    if (res === true) state.fundOpen = null;
-    return renderGrants();
+    // Busy per grant: a double-click must not pledge twice.
+    return withBusy(`fund-${d.fundGo}`, el, "Pledging…", async () => {
+      const res = await grantAction(`/api/grants/${encodeURIComponent(d.fundGo)}/fund`,
+        { amount: tflops * T }, `Pledged ${withUnit(tflops * T)} to ${grant ? grant.title : "the grant"}`);
+      state.fundMsg = res === true ? "" : res;
+      if (res === true) state.fundOpen = null;
+      renderGrants();
+    });
   }
   if (d.review) {
     const approve = !!d.approve;
-    const res = await grantAction(`/api/grants/${encodeURIComponent(d.review)}/review`, { approve },
-      approve ? "Approved. It's public now." : "Declined.");
-    if (res !== true) toast(res, "bad");
+    return withBusy(`review-${d.review}`, el, approve ? "Approving…" : "Declining…", async () => {
+      const res = await grantAction(`/api/grants/${encodeURIComponent(d.review)}/review`, { approve },
+        approve ? "Approved. It's public now." : "Declined.");
+      if (res !== true) toast(res, "bad");
+    });
   }
 });
 
-$("#gpu").addEventListener("input", (e) => {
-  rangeFill(e.target);
-  setText("#gpu-out", `${e.target.value}%`);
-});
-$("#gpu").addEventListener("change", async (e) => {
-  await saveSettings({ gpu_percent: Number(e.target.value) });
-  render();
-});
+// A slider mid-drag keeps the value under the thumb; polls sync it again once its change is saved.
+// (Focus would tell us the same, but WKWebView does not report it reliably for range inputs.)
+function bindSlider(el, onInput, onChange) {
+  const key = el.id;
+  let moved = false;
+  el.addEventListener("pointerdown", () => state.dragging.add(key));
+  el.addEventListener("input", () => {
+    moved = true;
+    state.dragging.add(key);
+    onInput(el);
+  });
+  // A press that never moved the thumb fires no change: let the next poll sync it again.
+  const release = () => { if (!moved) state.dragging.delete(key); };
+  window.addEventListener("pointerup", release);
+  window.addEventListener("pointercancel", release);
+  el.addEventListener("change", async () => {
+    try {
+      await onChange(Number(el.value));
+    } finally {
+      moved = false;
+      state.dragging.delete(key);
+      render();
+    }
+  });
+}
 
-$("#mem").addEventListener("input", (e) => {
-  rangeFill(e.target);
-  setText("#mem-out", memLabel(Number(e.target.value), trainingAutoGb()));
-});
-$("#mem").addEventListener("change", async (e) => {
-  await saveSettings({ memory_gb: Number(e.target.value) });
-  render();
-});
+bindSlider($("#gpu"), (el) => {
+  rangeFill(el);
+  setText("#gpu-out", `${el.value}%`);
+}, (gpu_percent) => saveSettings({ gpu_percent }));
 
-$("#split").addEventListener("input", (e) => {
-  state.settings = { ...state.settings, grant_split: Number(e.target.value) };
+bindSlider($("#mem"), (el) => {
+  rangeFill(el);
+  setText("#mem-out", memLabel(Number(el.value), trainingAutoGb()));
+}, (memory_gb) => saveSettings({ memory_gb }));
+
+bindSlider($("#split"), (el) => {
+  state.settings = { ...state.settings, grant_split: Number(el.value) };
   renderContributions();
   renderGrantsLive();
-});
-$("#split").addEventListener("change", async (e) => {
-  const grant_split = Number(e.target.value);
+}, async (grant_split) => {
   await saveSettings({ grant_split });
-  if (signedIn()) {
-    try {
-      const r = await patch("/api/coord/auth/me", { grant_split });
-      if (r && r.user) state.user = r.user;
-    } catch (err) {
-      toast(err.message, "bad");
-    }
+  if (!signedIn()) return;
+  try {
+    const r = await patch("/api/coord/auth/me", { grant_split });
+    if (r && r.user) state.user = r.user;
+  } catch (err) {
+    toast(err.message, "bad");
   }
 });
 
+$("#url").addEventListener("input", () => { state.dirty.url = true; });
 $("#url").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") actions.connect($("#p-connect"));
+  if (e.key === "Enter" && !e.isComposing) actions.connect($("#p-connect"));
 });
 
+$("#public-url").addEventListener("input", () => { state.dirty.publicUrl = true; });
+// Leaving the field stores the address, so a sign-in reaches that pool before Connect is pressed.
+$("#public-url").addEventListener("change", (e) => {
+  const url = e.target.value.trim();
+  state.dirty.publicUrl = false;
+  if (url && url !== (state.settings || {}).url) saveSettings({ mode: "public", url });
+});
 $("#public-url").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") actions["connect-public"]($("#p-connect-public"));
+  if (e.key === "Enter" && !e.isComposing) actions["connect-public"]($("#p-connect-public"));
 });
 
 $("#dataset").addEventListener("change", (e) => {
@@ -1429,17 +1700,19 @@ $("#job-form").addEventListener("submit", (e) => {
   });
 });
 
-$("#grant-form").addEventListener("submit", async (e) => {
+$("#grant-form").addEventListener("submit", (e) => {
   e.preventDefault();
-  const res = await grantAction("/api/grants", {
-    title: $("#g-title").value,
-    summary: $("#g-summary").value,
-    goal: Number($("#g-goal").value) * T,
-  }, "Request sent. It goes public once an admin approves it.");
-  if (res !== true) return setMsg("#g-msg", res, "bad");
-  $("#g-title").value = "";
-  $("#g-summary").value = "";
-  $("#g-request").hidden = true;
+  return withBusy("grant-request", e.target.querySelector("[type=submit]"), "Sending…", async () => {
+    const res = await grantAction("/api/grants", {
+      title: $("#g-title").value,
+      summary: $("#g-summary").value,
+      goal: Number($("#g-goal").value) * T,
+    }, "Request sent. It goes public once an admin approves it.");
+    if (res !== true) return setMsg("#g-msg", res, "bad");
+    $("#g-title").value = "";
+    $("#g-summary").value = "";
+    $("#g-request").hidden = true;
+  });
 });
 
 $("#auth-form").addEventListener("submit", (e) => {
@@ -1464,20 +1737,17 @@ $("#auth-form").addEventListener("submit", (e) => {
       } catch { state.terms = ""; }
     }
     setMsg("#auth-msg", "", "");
+    $("#auth-password").value = "";
     toast(state.authMode === "register" ? "Account created." : "Signed in.");
     loadGrants();
   });
 });
 
 $("#l-model").addEventListener("change", (e) => { state.llm.model = e.target.value; renderLlm(); });
-$("#l-mem").addEventListener("input", (e) => {
-  rangeFill(e.target);
-  setText("#l-mem-out", memLabel(Number(e.target.value), inferenceAutoGb()));
-});
-$("#l-mem").addEventListener("change", async (e) => {
-  await saveSettings({ inference_memory_gb: Number(e.target.value) });
-  render();
-});
+bindSlider($("#l-mem"), (el) => {
+  rangeFill(el);
+  setText("#l-mem-out", memLabel(Number(el.value), inferenceAutoGb()));
+}, (inference_memory_gb) => saveSettings({ inference_memory_gb }));
 $("#l-dir").addEventListener("change", (e) => saveSettings({ models_dir: e.target.value.trim() || "~/models" }));
 $("#l-file").addEventListener("change", (e) => {
   const f = e.target.files[0];
@@ -1485,7 +1755,7 @@ $("#l-file").addEventListener("change", (e) => {
   if (f) uploadModel(f);
 });
 $("#l-draft").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); }
 });
 $("#chat-form").addEventListener("submit", (e) => { e.preventDefault(); sendChat(); });
 // Remember a Thinking block the user opened or closed, so the next streamed token doesn't undo it.
@@ -1494,5 +1764,9 @@ $("#l-log").addEventListener("click", (e) => {
   if (block) state.llm.messages[block.dataset.think].thinkOpen = !block.open;
 });
 
-poll();
-window.setInterval(poll, 2000);
+// A file dropped anywhere but a picker must not replace the dashboard with it (pywebview hands the
+// drop to WKWebView, which would navigate to the file).
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => e.preventDefault());
+
+poll();   // each poll schedules the next once it has finished (see poll())

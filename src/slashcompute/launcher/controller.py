@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -10,11 +11,14 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 import httpx
 import psutil
@@ -37,6 +41,13 @@ UNREACHABLE_ERRORS = ("No coordinator at ", "Coordinator started but is not answ
 OUTDATED_COORDINATOR = ("This pool's coordinator has no LLM inference: it runs an older /compute. "
                         "Ask whoever hosts it to update and restart it, or host a pool on this Mac.")
 PORT_IN_USE = "Port {port} is already in use — quit the other /compute or coordinator, then Start hosting."
+# A restart that waits for the running process to finish its step; cleared once the new one is up.
+AGENT_RESTARTING = ("Restarting the training agent after the current step finishes; "
+                    "the new settings apply then.")
+NODE_RESTARTING = "Restarting the LLM node after the current step finishes; the new settings apply then."
+AGENT_MODULE = "slashcompute.agent.main"
+INFERENCE_MODULE = "slashcompute.inference.node"
+HEALTH_COUNTS = ("nodes", "jobs", "inference_nodes")
 
 
 def stateless_http(**kw: Any) -> httpx.Client:
@@ -51,6 +62,37 @@ def supports_inference(health: Optional[dict]) -> Optional[bool]:
     """Whether the coordinator serves LLMs (every build since inference reports its transport in
     /health). None while it is unreachable."""
     return None if not health else "inference_transport" in health
+
+
+def health_count(health: dict, key: str) -> int:
+    """A count from /health, 0 when it is missing or not a number."""
+    try:
+        return int(health.get(key, 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def agent_gpu_percent(status: dict) -> Optional[int]:
+    """The GPU share the agent reports in its status.json, None when absent or malformed."""
+    try:
+        value = status.get("gpu_percent")
+        return None if value is None else int(value)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return None
+
+
+def valid_health(data: Any) -> bool:
+    """Whether a /health body is one the shell can use: a coordinator whose counts are not numbers
+    is treated as unhealthy rather than crashing every status poll."""
+    if not isinstance(data, dict):
+        return False
+    for key in HEALTH_COUNTS:
+        value = data.get(key, 0)
+        try:
+            int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return True
 
 
 @dataclass
@@ -117,6 +159,8 @@ class StatusSnapshot:
     agent_job_id: Optional[str] = None
     agent_fetch_done_bytes: Optional[int] = None    # the agent is downloading a job's model
     agent_fetch_total_bytes: Optional[int] = None
+    agent_draining: bool = False                    # it was asked to stop and finishes its step first
+    agent_gpu_percent: Optional[int] = None         # the share the running agent was started with
     coordinator_pid: Optional[int] = None
     agent_pid: Optional[int] = None
     lan_ip: str = ""
@@ -146,10 +190,22 @@ def normalize_url(url: str, port: int = 8765, scheme: str = "http") -> str:
 
 
 def write_private(path: Path, text: str) -> None:
-    """Write a file only this user can read: it holds a session or a fingerprint of one."""
-    path.touch(mode=0o600)
-    path.chmod(0o600)
-    path.write_text(text)
+    """Write a file only this user can read: it holds a session or a fingerprint of one.
+
+    Written beside the file and renamed over it: a reader on another thread (every status poll
+    loads launcher.json) sees the old or the new content, never a truncated file that loads as
+    defaults — and could then be saved back with the session gone."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")   # created 0600
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def launch_record(argv: list[str], session: str) -> dict:
@@ -199,6 +255,21 @@ def started_after(pid: int, when: float) -> bool:
         return False
 
 
+def process_cmdline(pid: int) -> Optional[list[str]]:
+    """The command line of process `pid`; None when it cannot be read (it is gone, or not ours)."""
+    try:
+        return list(psutil.Process(pid).cmdline() or [])
+    except psutil.Error:
+        return None
+
+
+def same_path(a: str, b: Path) -> bool:
+    try:
+        return Path(a).expanduser().resolve() == Path(b).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return str(a) == str(b)
+
+
 def port_free(host: str, port: int) -> bool:
     """Whether a server could bind host:port (uvicorn binds with SO_REUSEADDR too)."""
     with socket.socket() as s:
@@ -235,11 +306,20 @@ class Launcher:
         self._memory = memory_fn
         self._port_free = port_free_fn
         self.last_error = ""
+        # One launcher serves every request thread of the shell: starts, stops and the status polls
+        # that reap and restart processes take this lock (re-entrant: start() ends in snapshot()).
+        self._lock = threading.RLock()
         self._coordinator_proc: Any = None      # the coordinator this launcher spawned, while it runs
         self._coordinator_log_at = 0            # coordinator.log size when it was spawned
-        self._stopping: list[Any] = []          # coordinators we stopped, reaped once they exit
+        self._stopping: list[Any] = []          # processes we stopped, reaped once they exit
+        self._agent_proc: Any = None            # the training agent we spawned, reaped when it exits
+        self._agent_stop_pid: Optional[int] = None   # the agent we asked to stop, until it has
         self._inference_proc: Any = None        # the LLM node we spawned, to report its exit
         self._inference_log_at = 0
+        # A restart that could not happen yet (the old process still finishes its step): what to
+        # start it as, done from snapshot() once the old one is gone.
+        self._pending_agent: Optional[tuple[list[str], str]] = None
+        self._pending_inference: Optional[tuple[list[str], str]] = None
         self.paths = AgentPaths(self.home)
 
     @property
@@ -257,6 +337,10 @@ class Launcher:
         return d
 
     def load_settings(self) -> LauncherSettings:
+        with self._lock:
+            return self._load_settings()
+
+    def _load_settings(self) -> LauncherSettings:
         if not self.settings_path.exists():
             return LauncherSettings()
         try:
@@ -288,10 +372,11 @@ class Launcher:
 
     def save_settings(self, settings: LauncherSettings) -> None:
         s = settings.clamp()
-        before = self.load_settings()
-        if (s.mode, s.url) != (before.mode, before.url):
-            self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
-        write_private(self.settings_path, json.dumps(asdict(s), indent=2) + "\n")
+        with self._lock:
+            before = self._load_settings()
+            if (s.mode, s.url) != (before.mode, before.url):
+                self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
+            write_private(self.settings_path, json.dumps(asdict(s), indent=2) + "\n")
 
     def session_for(self, settings: LauncherSettings, url: Optional[str] = None) -> str:
         """The stored session, but only for the pool that issued it (`url`, default the pool the
@@ -356,7 +441,27 @@ class Launcher:
             pid = int(self.inference_pid_path.read_text().strip())
         except (OSError, ValueError):
             return None
-        return pid if process_alive(pid) else None
+        if not process_alive(pid):
+            return None
+        if not self._owned_process(pid, INFERENCE_MODULE):
+            self.inference_pid_path.unlink(missing_ok=True)   # another program has the pid now
+            return None
+        return pid
+
+    def _owned_process(self, pid: Optional[int], module: str) -> bool:
+        """Whether `pid` is alive and is our `module` serving this home. After a crash or a reboot
+        the pid in a left-over pid file can belong to any other program: the UI must not call it
+        ours and Stop must not SIGTERM it."""
+        if not pid or not process_alive(pid):
+            return False
+        argv = process_cmdline(pid)
+        if argv is None:
+            return True   # alive, but its command line is out of reach: the pid file is all we have
+        if not any(module in arg for arg in argv):
+            return False
+        if "--home" in argv[:-1]:
+            return same_path(argv[argv.index("--home") + 1], self.home)
+        return same_path(str(EngineConfig.from_env().home), self.home)   # started with the default home
 
     def inference_status(self) -> dict:
         try:
@@ -436,6 +541,10 @@ class Launcher:
         Start serving used to resend every setting through ``start``. A training setting saved
         since the agent started (its memory, say) then restarted the training agent, which can't
         stop while it downloads a model, so the click failed with "still stopping"."""
+        with self._lock:
+            return self._set_inference(on, **changes)
+
+    def _set_inference(self, on: bool, **changes: Any) -> StatusSnapshot:
         allowed = {k: v for k, v in changes.items() if k in INFERENCE_SETTINGS}
         s = replace(self.load_settings(), **allowed)
         # Lending to LLMs is contributing; fine-tuning stays as it is right now.
@@ -445,6 +554,7 @@ class Launcher:
         self.save_settings(s)
         self.last_error = ""
         if not on:
+            self._pending_inference = None
             self._stop_inference()
             return self.snapshot(s)
         url = self.coordinator_url(s)
@@ -565,7 +675,9 @@ class Launcher:
             r = self._http.get(f"{url.rstrip('/')}/health", timeout=health_timeout(url))
             if r.status_code == 200:
                 data = r.json()
-                return data if isinstance(data, dict) else {"ok": True}
+                if not isinstance(data, dict):
+                    return {"ok": True}
+                return data if valid_health(data) else None   # malformed counts: unhealthy
         except Exception:
             return None
         return None
@@ -581,8 +693,23 @@ class Launcher:
         return False
 
     def find_on_lan(self, timeout: float = 5.0) -> Optional[str]:
+        """The first coordinator advertised on the LAN that is not the one hosted on this Mac
+        (Connect would join it only for start(join) to stop hosting it)."""
         found = self._discover(timeout)
-        return normalize_url(found) if found else None
+        if not found:
+            return None
+        url = normalize_url(found)
+        return None if self.is_own_url(url) else url
+
+    def is_own_url(self, url: str) -> bool:
+        """Whether `url` is this Mac's own coordinator address: its LAN ip or loopback, on our port."""
+        try:
+            parts = urlsplit(normalize_url(url, self.cfg.coordinator_port))
+            port = parts.port or {"https": 443}.get(parts.scheme, 80)
+        except ValueError:
+            return False
+        own_hosts = {self._lan_ip(), "127.0.0.1", "localhost", "::1"}
+        return (parts.hostname or "") in own_hosts and port == self.cfg.coordinator_port
 
     def _ensure_coordinator(self, s: LauncherSettings, url: str) -> None:
         """Hosting: run our coordinator (with the chosen LLM transport) and wait for it to answer."""
@@ -608,6 +735,10 @@ class Launcher:
             self._restart_coordinator(s)
 
     def start(self, settings: LauncherSettings) -> StatusSnapshot:
+        with self._lock:
+            return self._start(settings)
+
+    def _start(self, settings: LauncherSettings) -> StatusSnapshot:
         s = settings.clamp()
         self.save_settings(s)
         self.last_error = ""
@@ -634,10 +765,12 @@ class Launcher:
         if s.mode in ("join", "public") and not self.poll_health(url):
             self.last_error = f"No coordinator at {url}."
             raise LauncherError(self.last_error)
-        if s.mode in ("join", "public"):
+        if s.mode in ("join", "public") and not self.is_own_url(url):
             self._stop_coordinator()   # the new pool answers: stop hosting ours, nothing here dials it now
-        if not want_agent and self._agent_running():
-            request_stop(self.paths)
+        if not want_agent:
+            self._pending_agent = None
+            if self._agent_running():
+                self._request_agent_stop()
         if want_agent:
             self._ensure_agent(self.agent_argv(agent_url, s.gpu_percent, s.memory_gb),
                                self._agent_session(s, agent_url))
@@ -654,12 +787,24 @@ class Launcher:
 
     def rebind_session(self) -> StatusSnapshot:
         """After a sign-in or sign-out: restart the agent and LLM node running here with the session
-        now stored for their pool, so they earn for the signed-in account without another Start."""
+        now stored for their pool, so they earn for the signed-in account without another Start.
+        One that cannot stop yet is restarted from a later snapshot(): this Mac never silently
+        stops contributing over a sign-in."""
+        with self._lock:
+            return self._rebind_session()
+
+    def _rebind_session(self) -> StatusSnapshot:
         s = self.load_settings()
         try:
-            if self._agent_running() and (argv := recorded_argv(self._read_agent_args())):
+            if self._pending_agent is not None:   # restarting anyway: with the session stored now
+                argv, _ = self._pending_agent
+                self._pending_agent = (argv, self._agent_session(s, argv[argv.index("--url") + 1]))
+            elif self._agent_running() and (argv := recorded_argv(self._read_agent_args())):
                 self._ensure_agent(argv, self._agent_session(s, argv[argv.index("--url") + 1]))
-            if self.read_inference_pid() is not None and (argv := recorded_argv(self._read_inference_args())):
+            if self._pending_inference is not None:
+                argv, _ = self._pending_inference
+                self._pending_inference = (argv, self.session_for(s, argv[argv.index("--url") + 1]))
+            elif self.read_inference_pid() is not None and (argv := recorded_argv(self._read_inference_args())):
                 self._ensure_inference(argv, self.session_for(s, argv[argv.index("--url") + 1]))
         except LauncherError:
             pass   # last_error says why
@@ -668,29 +813,45 @@ class Launcher:
     def _agent_session(self, s: LauncherSettings, url: str) -> str:
         return self.session_for(s, url) or os.environ.get("SLASHCOMPUTE_SESSION", "")
 
+    def _request_agent_stop(self) -> None:
+        """Ask our training agent to stop (it drains its step first); its exit is expected now."""
+        if self._agent_proc is not None:
+            self._stopping.append(self._agent_proc)
+            self._agent_proc = None
+        self._agent_stop_pid = self.paths.read_pid()
+        request_stop(self.paths)
+
     def _ensure_agent(self, argv: list[str], session: str) -> None:
-        """Run the training agent as `argv` with `session`, restarting one started differently."""
+        """Run the training agent as `argv` with `session`, restarting one started differently.
+        One still draining after a short wait is restarted later, from snapshot(), once it is gone:
+        a settings change or sign-in must never leave this Mac quietly not contributing."""
         record = launch_record(argv, session)
         if self._agent_running() and self._read_agent_args() != record:
-            request_stop(self.paths)
+            self._request_agent_stop()
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline and self._agent_running():
                 time.sleep(0.05)
             if self._agent_running():
-                self.last_error = (
-                    "Training agent is still stopping. Settings have not been applied; "
-                    "start again after its current work finishes."
-                )
+                self._pending_agent = (argv, session)
+                self.last_error = AGENT_RESTARTING
+                return
+        self._pending_agent = None
         if not self._agent_running():
-            self._spawn(argv, self.log_dir / "agent.log", session=session)
+            self._agent_proc = self._spawn(argv, self.log_dir / "agent.log", session=session)
             write_private(self._agent_args_path(), json.dumps(record))
 
     def _ensure_inference(self, argv: list[str], session: str) -> Any:
         """Run the LLM node as `argv` with `session`, restarting one started differently.
-        Returns the process when it started one."""
+        Returns the process when it started one. One still draining after the wait is restarted
+        later, from snapshot()."""
         record = launch_record(argv, session)
         if self.read_inference_pid() is not None and self._read_inference_args() != record:
             self._stop_inference(wait=10.0)   # settings changed: drain, then rejoin with the new ones
+            if self.read_inference_pid() is not None:
+                self._pending_inference = (argv, session)
+                self.last_error = NODE_RESTARTING
+                return None
+        self._pending_inference = None
         if self.read_inference_pid() is not None:
             return None
         log = self.log_dir / "inference.log"
@@ -702,11 +863,14 @@ class Launcher:
         return self._inference_proc
 
     def stop(self) -> StatusSnapshot:
-        self.last_error = ""
-        request_stop(self.paths)
-        self._stop_inference()
-        self._stop_coordinator()
-        return self.snapshot()
+        with self._lock:
+            self.last_error = ""
+            self._pending_agent = self._pending_inference = None
+            if self._agent_running():   # never SIGTERM a stranger that was given a stale pid
+                self._request_agent_stop()
+            self._stop_inference()
+            self._stop_coordinator()
+            return self.snapshot()
 
     def _stop_coordinator(self) -> None:
         self._forget_coordinator()
@@ -721,9 +885,12 @@ class Launcher:
 
     def stop_agent(self) -> StatusSnapshot:
         """Stop contributing; a coordinator hosted here keeps running."""
-        self.last_error = ""
-        request_stop(self.paths)
-        return self.snapshot()
+        with self._lock:
+            self.last_error = ""
+            self._pending_agent = None
+            if self._agent_running():
+                self._request_agent_stop()
+            return self.snapshot()
 
     def my_node_id(self) -> Optional[str]:
         """This Mac's agent id, once it has registered. Never creates one."""
@@ -748,44 +915,81 @@ class Launcher:
         return data if isinstance(data, list) else []
 
     def snapshot(self, settings: Optional[LauncherSettings] = None) -> StatusSnapshot:
-        s = settings.clamp() if settings is not None else self.load_settings()
-        self._check_coordinator()
-        self._check_inference()
+        with self._lock:   # what reaps, restarts or forgets processes; the network polls run outside
+            s = settings.clamp() if settings is not None else self.load_settings()
+            self._check_coordinator()
+            self._check_inference()
+            self._check_agent()
+            self._finish_pending()
+            agent = self.paths.read_status()
+            agent_pid = self._agent_pid()
+            agent_running = agent_pid is not None
+            draining = agent_running and (
+                bool(agent.get("draining")) or self._pending_agent is not None
+                or self._agent_stop_pid == agent_pid)
+            inference_pid = self.read_inference_pid()
+            inference_status = self.inference_status() if inference_pid is not None else {}
+            coordinator_pid = self.read_coordinator_pid()
         url = self.coordinator_url(s)
         health = self.poll_health(self.proxy_url(s)) if s.mode == "host" else None
         health = health or self.poll_health(url) or {}
-        if health and self.last_error.startswith(UNREACHABLE_ERRORS):
-            self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
-        agent = self.paths.read_status()
-        agent_pid = self.paths.read_pid()
-        agent_running = bool(agent_pid and process_alive(agent_pid))
-        if agent_pid and not agent_running:
-            self.paths.clear_pid()
-            agent_pid = None
-        inference_pid = self.read_inference_pid()
         mem_total, mem_free = self._memory()
+        with self._lock:
+            if health and self.last_error.startswith(UNREACHABLE_ERRORS):
+                self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
+            last_error = self.last_error
         return StatusSnapshot(
             coordinator_up=bool(health),
-            nodes=int(health.get("nodes", 0) or 0),
-            jobs=int(health.get("jobs", 0) or 0),
+            nodes=health_count(health, "nodes"),
+            jobs=health_count(health, "jobs"),
             agent_running=agent_running,
             agent_status=str(agent.get("status", "") or ""),
             agent_job_id=agent.get("job_id"),
             agent_fetch_done_bytes=agent.get("fetch_done_bytes") if agent_running else None,
             agent_fetch_total_bytes=agent.get("fetch_total_bytes") if agent_running else None,
-            coordinator_pid=self.read_coordinator_pid(),
-            agent_pid=agent_pid if agent_running else None,
+            agent_draining=draining,
+            agent_gpu_percent=agent_gpu_percent(agent) if agent_running else None,
+            coordinator_pid=coordinator_pid,
+            agent_pid=agent_pid,
             lan_ip=self._lan_ip(),
-            last_error=self.last_error,
+            last_error=last_error,
             inference_running=inference_pid is not None,
             inference_pid=inference_pid,
-            inference_status=self.inference_status() if inference_pid is not None else {},
-            inference_nodes=int(health.get("inference_nodes", 0) or 0),
+            inference_status=inference_status,
+            inference_nodes=health_count(health, "inference_nodes"),
             inference_transport=str(health.get("inference_transport", "") or ""),
             inference_supported=supports_inference(health),
             memory_total_bytes=mem_total,
             memory_available_bytes=mem_free,
         )
+
+    def _check_agent(self) -> None:
+        """Reap the training agent we spawned once it exits (a zombie until then, and the
+        coordinators and nodes we stopped along with it)."""
+        self._stopping = [p for p in self._stopping if p.poll() is None]
+        if self._agent_proc is not None and self._agent_proc.poll() is not None:
+            self._agent_proc = None
+
+    def _finish_pending(self) -> None:
+        """Complete a restart that waited for the old agent or LLM node to finish its step."""
+        if self._pending_agent is not None and not self._agent_running():
+            argv, session = self._pending_agent
+            self._pending_agent = None   # one attempt: if it fails, last_error says why
+            try:
+                self._ensure_agent(argv, session)
+            except LauncherError:
+                return
+            if self.last_error == AGENT_RESTARTING:
+                self.last_error = ""
+        if self._pending_inference is not None and self.read_inference_pid() is None:
+            argv, session = self._pending_inference
+            self._pending_inference = None
+            try:
+                self._ensure_inference(argv, session)
+            except LauncherError:
+                return
+            if self.last_error == NODE_RESTARTING:
+                self.last_error = ""
 
     def _read_inference_args(self) -> Any:
         try:
@@ -802,9 +1006,21 @@ class Launcher:
         except (OSError, ValueError):
             return []
 
-    def _agent_running(self) -> bool:
+    def _agent_pid(self) -> Optional[int]:
+        """The pid of our running training agent; a pid file left by one that is gone, or that now
+        names another program, is removed."""
         pid = self.paths.read_pid()
-        return bool(pid and process_alive(pid))
+        if pid is None:
+            return None
+        if not self._owned_process(pid, AGENT_MODULE):
+            self.paths.clear_pid()
+            if self._agent_stop_pid == pid:
+                self._agent_stop_pid = None
+            return None
+        return pid
+
+    def _agent_running(self) -> bool:
+        return self._agent_pid() is not None
 
     def _spawn(self, argv: list[str], log_path: Path,
                pid_writer: Optional[Callable[[int], None]] = None, session: Optional[str] = None) -> Any:

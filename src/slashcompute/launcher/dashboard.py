@@ -12,6 +12,10 @@ from typing import Optional
 JOB_WAITING = ("queued", "recovering")
 JOB_ACTIVE = ("starting", "running")
 JOB_TERMINAL = ("completed", "failed", "cancelled")
+# The coordinator's /jobs has no limit parameter, so the cap is applied here: the newest rows are
+# listed, every row is counted.
+JOBS_SHOWN = 50
+POOL_LISTS = ("/nodes", "/jobs", "/ledger")
 
 
 @dataclass(frozen=True)
@@ -22,6 +26,23 @@ class PoolData:
     nodes: list = field(default_factory=list)
     jobs: list = field(default_factory=list)
     ledger: list = field(default_factory=list)
+
+
+def fresh_pool(previous: PoolData, nodes: Optional[list], jobs: Optional[list],
+               ledger: Optional[list]) -> PoolData:
+    """An online pool's latest rows. A list whose fetch failed (``None``) keeps its last-good rows,
+    so a slow coordinator shows a stale leaderboard rather than one that flickers to empty."""
+    return PoolData(
+        online=True,
+        nodes=previous.nodes if nodes is None else nodes,
+        jobs=previous.jobs if jobs is None else jobs,
+        ledger=previous.ledger if ledger is None else ledger,
+    )
+
+
+def recent_jobs(jobs: list, limit: int = JOBS_SHOWN) -> list:
+    """The newest ``limit`` jobs, newest first."""
+    return sorted(jobs, key=lambda j: j.get("submitted_at") or 0.0, reverse=True)[:limit]
 
 
 def format_flops(flops: float) -> str:
@@ -120,8 +141,7 @@ def overview(status: dict, pool: PoolData, my_id: Optional[str], grant_percent: 
             "nodes": [{**n, "flops": flops_by_node.get(n.get("node_id"), 0.0),
                        "is_me": bool(my_id) and n.get("node_id") == my_id}
                       for n in sorted(pool.nodes, key=lambda n: str(n.get("name", "")).lower())],
-            "jobs": [job_card(j) for j in
-                     sorted(pool.jobs, key=lambda j: j.get("submitted_at") or 0.0, reverse=True)],
+            "jobs": [job_card(j) for j in recent_jobs(pool.jobs)],
             "capacity": capacity(pool.nodes, pool.jobs),
         },
         "me": {
