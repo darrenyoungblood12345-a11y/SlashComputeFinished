@@ -83,6 +83,11 @@ class Heartbeat(Msg):
     status: Literal["idle", "loading", "running", "draining"]
     job_id: Optional[str] = None
     epoch: Optional[int] = None
+    # While "loading": "fetching" means the model is still downloading, with its progress.
+    # Optional and a plain str, so older coordinators ignore them and newer phases parse.
+    phase: Optional[str] = None
+    fetch_done_bytes: Optional[int] = None
+    fetch_total_bytes: Optional[int] = None
 
 
 class DrainNotice(Msg):

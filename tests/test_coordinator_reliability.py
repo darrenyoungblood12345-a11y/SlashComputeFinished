@@ -284,6 +284,11 @@ def test_node_lost_before_its_assignment_rolls_the_epoch_back(core):
         runs = s.exec(select(StageRun).where(StageRun.job_id == job.id)).all()
     assert len(runs) == 2 and {r.end_reason for r in runs} == {"start rolled back"}
 
+    # The node that was told may have begun the stage: it is free once its agent says it stopped.
+    assert not core.registry.get(first).schedulable
+    asyncio.run(core.handle(first, P.StageFinished(job_id=job.id, epoch=1, stage_idx=0,
+                                                   reason="cancelled", last_step=0)))
+    assert core.registry.get(first).schedulable
     _online(core, "n2" if first == "n1" else "n1", sent)
     assert asyncio.run(core.scheduler.try_start(job))  # tried again as if nothing happened
     assert job.row.epoch == 2 and job.row.recoveries == 0
@@ -460,3 +465,149 @@ def test_silent_agent_with_a_session_is_held_then_resumes(live):
     _wait(lambda: job.row.status == "running")
     assert job.row.recoveries == 0
     b.close()
+
+
+# ------------------------------------------------------------ a stopped job frees its Mac only once it stopped
+
+
+def _hb(node_id, status, job_id=None, epoch=None, **kw):
+    return P.Heartbeat(node_id=node_id, status=status, job_id=job_id, epoch=epoch, **kw)
+
+
+def _runs(core, job_id):
+    with core.db.session() as s:
+        return s.exec(select(StageRun).where(StageRun.job_id == job_id)).all()
+
+
+def _stopped(core, node_id, job, epoch=1):
+    asyncio.run(core.handle(node_id, P.StageFinished(job_id=job.id, epoch=epoch, stage_idx=0,
+                                                     reason="cancelled", last_step=0)))
+
+
+def test_cancelled_jobs_node_is_not_reassigned_until_it_lets_go(core):
+    """Behind "the job says starting but never runs": a cancel freed the Mac at once, so the
+    next job went to an agent still downloading the cancelled job's model and queued there."""
+    sent = {}
+    _online(core, "n1", sent)
+    a = core.submit(_spec(core))
+    assert asyncio.run(core.scheduler.try_start(a))
+    b = core.submit(_spec(core))
+    asyncio.run(core.cancel_job(a))
+    assert isinstance(sent["n1"][-1], P.CancelStage)
+    assert not core.registry.get("n1").schedulable
+    assert [r.end_reason for r in _runs(core, a.id)] == ["cancelled"]
+    asyncio.run(core.scheduler.tick())
+    assert b.row.status == "queued" and "waiting for n1 to stop a cancelled job" in b.wait_reason
+
+    _stopped(core, "n1", a)
+    asyncio.run(core.scheduler.tick())
+    assert b.row.status == "starting" and core.registry.get("n1").assignment.job_id == b.id
+
+
+def test_release_confirmed_by_idle_heartbeat_or_bounded_fallback(core):
+    sent = {}
+    _online(core, "n1", sent)
+    node = core.registry.get("n1")
+    job = core.submit(_spec(core))
+    assert asyncio.run(core.scheduler.try_start(job))
+    asyncio.run(core.cancel_job(job))
+    asyncio.run(core.handle("n1", _hb("n1", "idle")))   # may have left before it got the cancel
+    assert node.releasing is not None
+    node.releasing.since -= core.cfg.heartbeat_interval_s
+    asyncio.run(core.handle("n1", _hb("n1", "idle")))   # sent after it: it let go
+    assert node.releasing is None and node.schedulable
+
+    job2 = core.submit(_spec(core))
+    assert asyncio.run(core.scheduler.try_start(job2))
+    asyncio.run(core.cancel_job(job2))
+    asyncio.run(core.handle("n1", _hb("n1", "loading", job2.id, 1)))
+    node.releasing.since -= core.cfg.release_timeout_s + 1
+    asyncio.run(core.recovery.tick())
+    assert node.releasing is not None and not node.schedulable   # still busy with it: held
+    asyncio.run(core.handle("n1", _hb("n1", "loading")))        # an agent that never says
+    asyncio.run(core.recovery.tick())
+    assert node.releasing is None and node.schedulable           # ...is freed after the timeout
+
+
+def test_late_stage_finished_confirms_release_but_is_not_applied(core):
+    sent = {}
+    _online(core, "n1", sent)
+    _online(core, "n2", sent)
+    job = core.submit(_spec(core))
+    assert asyncio.run(core.scheduler.try_start(job))
+    [first] = [p.node_id for p in job.current.plans]
+    other = "n2" if first == "n1" else "n1"
+    asyncio.run(core.recovery.abort_epoch(job, "test"))
+    assert not core.registry.get(first).schedulable
+    assert asyncio.run(core.scheduler.try_start(job))
+    assert job.current.epoch == 2 and [p.node_id for p in job.current.plans] == [other]
+    recoveries = job.row.recoveries
+    _stopped(core, first, job, epoch=1)
+    assert core.registry.get(first).schedulable
+    assert not job.current.closed and job.row.recoveries == recoveries
+
+
+def test_abort_closes_stage_runs_of_lost_nodes(core):
+    sent = {}
+    _online(core, "n1", sent)
+    _online(core, "n2", sent)
+    job = _two_stage_job(core)
+    assert asyncio.run(core.scheduler.try_start(job))
+    core.registry.remove("n2")
+    asyncio.run(core.recovery.abort_epoch(job, "node n2 lost"))
+    assert sorted(r.end_reason for r in _runs(core, job.id)) == ["aborted", "aborted"]
+
+
+def test_start_timeout_waits_while_fetch_progress_advances(core):
+    """A big model took longer than the start timeout to download, so the job was aborted and
+    re-sent to the same Mac, behind the same download, up to 20 times."""
+    core.cfg.stage_start_timeout_s = 0.3
+    sent = {}
+    _online(core, "n1", sent)
+    job = core.submit(_spec(core))
+    assert asyncio.run(core.scheduler.try_start(job))
+    done = 0
+    for _ in range(6):                                   # downloading for twice the timeout
+        done += 1000
+        asyncio.run(core.handle("n1", _hb("n1", "loading", job.id, 1, phase="fetching",
+                                          fetch_done_bytes=done, fetch_total_bytes=10**6)))
+        time.sleep(0.1)
+        asyncio.run(core.scheduler.tick())
+        assert job.row.status == "starting"
+    [stage] = core.job_view(job)["stages"]
+    assert stage["node_name"] == "n1" and stage["phase"] == "fetching"
+    assert (stage["fetch_done_bytes"], stage["fetch_total_bytes"]) == (done, 10**6)
+
+    time.sleep(0.4)                                      # the download stalls
+    asyncio.run(core.scheduler.tick())
+    assert job.row.status == "recovering" and "no progress" in job.row.error
+    assert core.registry.get("n1").avoid_until > time.monotonic()
+
+
+def test_start_timeout_abort_prefers_another_node(core):
+    sent = {}
+    _online(core, "n1", sent)
+    core.registry.get("n1").avoid_until = time.monotonic() + 60   # it just stalled a start
+    _online(core, "n2", sent)
+    job = core.submit(_spec(core))
+    assert asyncio.run(core.scheduler.try_start(job))
+    assert [p.node_id for p in job.current.plans] == ["n2"]
+    job2 = core.submit(_spec(core))                      # only the stalled Mac is free: use it
+    assert asyncio.run(core.scheduler.try_start(job2))
+    assert [p.node_id for p in job2.current.plans] == ["n1"]
+
+
+def test_job_needing_more_macs_than_the_pool_does_not_block_later_jobs(core):
+    sent = {}
+    _online(core, "n1", sent)
+    a = core.submit(_spec(core, min_stages=2))
+    b = core.submit(_spec(core))
+    asyncio.run(core.scheduler.tick())
+    assert a.row.status == "queued" and a.wait_reason == "needs 2 Macs; the pool has 1"
+    assert core.job_view(a)["wait_reason"] == "needs 2 Macs; the pool has 1"
+    assert b.row.status == "starting"
+
+    _online(core, "n2", sent)        # now the pool could run it: first in line again
+    c = core.submit(_spec(core))
+    asyncio.run(core.scheduler.tick())
+    assert a.row.status == "queued" and c.row.status == "queued"

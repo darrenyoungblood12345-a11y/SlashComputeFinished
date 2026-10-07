@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import math
 import os
@@ -13,14 +15,15 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from slashcompute.common.config import DEMO_MODEL_CANDIDATES, DEV_MODEL
 from slashcompute.common.jsonbool import body_bool
 from slashcompute.launcher.controller import (
-    FINISHES, OUTDATED_COORDINATOR, Launcher, LauncherError, LauncherSettings, supports_inference,
+    FINISHES, INFERENCE_SETTINGS, OUTDATED_COORDINATOR, Launcher, LauncherError, LauncherSettings,
+    supports_inference,
 )
 from slashcompute.launcher.dashboard import PoolData, overview
 from slashcompute.web import sample_grants
@@ -28,7 +31,8 @@ from slashcompute.web import sample_grants
 STATIC = Path(__file__).resolve().parent / "static"
 SHELL_HOST = os.environ.get("SLASHCOMPUTE_SHELL_HOST", "127.0.0.1")
 SHELL_PORT = int(os.environ.get("SLASHCOMPUTE_SHELL_PORT", "8766"))
-SHELL_GENERATION = 6
+# Bump when the shell changes: a running older shell is then replaced instead of reused.
+SHELL_GENERATION = 7
 MODELS = [DEV_MODEL, *DEMO_MODEL_CANDIDATES]
 _PROXY_BLOCK = {"verify"}
 _SORTS = ("top", "trending", "least")
@@ -262,7 +266,11 @@ def create_shell(launcher: Optional[Launcher] = None,
         path = STATIC / "index.html"
         if not path.is_file():
             raise HTTPException(500, "UI missing")
-        return FileResponse(path)
+        # Ask for the scripts by content version: the window kept an old app.js after updates.
+        v = asset_version()
+        page = path.read_text().replace('/static/app.js"', f'/static/app.js?v={v}"') \
+            .replace('/static/app.css"', f'/static/app.css?v={v}"')
+        return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/shell")
     def shell_info():
@@ -303,6 +311,13 @@ def create_shell(launcher: Optional[Launcher] = None,
             snap = launch.start(s)
         except LauncherError as e:
             raise HTTPException(400, str(e)) from e
+        return {**asdict(snap), **shown(launch.load_settings())}
+
+    @app.post("/api/inference")
+    def set_inference(body: dict):
+        """Start or stop serving LLMs on this Mac, leaving the training agent alone."""
+        changes = {k: body[k] for k in INFERENCE_SETTINGS if k in body}
+        snap = launch.set_inference(bool(body.get("on")), **changes)
         return {**asdict(snap), **shown(launch.load_settings())}
 
     @app.post("/api/stop")
@@ -497,5 +512,23 @@ def create_shell(launcher: Optional[Launcher] = None,
         return _cookie_response(r)
 
     if STATIC.is_dir():
-        app.mount("/static", StaticFiles(directory=STATIC), name="static")
+        app.mount("/static", FreshStaticFiles(directory=STATIC), name="static")
     return app
+
+
+class FreshStaticFiles(StaticFiles):
+    """Static files the window revalidates every time (it gets a 304 when nothing changed)."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+def asset_version() -> str:
+    """Changes whenever app.js or app.css does."""
+    h = hashlib.sha256()
+    for name in ("app.js", "app.css"):
+        with contextlib.suppress(OSError):
+            h.update((STATIC / name).read_bytes())
+    return h.hexdigest()[:12]

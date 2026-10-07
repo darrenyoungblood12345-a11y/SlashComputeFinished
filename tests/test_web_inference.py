@@ -2,8 +2,11 @@
 
 import json
 import os
+import re
+from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from slashcompute.launcher.controller import Launcher, LauncherSettings
@@ -238,3 +241,107 @@ def test_transport_change_restarts_our_coordinator(tmp_path, monkeypatch):
     launcher.start(LauncherSettings(mode="host", contribute=False, transport="relay"))
     assert killed and killed[0][0] == 4242
     assert spawned[0].argv[-2:] == ["--inference-transport", "relay"]
+
+
+# ------------------------------------------------------------ Start serving touches only the LLM node
+
+
+def _serving_launcher(tmp_path, monkeypatch, health=CURRENT):
+    launcher, spawned = _launcher(tmp_path, health)
+    monkeypatch.setattr(launcher, "_ensure_coordinator", lambda s, url: None)
+    return launcher, spawned
+
+
+def test_start_serving_never_restarts_the_training_agent(tmp_path, monkeypatch):
+    """Start serving used to resend every setting through start(): a training setting saved since
+    the agent started (here its memory) restarted the agent, which can't stop while it downloads
+    a model, so the click failed with "Training agent is still stopping"."""
+    launcher, spawned = _serving_launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(launcher, "_await_node", lambda proc, timeout=8.0: None)
+    monkeypatch.setattr(launcher, "_agent_running", lambda: True)
+    monkeypatch.setattr(launcher, "_ensure_agent", lambda *a: pytest.fail("touched the training agent"))
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop",
+                        lambda paths: pytest.fail("stopped the training agent"))
+    launcher.save_settings(LauncherSettings(mode="host", contribute=False, training=True, memory_gb=8))
+    launcher.set_inference(True, inference_memory_gb=9, memory_gb=2, training=False)  # the last two ignored
+    [node] = spawned
+    assert node.argv[2] == "slashcompute.inference.node"
+    assert node.argv[node.argv.index("--memory-gb") + 1] == "9"
+    assert "127.0.0.1" in node.argv[node.argv.index("--url") + 1]
+    s = launcher.load_settings()
+    assert (s.inference, s.contribute, s.training, s.memory_gb, s.inference_memory_gb) == (True, True, True, 8, 9)
+    assert launcher.inference_pid_path.read_text().strip() == str(node.pid)   # recorded at spawn
+
+
+def test_second_start_serving_click_does_not_start_a_second_node(tmp_path, monkeypatch):
+    launcher, spawned = _serving_launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(launcher, "_await_node", lambda proc, timeout=8.0: None)
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: pid == 6001)
+    launcher.set_inference(True)
+    launcher.set_inference(True)            # before the node itself got to write its pid
+    assert len(spawned) == 1
+
+
+def test_node_that_exits_on_start_says_why(tmp_path, monkeypatch):
+    launcher, _ = _serving_launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: False)
+    log = launcher.log_dir / "inference.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("an older run's noise\n")
+
+    def popen(argv, stdout=None, **_):
+        stdout.write(b"llama.cpp RPC server not found (/x/rpc-server): run scripts/build_llama.sh\n")
+        stdout.flush()
+        return SimpleNamespace(pid=7001, argv=argv, poll=lambda: 1)
+
+    launcher._popen = popen
+    snap = launcher.set_inference(True)
+    assert not snap.inference_running
+    assert "exited with code 1" in snap.last_error and "RPC server not found" in snap.last_error
+    assert "older run" not in snap.last_error
+
+
+def test_node_that_cannot_join_says_why(tmp_path, monkeypatch):
+    launcher, spawned = _serving_launcher(tmp_path, monkeypatch)
+    status = tmp_path / "inference" / "status.json"
+    status.parent.mkdir(parents=True, exist_ok=True)
+    status.write_text(json.dumps({"pid": 6001, "reason": "unsupported",
+                                  "last_error": "the coordinator has no LLM inference"}))
+    snap = launcher.set_inference(True)
+    assert len(spawned) == 1 and "no LLM inference" in snap.last_error
+
+
+def test_stop_serving_stops_only_the_node(tmp_path, monkeypatch):
+    launcher, _ = _serving_launcher(tmp_path, monkeypatch)
+    stopped = []
+    monkeypatch.setattr(launcher, "_stop_inference", lambda wait=0.0: stopped.append(1))
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop",
+                        lambda paths: pytest.fail("stopped the training agent"))
+    launcher.save_settings(LauncherSettings(inference=True))
+    launcher.set_inference(False)
+    assert stopped and launcher.load_settings().inference is False
+
+
+def test_start_serving_route_passes_only_llm_settings(tmp_path, monkeypatch):
+    launcher, _ = _launcher(tmp_path, CURRENT)
+    calls = []
+    monkeypatch.setattr(launcher, "set_inference",
+                        lambda on, **changes: (calls.append((on, changes)), launcher.snapshot())[1])
+    app = create_shell(launcher, stream_client=httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404))))
+    with TestClient(app, base_url=SHELL) as c:
+        r = c.post("/api/inference", json={"on": True, "inference_memory_gb": 9, "memory_gb": 2,
+                                           "training": False})
+    assert r.status_code == 200 and calls == [(True, {"inference_memory_gb": 9})]
+
+
+def test_static_assets_are_versioned_and_revalidated(tmp_path):
+    """The app window kept running an old app.js after an update, so UI fixes never showed."""
+    with TestClient(_shell(tmp_path, lambda r: httpx.Response(404)), base_url=SHELL) as c:
+        page = c.get("/")
+        assert page.headers["cache-control"] == "no-cache"
+        v = re.search(r'/static/app\.js\?v=([0-9a-f]{12})"', page.text).group(1)
+        assert f'/static/app.css?v={v}"' in page.text
+        js = c.get(f"/static/app.js?v={v}")
+        assert js.status_code == 200 and js.headers["cache-control"] == "no-cache"
+        assert b'"/api/inference"' in js.content and b'id="l-why"' in page.content

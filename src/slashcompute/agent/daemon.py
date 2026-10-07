@@ -46,10 +46,11 @@ from slashcompute.common.protocol import (
     parse_agent_message, parse_coordinator_message,
 )
 from slashcompute.common.reliable import Inbox, Outbox, is_sequenced
-from slashcompute.pipeline.model_profile import resolve_model_path
 
 log = logging.getLogger(__name__)
 RECONNECT_MAX_S = 15.0
+FETCH_STOP_GRACE_S = 2.0        # a stopped download gets this long to exit before SIGKILL
+FETCH_LOG_EVERY_S = 30.0
 
 
 def _rejection(e: Exception) -> str:
@@ -81,6 +82,28 @@ def public_transport(url: str, public_pool: bool = False) -> bool:
 
 def peered_assignment(asg: StageAssignment) -> bool:
     return asg.prev_peer is not None or asg.next_peer is not None
+
+
+def fetch_command(model: str) -> list[str]:
+    """The model download, as a process a cancel can stop (see ``agent.fetch``)."""
+    return [sys.executable, "-m", "slashcompute.agent.fetch", model]
+
+
+async def _terminate(proc: asyncio.subprocess.Process, grace: float) -> None:
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), grace)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+
+
+def _gb(n: Optional[int]) -> str:
+    return "?" if n is None else f"{n / 1e9:.1f}"
 
 
 def _alive(pid: int) -> bool:
@@ -129,12 +152,19 @@ class AgentOptions:
 @dataclass(eq=False)
 class _Stage:
     """The stage this agent runs: in-process (``session``) or a sandboxed worker
-    process (``proc``, whose stdout ``pump`` forwards)."""
+    process (``proc``, whose stdout ``pump`` forwards). ``starter`` first downloads the
+    model in ``fetch_proc``, then starts it."""
 
     asg: StageAssignment
     session: Optional[StageSession] = None
     proc: Optional[asyncio.subprocess.Process] = None
     pump: Optional[asyncio.Task] = None
+    starter: Optional[asyncio.Task] = None
+    fetch_proc: Optional[asyncio.subprocess.Process] = None
+    fetch_done: Optional[int] = None             # bytes of the model on disk so far
+    fetch_total: Optional[int] = None
+    ready: bool = False                          # StageReady went out
+    reported: bool = False                       # its StageFinished went out: never send another
 
     def matches(self, job_id: str, epoch: int) -> bool:
         return self.asg.job_id == job_id and self.asg.epoch == epoch
@@ -196,12 +226,20 @@ class Daemon:
             self._stage = None
             self._set_status("idle", None, None)
 
+    def _fetching(self) -> Optional[_Stage]:
+        """The current stage while its model downloads."""
+        stage = self._stage
+        return stage if stage is not None and stage.fetch_proc is not None else None
+
     def _write_status(self) -> None:
+        fetch = self._fetching()
         self.opt.paths.write_status(
             pid=__import__("os").getpid(), node_id=self.opt.node_id, name=self.opt.name,
             status=self.status, draining=self._draining, job_id=self.job_id, epoch=self.epoch,
             coordinator=self.opt.coordinator, data_addr=f"{self.opt.data_host}:{self.opt.data_port}",
             gpu_percent=self.opt.gpu_percent,
+            fetch_done_bytes=fetch.fetch_done if fetch else None,
+            fetch_total_bytes=fetch.fetch_total if fetch else None,
         )
 
     async def send(self, msg: BaseModel) -> None:
@@ -274,15 +312,10 @@ class Daemon:
     async def _release_orphaned_stage(self) -> None:
         """Stop a stage the coordinator no longer counts on (it restarted, or we were away
         longer than its grace window), and say so in case it is still listening."""
-        stage = self._stage
-        if stage is None:
+        if self._stage is None:
             return
         log.info("lost the coordinator mid-stage; releasing it (the job will be rescheduled)")
-        await self._cancel_stage()
-        asg = stage.asg
-        await self.send(StageFinished(
-            job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx, reason="cancelled",
-            last_step=asg.resume_step, detail="lost the coordinator"))
+        await self._cancel_stage(detail="lost the coordinator")
 
     async def _connect_once(self, ws_url: str, device) -> None:
         """One coordinator connection: register, then handle messages until it closes."""
@@ -359,14 +392,21 @@ class Daemon:
         if seq is not None:
             await self.send(Ack(upto=seq))
 
+    def _heartbeat_msg(self) -> Heartbeat:
+        fetch = self._fetching()
+        return Heartbeat(
+            node_id=self.opt.node_id, status=self.status if not self._draining else "draining",
+            job_id=self.job_id, epoch=self.epoch,
+            phase="fetching" if fetch else None,
+            fetch_done_bytes=fetch.fetch_done if fetch else None,
+            fetch_total_bytes=fetch.fetch_total if fetch else None,
+        )
+
     async def _heartbeats(self, interval: float) -> None:
         try:
             while not self._stop.is_set():
                 try:
-                    await self.send(Heartbeat(
-                        node_id=self.opt.node_id, status=self.status if not self._draining else "draining",
-                        job_id=self.job_id, epoch=self.epoch,
-                    ))
+                    await self.send(self._heartbeat_msg())
                 except Exception:  # a silently dead heartbeat loop gets the node evicted
                     log.exception("heartbeat failed")
                 await asyncio.sleep(interval)
@@ -389,29 +429,89 @@ class Daemon:
         else:
             log.warning("unhandled coordinator message %s", type(msg).__name__)
 
-    async def _start_stage(self, asg: StageAssignment) -> None:
+    async def _start_stage(self, asg: StageAssignment) -> Optional[_Stage]:
+        """Take on ``asg`` and return at once: ``stage.starter`` downloads the model and starts
+        the worker, so this message loop stays free for a CancelStage, a newer assignment or a
+        shutdown while a model downloads (that used to take 10-40 minutes, unread)."""
         if public_transport(self.opt.coordinator, self.opt.cfg.public_pool) and peered_assignment(asg):
             log.warning("refusing multi-peer assignment on public/https coordinator")
-            return
+            return None
         async with self._stage_lock:
             if self._stopping:
                 log.warning("ignoring assignment for job %s: shutting down", asg.job_id)
-                return
+                return None
             cur = self._stage
             if cur is not None and cur.runs(asg):
                 log.info("already running job %s epoch %d stage %d", asg.job_id, asg.epoch,
                          asg.stage_idx)
-                return
+                return cur
             if cur is not None:
                 log.warning("assignment while a stage is running; cancelling the old one")
-                await self._stop_stage(cur)
+                await self._stop_stage(cur, "replaced by a newer assignment")
+            # Claimed before anything can yield: a CancelStage right behind this message
+            # finds this stage and stops its starter, even before the starter has run.
             stage = self._stage = _Stage(asg)
             self._set_status("loading", asg.job_id, asg.epoch)
+            stage.starter = self._spawn(self._launch(stage))
+        return stage
+
+    async def _launch(self, stage: _Stage) -> None:
+        asg = stage.asg
+        try:
+            await self._fetch_model(stage)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("model fetch for job %s failed: %s", asg.job_id, e)
+            await self._fail_start(stage, f"model fetch failed: {e}")
+            return
         job_dir = self.opt.paths.job_dir(asg.job_id, asg.epoch)
         if self.opt.sandbox:
             await self._start_sandboxed(stage, job_dir)
-        else:
-            self._start_in_process(stage, job_dir)
+            return
+        async with self._stage_lock:
+            if self._stage is stage and not self._stopping:
+                self._start_in_process(stage, job_dir)
+
+    async def _fetch_model(self, stage: _Stage) -> None:
+        """Download the stage's model into the HF cache (the sandboxed worker can't write it,
+        and the in-process one would block this loop) in a child process ``_stop_stage`` can
+        kill. Its progress goes out in heartbeats and status.json."""
+        asg = stage.asg
+        model = asg.spec.model
+        if Path(model).expanduser().is_dir():
+            return
+        proc = await asyncio.create_subprocess_exec(
+            *fetch_command(model), stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL)
+        stage.fetch_proc = proc            # no await in between: a stop always sees it
+        if self._stage is stage:
+            self._write_status()
+        log.info("job %s: fetching %s", asg.job_id, model)
+        error, logged = "", 0.0
+        try:
+            assert proc.stdout is not None
+            while line := await proc.stdout.readline():
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("type") == "progress":
+                    stage.fetch_done, stage.fetch_total = msg.get("done"), msg.get("total")
+                    if self._stage is stage:
+                        self._write_status()
+                    if time.monotonic() - logged >= FETCH_LOG_EVERY_S:
+                        logged = time.monotonic()
+                        log.info("job %s: fetched %s of %s GB of %s", asg.job_id,
+                                 _gb(stage.fetch_done), _gb(stage.fetch_total), model)
+                elif msg.get("type") == "error":
+                    error = str(msg.get("detail") or "")
+            code = await proc.wait()
+        finally:
+            await _terminate(proc, FETCH_STOP_GRACE_S)
+            stage.fetch_proc = None
+        if code != 0:
+            raise RuntimeError(error or f"the download exited with code {code}")
+        log.info("job %s: %s is ready", asg.job_id, model)
 
     def _start_in_process(self, stage: _Stage, job_dir: Path) -> None:
         asg = stage.asg
@@ -424,11 +524,16 @@ class Daemon:
         )
 
         async def emit(m) -> None:
-            if isinstance(m, StageReady) and self._stage is stage:
-                self._set_status("running", asg.job_id, asg.epoch)
-            await self.send(m)
+            if isinstance(m, StageReady):
+                stage.ready = True
+                if self._stage is stage:
+                    self._set_status("running", asg.job_id, asg.epoch)
             if isinstance(m, StageFinished):
+                if stage.reported:
+                    return                   # already reported stopped
+                stage.reported = True
                 self._release(stage)
+            await self.send(m)
 
         async def _run() -> None:
             try:
@@ -443,15 +548,9 @@ class Daemon:
         session.task = asyncio.create_task(_run())
 
     async def _start_sandboxed(self, stage: _Stage, job_dir: Path) -> None:
-        asg = stage.asg
         # The sandbox can't write the HF cache (~/.cache/huggingface: locks, refs, blobs), so
-        # fetch the model here, unsandboxed, and run the worker offline against that cache.
-        try:
-            await asyncio.to_thread(resolve_model_path, asg.spec.model)
-        except Exception as e:
-            log.exception("model fetch failed")
-            await self._fail_start(stage, f"model fetch failed: {e}")
-            return
+        # _launch fetched the model unsandboxed, and the worker runs offline against that cache.
+        asg = stage.asg
         try:
             spec_path = job_dir / "assignment.json"
             spec_path.touch(mode=0o600)
@@ -471,7 +570,7 @@ class Daemon:
                 job_dir, self.opt.paths.root,
             )
             async with self._stage_lock:
-                if self._stage is not stage:
+                if self._stage is not stage or self._stopping:
                     log.info("job %s epoch %d was cancelled before its worker started",
                              asg.job_id, asg.epoch)
                     return
@@ -488,14 +587,15 @@ class Daemon:
     async def _fail_start(self, stage: _Stage, detail: str) -> None:
         """Report a stage that never started now, rather than leave the coordinator
         waiting out its start timeout."""
-        if self._stage is not stage:
-            return  # cancelled meanwhile; nobody is waiting for it
+        if self._stage is not stage or stage.reported:
+            return  # cancelled meanwhile; that was reported
+        stage.reported = True
+        self._release(stage)
         asg = stage.asg
         await self.send(StageFinished(
             job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx, reason="error",
             last_step=asg.resume_step, detail=detail,
         ))
-        self._release(stage)
 
     async def _pump_worker_stdout(self, stage: _Stage) -> None:
         proc = stage.proc
@@ -515,18 +615,24 @@ class Daemon:
                 except ValidationError:
                     log.warning("worker stdout: %s", raw[:200])
                     continue
-                if isinstance(msg, StageReady) and self._stage is stage:
-                    self._set_status("running", asg.job_id, asg.epoch)
-                await self.send(msg)
+                if isinstance(msg, StageReady):
+                    stage.ready = True
+                    if self._stage is stage:
+                        self._set_status("running", asg.job_id, asg.epoch)
                 if isinstance(msg, StageFinished):
-                    finished = True
+                    if stage.reported:
+                        continue                 # already reported stopped
+                    stage.reported = finished = True
                     self._release(stage)
+                await self.send(msg)
         finally:
             if proc.returncode is None:
                 await proc.wait()
-            if not finished and self._stage is stage:
+            if not finished and self._stage is stage and not stage.reported:
                 # The worker died without reporting (crash, OOM kill): say so now rather
                 # than leave the coordinator waiting for a stall timeout.
+                stage.reported = True
+                self._release(stage)
                 await self.send(StageFinished(
                     job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx, reason="error",
                     last_step=asg.resume_step, detail=f"worker exited with code {proc.returncode}",
@@ -547,7 +653,8 @@ class Daemon:
             except (BrokenPipeError, ConnectionResetError):
                 pass                             # the worker already exited
 
-    async def _cancel_stage(self, job_id: Optional[str] = None, epoch: Optional[int] = None) -> None:
+    async def _cancel_stage(self, job_id: Optional[str] = None, epoch: Optional[int] = None,
+                            detail: str = "cancelled by the coordinator") -> None:
         """Stop the running stage; with ``job_id``/``epoch``, only if it is that one (a
         stale CancelStage must not kill a newer stage)."""
         async with self._stage_lock:
@@ -558,11 +665,21 @@ class Daemon:
                 log.info("ignoring cancel for job %s epoch %s: running job %s epoch %d",
                          job_id, epoch, stage.asg.job_id, stage.asg.epoch)
                 return
-            await self._stop_stage(stage)
+            await self._stop_stage(stage, detail)
 
-    async def _stop_stage(self, stage: _Stage) -> None:
-        """Stop ``stage``. The caller holds ``_stage_lock``."""
-        self._release(stage)  # first, so the stage's own exit path leaves state alone
+    async def _stop_stage(self, stage: _Stage, detail: str = "cancelled by the coordinator") -> None:
+        """Stop ``stage`` wherever it is (downloading, starting, running), then tell the
+        coordinator it stopped, once: until it hears that, it keeps this Mac out of new work.
+        The caller holds ``_stage_lock``."""
+        self._release(stage)  # first, so the stage's own exit paths leave state alone
+        starter, me = stage.starter, asyncio.current_task()
+        live = starter is not None and starter is not me and not starter.done()
+        if live:
+            starter.cancel()
+        if stage.fetch_proc is not None:
+            await _terminate(stage.fetch_proc, FETCH_STOP_GRACE_S)
+        if live:
+            await asyncio.wait({starter}, timeout=5)   # it can't be holding our lock
         if stage.session is not None:
             await stage.session.cancel()
         proc = stage.proc
@@ -574,6 +691,17 @@ class Daemon:
             except asyncio.TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
+        if stage.pump is not None and not stage.pump.done():
+            await asyncio.wait({stage.pump}, timeout=2)   # forward the worker's last words first
+        if not stage.reported:
+            stage.reported = True
+            asg = stage.asg
+            log.info("job %s epoch %d stage %d stopped: %s", asg.job_id, asg.epoch, asg.stage_idx,
+                     detail)
+            await self.send(StageFinished(
+                job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx, reason="cancelled",
+                last_step=asg.resume_step, detail=detail,
+            ))
 
     async def _on_fetch(self, msg: VerifyFetch) -> None:
         dest = self.opt.paths.job_dir(msg.job_id, msg.epoch) / f"bundle_{msg.step}.safetensors"
@@ -631,16 +759,17 @@ class Daemon:
         except Exception:
             pass
         stage = self._stage
-        if stage is not None:
-            # In-process stages drain via their runner; sandboxed workers on a stdin line,
-            # with the pump forwarding their StageFinished.
+        if stage is not None and stage.ready:
+            # A running stage drains to a checkpoint: in-process via its runner, a sandboxed
+            # worker on a stdin line, with the pump forwarding its StageFinished. One still
+            # downloading or loading has nothing to save and just stops below.
             await self._request_drain()
             ended = stage.session.task if stage.session else stage.pump
             if ended is not None:
                 with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                     await asyncio.wait_for(asyncio.shield(ended), timeout=self.opt.cfg.grace_period_s)
-            if self._stage is stage:
-                await self._cancel_stage()
+        # Whatever is current now, including a stage assigned while we drained.
+        await self._cancel_stage(detail="agent shutting down")
         self._stop.set()
         conn = self._conn or self._ws  # close it even mid-handshake, or run() never returns
         if conn is not None:

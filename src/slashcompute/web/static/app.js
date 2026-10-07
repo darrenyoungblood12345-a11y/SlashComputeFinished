@@ -46,6 +46,9 @@ const state = {
     streaming: false,
     abort: null,
     upload: null,       // {name, pct} while a GGUF is on its way
+    error: "",          // why the pool's LLM service could not be read
+    why: null,          // why Send is unavailable: {text, tone?, action?}
+    starting: false,    // the pending Start/Stop serving click is a start
   },
 };
 
@@ -196,6 +199,12 @@ function grantBalance() {
   if (state.credits) return Math.max(0, Number(state.credits.balance) || 0);
   if (state.grants && state.grants.available != null) return Math.max(0, Number(state.grants.available) || 0);
   return 0;
+}
+
+function agentActivity(st) {
+  if (st.agent_fetch_done_bytes == null) return st.agent_status || "running";
+  const total = st.agent_fetch_total_bytes ? ` of ${fmtBytes(st.agent_fetch_total_bytes)}` : "";
+  return `downloading the model (${fmtBytes(st.agent_fetch_done_bytes)}${total})`;
 }
 
 function fmtWait(s) {
@@ -405,7 +414,7 @@ function renderContributions() {
   if (running) {
     const job = st.agent_job_id ? ` · job ${String(st.agent_job_id).slice(0, 8)}` : "";
     setText("#c-state", `Contributing${job}`);
-    setText("#c-detail", `Agent is ${st.agent_status || "running"}. Earning whenever the pool has work.`);
+    setText("#c-detail", `Agent is ${agentActivity(st)}. Earning whenever the pool has work.`);
   } else {
     const where = s.mode === "host" ? "hosted on this Mac"
       : s.mode === "public" ? (s.url || status().public_url || "public pool")
@@ -500,35 +509,78 @@ function renderUsage() {
   msg.dataset.offline = p.online ? "" : "1";
 
   setText("#u-count", String(p.jobs.length));
-  renderOnce("jobs", p.jobs, $("#jobs"), () => p.jobs.length ? p.jobs.map(jobCard).join("")
-    : `<p class="empty">No jobs yet. Submit one and it will appear here.</p>`);
+  // Rebuilt only when the cards themselves change. A starting job's progress changes every poll,
+  // and rebuilding then replaced its Cancel button under the pointer, losing the click.
+  renderOnce("jobs", p.jobs.map((j) => [j.id, j.status, j.can_cancel, j.model]), $("#jobs"),
+    () => p.jobs.length ? p.jobs.map(jobCard).join("")
+      : `<p class="empty">No jobs yet. Submit one and it will appear here.</p>`);
+  $$("#jobs .job").forEach((card, i) => patchJob(card, p.jobs[i]));
+}
+
+// What a starting job waits for on each Mac: the model download, loading it, or nothing.
+function startNote(j) {
+  const parts = (j.stages || []).map((st) => {
+    const who = st.node_name || String(st.node_id || "").slice(0, 8);
+    if (st.phase === "ready") return `${who} ready`;
+    if (st.phase !== "fetching") return `Loading the model on ${who}`;
+    const done = st.fetch_done_bytes;
+    const total = st.fetch_total_bytes;
+    if (done == null) return `Downloading the model on ${who}`;
+    const pct = total ? ` (${Math.floor((done / total) * 100)}%)` : "";
+    return `Downloading the model on ${who}: ${fmtBytes(done)}${total ? ` of ${fmtBytes(total)}` : ""}${pct}`;
+  });
+  if (!parts.length) parts.push("Starting");
+  if (j.starting_s != null) parts.push(`assigned ${fmtWait(j.starting_s)} ago`);
+  return parts.join(" · ");
+}
+
+function jobNotes(j, status) {
+  const waiting = ["queued", "recovering"].includes(status);
+  const notes = [];   // [text, class]
+  if (status === "starting") notes.push([startNote(j), "info"]);
+  // While it waits or starts again, the error is why the last try ended, not the news.
+  if (j.error) notes.push([waiting || status === "starting" ? `Last try: ${j.error}` : j.error, ""]);
+  if (waiting) {
+    const bits = [];
+    if (j.queue_position != null) bits.push(`queue #${j.queue_position}`);
+    if (j.wait_reason) bits.push(j.wait_reason);
+    else if (j.queue_position > 1) bits.push("behind the job ahead of it");
+    if (Number(j.wait_s) > 0) bits.push(`~${fmtWait(j.wait_s)}`);
+    if (bits.length) notes.push([`Waitlist ${bits.join(" · ")}`, "info"]);
+  } else if (j.wait_reason) notes.push([`Waiting: ${j.wait_reason}`, "info"]);
+  if (!notes.length && j.adapter_dir) return `<p class="note ok">Adapter ready at ${esc(j.adapter_dir)}</p>`;
+  return notes.map(([text, cls]) => `<p class="note ${cls}">${esc(text)}</p>`).join("");
 }
 
 function jobCard(j) {
   const status = String(j.status || "");
   const cls = ["running", "starting"].includes(status) ? "is-active"
     : ["queued", "recovering"].includes(status) ? "is-waiting" : "";
-  const meta = [`Step ${j.progress_step ?? 0} of ${j.steps ?? 0}`];
-  if (j.last_loss != null) meta.push(`loss ${Number(j.last_loss).toFixed(3)}`);
-  if (j.stages && j.stages.length) meta.push(plural(j.stages.length, "Mac"));
-  meta.push(String(j.id).slice(0, 8));
-  let note = "";
-  if (j.error) note = `<p class="note">${esc(j.error)}</p>`;
-  else if (["queued", "recovering"].includes(status) && (j.queue_position != null || j.wait_s != null || j.wait_reason)) {
-    const bits = [];
-    if (j.queue_position != null) bits.push(`queue #${j.queue_position}`);
-    bits.push(j.wait_s == null ? "unknown wait" : `~${fmtWait(j.wait_s)}`);
-    if (j.wait_reason) bits.push(j.wait_reason);
-    note = `<p class="note">Waitlist ${esc(bits.join(" · "))}</p>`;
-  } else if (j.wait_reason) note = `<p class="note">Waiting: ${esc(j.wait_reason)}</p>`;
-  else if (j.adapter_dir) note = `<p class="note ok">Adapter ready at ${esc(j.adapter_dir)}</p>`;
   const cancel = j.can_cancel
     ? `<button type="button" class="btn ghost sm" data-cancel="${esc(j.id)}">Cancel</button>` : "";
   return `<div class="job ${cls}">
     <div class="job-top"><b>${esc(modelLabel(j.model))}</b><span class="tag ${STATUS_TONE[status] || ""}">${esc(status)}</span>${cancel}</div>
-    <div class="bar ${status === "completed" ? "done" : ""}"><i style="width:${(Number(j.progress) * 100).toFixed(1)}%"></i></div>
-    <p class="meta">${esc(meta.join(" · "))}</p>${note}
+    <div class="bar ${status === "completed" ? "done" : ""}"><i></i></div>
+    <p class="meta"></p><div class="notes"></div>
   </div>`;
+}
+
+// The parts of a job card that change between polls, set in place.
+function patchJob(card, j) {
+  if (!j) return;
+  const status = String(j.status || "");
+  const meta = [`Step ${j.progress_step ?? 0} of ${j.steps ?? 0}`];
+  if (j.last_loss != null) meta.push(`loss ${Number(j.last_loss).toFixed(3)}`);
+  if (j.stages && j.stages.length) meta.push(plural(j.stages.length, "Mac"));
+  meta.push(String(j.id).slice(0, 8));
+  card.querySelector(".bar i").style.width = `${(Number(j.progress) * 100).toFixed(1)}%`;
+  card.querySelector(".meta").textContent = meta.join(" · ");
+  const notes = card.querySelector(".notes");
+  const html = jobNotes(j, status);
+  if (notes.dataset.html !== html) {
+    notes.innerHTML = html;
+    notes.dataset.html = html;
+  }
 }
 
 function setMsg(sel, text, tone) {
@@ -678,7 +730,7 @@ function renderPool() {
   const job = st.agent_job_id ? ` · job ${String(st.agent_job_id).slice(0, 8)}` : "";
   const rows = [
     ["Coordinator", st.coordinator_up, st.coordinator_up ? (hostingHere(st) ? "hosting here" : "reachable") : "offline"],
-    ["This Mac's agent", st.agent_running, st.agent_running ? `${st.agent_status || "running"}${job}` : "not contributing"],
+    ["This Mac's agent", st.agent_running, st.agent_running ? `${agentActivity(st)}${job}` : "not contributing"],
     ["Macs in pool", (st.nodes || 0) > 0, st.coordinator_up ? String(st.nodes || 0) : "—"],
     ["Jobs", (st.jobs || 0) > 0, st.coordinator_up ? String(st.jobs || 0) : "—"],
     ["LLM node", !!st.inference_running, st.inference_running ? llmNodeState(st) : "not serving"],
@@ -727,11 +779,84 @@ async function loadLlm() {
   try {
     l.net = await api("/api/coord/inference/status");
     l.models = ((await api("/api/coord/v1/models")) || {}).data || [];
-    if (!l.models.some((m) => m.id === l.model)) l.model = l.models.length ? l.models[0].id : "";
-  } catch {
+    l.error = "";
+  } catch (e) {
     l.net = null;
     l.models = [];
+    l.error = e.message || String(e);   // said under Send, not hidden behind "No models yet"
   }
+  const choices = llmChoices(l);
+  if (!choices.some((m) => m.id === l.model)) {
+    const served = choices.find((m) => llmServable(l, m.id));
+    l.model = (served || choices[0] || {}).id || "";
+  }
+}
+
+// Every known model can be picked, served or not: one nobody serves yet says why under Send.
+function llmChoices(l) {
+  const known = l.net ? l.net.models.filter((m) => m.status !== "rejected") : [];
+  return known.length ? known : l.models;
+}
+
+const llmServable = (l, id) => !!id && l.models.some((m) => m.id === id);
+
+// Why Send can't be used now (or why a reply would fail), and the one click that fixes it.
+function llmWhy(st, s, l, unsupported) {
+  if (!st.coordinator_up) return { text: "Start or join a pool first (Pool tab)." };
+  if (unsupported) return { text: OUTDATED_COORDINATOR, tone: "bad" };
+  if (l.error) return { text: `Can't reach the pool's LLM service: ${l.error}`, tone: "bad" };
+  const choices = llmChoices(l);
+  if (!choices.length) return { text: "No models yet. Upload a GGUF below, or put one in a head's models folder." };
+  const m = choices.find((c) => c.id === l.model) || choices[0];
+  const n = st.inference_status || {};
+  const running = !!st.inference_running;
+  if (state.busy.has("llm")) return { text: l.starting ? "Starting llama.cpp on this Mac…" : "Stopping serving on this Mac…" };
+  const me = l.net && n.node_id ? l.net.nodes.find((x) => x.id === n.node_id) : null;
+  const lent = me ? Number(me.committed_gb) || 0 : 0;
+  const need = Number(m.min_memory_gb) || 0;
+  const short = running && need > 0 && lent > 0 && lent < need;
+  const lend = need > memoryLimits().cap
+    ? { text: `${m.id} needs ${need} GB lent to run on one Mac, more than this Mac can lend (${memoryLimits().cap} GB). Add a Mac to the pool to split it.` }
+    : { text: `${m.id} needs ${need} GB lent to run on one Mac; this Mac lends ${lent} GB.`,
+        action: { label: `Lend ${need} GB and restart serving`, act: "llm-lend", gb: need } };
+  if (llmServable(l, m.id)) {
+    const serving = l.net ? l.net.nodes.filter((x) => x.online && x.available).length : 0;
+    return short && serving <= 1 ? { ...lend, text: `${lend.text} A reply would fail.` } : null;
+  }
+  if (!running) {
+    return { text: `No Mac is serving ${m.id} yet.`, action: { label: "Start serving on this Mac", act: "llm-serve" } };
+  }
+  if (n.reason === "unsupported") return { text: n.last_error || OUTDATED_COORDINATOR, tone: "bad" };
+  if (!n.node_id || ["connecting", "joining"].includes(n.reason)) {
+    return { text: n.last_error ? `Starting llama.cpp on this Mac: ${n.last_error}` : "Starting llama.cpp on this Mac…" };
+  }
+  if (n.available === false) return { text: `This Mac serves LLMs but is not taking work right now: ${n.reason || "paused"}.` };
+  if (s.inference_head === false) {
+    return { text: `This Mac only lends layers; a head has to hold ${m.id}.`,
+             action: { label: "Make this Mac a head", act: "llm-head" } };
+  }
+  const copying = me && m.downloading ? m.downloading[me.name] : null;
+  if (copying != null) return { text: `Copying ${m.id} to this Mac: ${Math.round(copying * 100)}%.` };
+  if (!(n.models || []).includes(m.id)) return { text: `Waiting for ${m.id} to reach this Mac.` };
+  if (m.status && m.status !== "ready") return { text: `${m.id} is ${m.status}${m.status_reason ? `: ${m.status_reason}` : ""}.` };
+  if (short) return lend;
+  return { text: `This Mac has ${m.id}; it is listed once the pool hears from it (a few seconds).` };
+}
+
+function renderWhy(why) {
+  const box = $("#l-why");
+  box.hidden = !why;
+  if (!why) return;
+  box.className = `why ${why.tone || ""}`.trim();
+  setText("#l-why-text", why.text);
+  const btn = $("#l-why-act");
+  const a = why.action;
+  if (state.busy.has("llm")) return;   // withBusy owns the button's label meanwhile
+  btn.hidden = !a;
+  if (!a) return;
+  btn.textContent = a.label;
+  btn.dataset.act = a.act;
+  btn.dataset.gb = a.gb != null ? String(a.gb) : "";
 }
 
 function renderLlm() {
@@ -745,8 +870,10 @@ function renderLlm() {
   const live = st.inference_transport || (net && net.transport) || "";
 
   const unsupported = up && st.inference_supported === false;
+  const choices = llmChoices(l);
   setTag("#l-pill", !up ? "Offline" : unsupported ? "Pool has no LLMs"
-    : l.models.length ? `${plural(l.models.length, "model")} ready` : "No models yet",
+    : l.models.length ? `${plural(l.models.length, "model")} ready`
+    : choices.length ? `${plural(choices.length, "model")} · none served` : "No models yet",
   !up || unsupported ? "hot" : l.models.length ? "ok" : "warn");
   setText("#l-models", String(l.models.length));
   setText("#l-models-sub", net ? `${plural(net.models.length, "known model")}, ${l.models.length} ready` : "ready to chat");
@@ -759,10 +886,12 @@ function renderLlm() {
   setTag("#l-chat-tag", l.streaming ? "Replying" : pipe ? pipe.state : "Idle", l.streaming ? "ok" : "");
 
   const sel = $("#l-model");
-  renderOnce("llm-models", [l.models.map((m) => m.id), l.model], sel, () => l.models.length
-    ? l.models.map((m) => `<option value="${esc(m.id)}"${m.id === l.model ? " selected" : ""}>${esc(m.id)} · ${esc(m.size_gb)} GB</option>`).join("")
-    : `<option value="">No model a head can serve yet</option>`);
-  $("#l-send").disabled = l.streaming || !l.model || !up;
+  renderOnce("llm-models", [choices.map((m) => [m.id, llmServable(l, m.id)]), l.model], sel, () => choices.length
+    ? choices.map((m) => `<option value="${esc(m.id)}"${m.id === l.model ? " selected" : ""}>${esc(m.id)} · ${esc(m.size_gb)} GB${llmServable(l, m.id) ? "" : " · not served yet"}</option>`).join("")
+    : `<option value="">No models yet</option>`);
+  $("#l-send").disabled = l.streaming || !llmServable(l, l.model) || !up;
+  l.why = llmWhy(st, s, l, unsupported);
+  renderWhy(l.why);
   $("#l-stop").disabled = !l.streaming;
 
   const catalog = net ? net.models : [];
@@ -875,7 +1004,7 @@ async function sendChat() {
   const draft = $("#l-draft");
   const text = draft.value.trim();
   if (!text || l.streaming) return;
-  if (!l.model) return setMsg("#l-msg", "No model to talk to yet. Upload a GGUF first.", "bad");
+  if (!llmServable(l, l.model)) return setMsg("#l-msg", (l.why && l.why.text) || "No Mac is serving this model yet.", "bad");
   setMsg("#l-msg", "", "");
   l.messages.push({ role: "user", content: text });
   const reply = { role: "assistant", content: "", live: true };
@@ -950,7 +1079,8 @@ function uploadModel(file) {
     try { data = JSON.parse(xhr.responseText); } catch { /* plain text */ }
     l.upload = null;
     if (xhr.status >= 200 && xhr.status < 300) {
-      setMsg("#l-upmsg", `${data.name}: ${data.layers} layers, sent to ${plural(data.pushed, "head")}. ${tooBig}`.trim(),
+      const none = data.pushed ? "" : "No Mac is serving yet: start serving on this Mac to host it.";
+      setMsg("#l-upmsg", `${data.name}: ${data.layers} layers, sent to ${plural(data.pushed, "head")}. ${none} ${tooBig}`.trim(),
         tooBig ? "warn" : "ok");
     } else {
       setMsg("#l-upmsg", (data && (data.detail || (data.error && data.error.message))) || xhr.statusText || "Upload failed.", "bad");
@@ -981,6 +1111,24 @@ async function withBusy(key, button, busyText, fn) {
   }
 }
 
+// Start or stop serving LLMs on this Mac. Only the LLM node changes: the training agent is left
+// alone (resending every setting through /api/start used to restart it, and it hung mid-download).
+function serveLlm(btn, on, changes = {}) {
+  if (!state.busy.has("llm")) state.llm.starting = on;
+  return withBusy("llm", btn, on ? "Starting…" : "Stopping…", async () => {
+    const s = state.settings || {};
+    const snap = await post("/api/inference", {
+      on, inference_memory_gb: s.inference_memory_gb, inference_head: s.inference_head !== false,
+      models_dir: s.models_dir, transport: s.transport, ...changes,
+    });
+    state.settings = pickSettings(snap);
+    if (snap.last_error) toast(snap.last_error, "bad");
+    else if (on && !snap.inference_running) toast("The LLM node did not start: see ~/.slashcompute/logs/inference.log.", "bad");
+    else toast(on ? "Serving. This Mac hosts LLM layers whenever a chat needs them."
+      : "Stopped serving. The current reply finishes first.");
+  });
+}
+
 // Joining another pool stops the coordinator hosted here once that pool answers: ask first.
 function leaveHostedPool() {
   return status().coordinator_pid == null || window.confirm(
@@ -988,17 +1136,10 @@ function leaveHostedPool() {
 }
 
 const actions = {
-  "toggle-llm": (btn) => {
-    const st = status();
-    const running = !!st.inference_running;
-    return withBusy("llm", btn, running ? "Stopping…" : "Starting…", async () => {
-      const keep = { contribute: true, training: !!st.agent_running };   // leave fine-tune contribution as it is
-      const snap = await post("/api/start", { ...state.settings, ...keep, inference: !running });
-      if (snap.last_error) toast(snap.last_error, "bad");
-      else toast(running ? "Stopped serving. The current reply finishes first."
-        : "Serving. This Mac hosts LLM layers whenever a chat needs them.");
-    });
-  },
+  "toggle-llm": (btn) => serveLlm(btn, !status().inference_running),
+  "llm-serve": (btn) => serveLlm(btn, true),
+  "llm-lend": (btn) => serveLlm(btn, true, { inference_memory_gb: Number(btn.dataset.gb) }),
+  "llm-head": (btn) => serveLlm(btn, true, { inference_head: true }),
   "llm-stop": () => { if (state.llm.abort) state.llm.abort.abort(); },
   "llm-clear": () => { state.llm.messages = []; renderChat(); },
   "llm-unload": (btn) => withBusy("llm-unload", btn, "Unloading…", async () => {

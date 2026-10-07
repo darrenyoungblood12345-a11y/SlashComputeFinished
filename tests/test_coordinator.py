@@ -291,7 +291,11 @@ def test_recovered_job_drops_the_stale_abort_error(env):
         ag = {m.stage_idx: x for x in agents for m in [x.recv()]}
         ag[0].send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=0, reason="error", last_step=0,
                                    detail="transient"))
-        assert isinstance(ag[1].recv(), P.CancelStage)
+        cancel = ag[1].recv()
+        assert isinstance(cancel, P.CancelStage)
+        # As a real agent does, say the stage stopped: until then its Mac takes no new work.
+        ag[1].send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=1, reason="cancelled",
+                                   last_step=0))
         new = {x.node_id: x.recv() for x in agents}
         assert all(isinstance(m, P.StageAssignment) and m.epoch == 2 for m in new.values())
         assert "transient" in client.get(f"/jobs/{job_id}").json()["error"]
@@ -415,3 +419,29 @@ def test_cli_sends_session_token_as_bearer(env, monkeypatch):
     CliRunner().invoke(app, ["cancel", "nope", "--session-token", "tok1"] + url)
     CliRunner().invoke(app, ["cancel", "nope"] + url, env={"SLASHCOMPUTE_SESSION": "tok2"})
     assert [h.get("Authorization") for h in seen] == ["Bearer tok1", "Bearer tok2"]
+
+
+@pytest.mark.parametrize("data,why", [
+    (b'{"text": "ok"}\n{"text": "ok"\n', "dataset line 2 is not JSON"),
+    (b'{"text": "ok"}\n[1, 2]\n', "dataset line 2 is not a JSON object"),
+    (b'{"text": "ok"}\n\n{"nope": 1}\n', "dataset line 3 has keys ['nope']"),
+    (b"\n\n", "the dataset has no rows"),
+])
+def test_upload_rejects_a_malformed_dataset(env, data, why):
+    """It used to be queued, then crash the worker on a Mac after the model had loaded."""
+    client, core, tiny_model, _, _ = env
+    r = client.post("/jobs/upload", files={"dataset": ("train.jsonl", data)},
+                    data={"model": str(tiny_model), "steps": "2"})
+    assert r.status_code == 400 and why in r.json()["detail"], r.text
+    assert core.jobs == {}
+
+
+def test_upload_accepts_every_dataset_row_format(env):
+    client, core, tiny_model, _, _ = env
+    rows = [{"text": "a"}, {"prompt": "q", "completion": "a"},
+            {"messages": [{"role": "user", "content": "q"}]}, {"tokens": [1, 2, 3]}]
+    data = "\n".join(json.dumps(r) for r in rows).encode() + b"\n"
+    r = client.post("/jobs/upload", files={"dataset": ("train.jsonl", data)},
+                    data={"model": str(tiny_model), "steps": "2"})
+    assert r.status_code == 200, r.text
+    assert core.jobs[r.json()["id"]].spec.min_stages == 1   # the form's default: one Mac is enough

@@ -154,3 +154,24 @@ async def test_shared_token_guards_uploads_and_chat(tmp_path):
             assert ok.status_code == 200
     finally:
         await h.stop()
+
+
+async def test_a_paused_head_does_not_make_its_models_servable(tmp_path):
+    """A head busy training refuses chats: listing its models enabled Send for a chat that failed."""
+    from slashcompute.inference.coordinator import registry
+    from slashcompute.inference.coordinator.status import snapshot
+
+    h = await start_harness(fast_settings(), tmp=str(tmp_path))
+    try:
+        d = tmp_path / "head" / "models"
+        d.mkdir(parents=True)
+        (d / "tiny.gguf").write_bytes(tiny_gguf())
+        await h.add_node(FakeNode("head", 16, may_be_head=True), 0, gguf_files=scan_models([str(d)]))
+        assert [r["id"] for r in registry.servable_models(h.conn, h.settings)] == ["tiny.gguf"]
+        [m] = snapshot(h.conn, h.settings)["models"]
+        assert m["servable"] and isinstance(m["min_memory_gb"], int) and m["min_memory_gb"] >= 2
+        h.conn.execute("UPDATE nodes SET available=0")
+        assert registry.servable_models(h.conn, h.settings) == []
+        assert not snapshot(h.conn, h.settings)["models"][0]["servable"]
+    finally:
+        await h.stop()

@@ -186,7 +186,8 @@ def start(
     from slashcompute.inference.node import hardware
 
     h = _home(home)
-    if (pid := read_pid(h)) is not None:
+    # The launcher records this process's pid as it spawns it: only another live pid means a node runs.
+    if (pid := read_pid(h)) is not None and pid != os.getpid():
         typer.echo(f"inference node already running (pid {pid})", err=True)
         raise typer.Exit(1)
     info_mem = hardware.detect().get("total_mem_bytes") or 0

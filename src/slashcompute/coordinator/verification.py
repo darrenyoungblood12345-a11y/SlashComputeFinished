@@ -181,7 +181,7 @@ class VerificationManager:
         for node in list(core.registry.nodes.values()):
             due = node.canary_passed is None or (
                 node.canary_passed and time.monotonic() - node.last_canary > core.cfg.canary_interval_s)
-            if not due or node.draining or node.assignment or node.verifying:
+            if not due or node.draining or node.assignment or node.releasing or node.verifying:
                 continue
             seed, size = self.rng.randrange(2**31), core.cfg.canary_size
             v = Verification(id=uuid.uuid4().hex, kind="canary", target_node_id=node.node_id,

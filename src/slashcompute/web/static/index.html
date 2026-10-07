@@ -162,7 +162,7 @@
               </div>
               <div class="field-pair">
                 <div class="field"><label for="steps">Steps</label><input type="number" id="steps" min="1" value="10"></div>
-                <div class="field"><label for="min_stages">Min Macs</label><input type="number" id="min_stages" min="1" max="16" value="2"></div>
+                <div class="field"><label for="min_stages">Min Macs</label><input type="number" id="min_stages" min="1" max="16" value="1"></div>
               </div>
               <div class="field" id="flop-budget" hidden>
                 <label for="max_flops">FLOP budget (TFLOPs)</label>
@@ -331,6 +331,10 @@
                 <textarea id="l-draft" rows="3" placeholder="Ask the pool… (Enter sends, Shift+Enter for a new line)" spellcheck="false"></textarea>
               </div>
               <p class="msg" id="l-msg"></p>
+              <div class="why" id="l-why" hidden>
+                <p id="l-why-text"></p>
+                <button type="button" class="btn primary sm" id="l-why-act" hidden></button>
+              </div>
               <div class="btn-row">
                 <button type="submit" class="btn primary grow" id="l-send">Send</button>
                 <button type="button" class="btn ghost" id="l-stop" data-act="llm-stop" disabled>Stop</button>

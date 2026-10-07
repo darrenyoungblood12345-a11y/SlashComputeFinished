@@ -394,7 +394,8 @@ async def test_stop_drains_a_sandboxed_worker_before_disconnecting(tmp_path, mon
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])))
     monkeypatch.setattr("slashcompute.agent.daemon.wrap_command",
                         lambda cmd, *_: [sys.executable, "-c", _DRAINABLE_WORKER, *cmd[3:]])
-    monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", lambda model: Path(model))
+    monkeypatch.setattr("slashcompute.agent.daemon.fetch_command",
+                        lambda model: [sys.executable, "-c", _INSTANT_FETCH])
 
     sent, closed = [], asyncio.Event()
 
@@ -415,8 +416,9 @@ async def test_stop_drains_a_sandboxed_worker_before_disconnecting(tmp_path, mon
         num_layers=8, spec=LoraFinetuneSpec(dataset_path="dataset.jsonl", steps=100),
         checkpoint_every=25, verify_ring_size=8,
     )
-    await daemon._start_stage(asg)
-    proc = daemon._proc
+    stage = await daemon._start_stage(asg)
+    await asyncio.wait_for(stage.starter, 30)
+    proc = stage.proc
     try:
         for _ in range(200):
             if any(m["type"] == "stage_ready" for m in sent):
@@ -521,14 +523,18 @@ async def test_sandboxed_worker_resolves_the_model_the_daemon_fetched(tmp_path, 
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_ENDPOINT", "http://127.0.0.1:9720")    # nothing listens: no real network
 
-    def fetch(name):                 # the daemon's unsandboxed snapshot_download, in HF's cache layout
-        repo = hf_home / "hub" / f"models--{name.replace('/', '--')}"
-        snap = repo / "snapshots" / sha
-        snap.mkdir(parents=True)
-        (snap / "config.json").write_text('{"model_type": "tiny"}')
-        (repo / "refs").mkdir()
-        (repo / "refs" / "main").write_text(sha)
-        return snap
+    # The daemon's unsandboxed download (agent.fetch), writing HF's cache layout.
+    fetch = f"""
+import json, os
+from pathlib import Path
+repo = Path(os.environ["HF_HOME"]) / "hub" / "models--{model.replace('/', '--')}"
+snap = repo / "snapshots" / "{sha}"
+snap.mkdir(parents=True)
+(snap / "config.json").write_text('{{"model_type": "tiny"}}')
+(repo / "refs").mkdir()
+(repo / "refs" / "main").write_text("{sha}")
+print(json.dumps({{"type": "done", "path": str(snap)}}))
+"""
 
     opt = AgentOptions(url="http://127.0.0.1:9720", home=tmp_path, localhost=True, sandbox=True)
     job_dir = opt.paths.job_dir("j", 1)
@@ -549,7 +555,8 @@ except PermissionError:
     out["cache"] = "read-only"
 open({str(job_dir / "probe.json")!r}, "w").write(json.dumps(out))
 """
-    monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", fetch, raising=False)
+    monkeypatch.setattr("slashcompute.agent.daemon.fetch_command",
+                        lambda name: [sys.executable, "-c", fetch])
     monkeypatch.setattr("slashcompute.agent.daemon.wrap_command",
                         lambda cmd, *a: sandbox.wrap_command([sys.executable, "-c", probe], *a))
     daemon = Daemon(opt)
@@ -559,8 +566,9 @@ open({str(job_dir / "probe.json")!r}, "w").write(json.dumps(out))
         checkpoint_every=25, verify_ring_size=8,
     )
     try:
-        await daemon._start_stage(asg)
-        await asyncio.wait_for(daemon._pump, 120)
+        stage = await daemon._start_stage(asg)
+        await asyncio.wait_for(stage.starter, 60)
+        await asyncio.wait_for(stage.pump, 120)
         out = json.loads((job_dir / "probe.json").read_text())
     finally:
         shutil.rmtree(home, ignore_errors=True)
@@ -571,14 +579,32 @@ open({str(job_dir / "probe.json")!r}, "w").write(json.dumps(out))
 # ------------------------------------------------------------ stage lifecycle races
 
 
-def _sandboxed_daemon(tmp_path, monkeypatch, worker="import time; time.sleep(30)"):
-    import sys
+_INSTANT_FETCH = 'import json; print(json.dumps({"type": "done", "path": "x"}))'
+# A download that never ends: notes its pid, then reports progress until it is killed.
+_SLOW_FETCH = """
+import json, os, sys, time
+open(sys.argv[1], "a").write(f"{os.getpid()}\\n")
+for i in range(1, 600):
+    print(json.dumps({"type": "progress", "done": i * 1000, "total": 10**9}), flush=True)
+    time.sleep(0.1)
+"""
 
-    from slashcompute.agent.daemon import AgentOptions, Daemon
+
+def _patch_agent_children(tmp_path, monkeypatch, worker="import time; time.sleep(30)",
+                          fetch=_INSTANT_FETCH):
+    """Stand-ins for the sandboxed worker and the model download (``fetch`` is a script)."""
+    import sys
 
     monkeypatch.setattr("slashcompute.agent.daemon.wrap_command",
                         lambda cmd, *_: [sys.executable, "-c", worker])
-    monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", lambda model: Path(model))
+    monkeypatch.setattr("slashcompute.agent.daemon.fetch_command",
+                        lambda model: [sys.executable, "-c", fetch, str(tmp_path / "fetch-pids")])
+
+
+def _sandboxed_daemon(tmp_path, monkeypatch, worker="import time; time.sleep(30)", fetch=_INSTANT_FETCH):
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+
+    _patch_agent_children(tmp_path, monkeypatch, worker, fetch)
     daemon = Daemon(AgentOptions(url="http://127.0.0.1:9940", home=tmp_path, localhost=True,
                                  sandbox=True))
     sent = []
@@ -590,12 +616,17 @@ def _sandboxed_daemon(tmp_path, monkeypatch, worker="import time; time.sleep(30)
     return daemon, sent
 
 
+async def _started(daemon, asg):
+    """Assign ``asg`` and wait until its worker is up (the start runs on its own)."""
+    stage = await daemon._start_stage(asg)
+    await asyncio.wait_for(stage.starter, 30)
+    return stage
+
+
 async def test_finished_worker_does_not_clobber_the_next_stage(tmp_path, monkeypatch):
     daemon, _ = _sandboxed_daemon(tmp_path, monkeypatch)
-    await daemon._start_stage(_assignment(epoch=1))
-    a = daemon._stage
-    await daemon._start_stage(_assignment(epoch=2))  # replaces (and stops) epoch 1
-    b = daemon._stage
+    a = await _started(daemon, _assignment(epoch=1))
+    b = await _started(daemon, _assignment(epoch=2))  # replaces (and stops) epoch 1
     try:
         await asyncio.wait_for(a.pump, 10)  # epoch 1's pump ran its cleanup after epoch 2 began
         assert a.proc.returncode is not None
@@ -644,11 +675,10 @@ async def test_stale_stage_commands_are_ignored(tmp_path):
 
 async def test_repeated_assignment_keeps_the_running_stage(tmp_path, monkeypatch):
     daemon, _ = _sandboxed_daemon(tmp_path, monkeypatch)
-    await daemon._start_stage(_assignment(epoch=1))
-    first = daemon._stage
+    first = await _started(daemon, _assignment(epoch=1))
     try:
-        await daemon._start_stage(_assignment(epoch=1))  # e.g. replayed after a reconnect
-        assert daemon._stage is first and first.proc.returncode is None
+        again = await daemon._start_stage(_assignment(epoch=1))  # e.g. replayed after a reconnect
+        assert again is first and daemon._stage is first and first.proc.returncode is None
     finally:
         await daemon._cancel_stage()
 
@@ -657,8 +687,8 @@ async def test_worker_that_dies_silently_is_reported(tmp_path, monkeypatch):
     from slashcompute.common.protocol import StageFinished
 
     daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch, worker="raise SystemExit(3)")
-    await daemon._start_stage(_assignment(epoch=1))
-    await asyncio.wait_for(daemon._stage.pump, 10)
+    stage = await _started(daemon, _assignment(epoch=1))
+    await asyncio.wait_for(stage.pump, 10)
     [finished] = [m for m in sent if isinstance(m, StageFinished)]
     assert finished.reason == "error" and "exited with code 3" in finished.detail
     assert daemon._stage is None and daemon.status == "idle"
@@ -677,7 +707,7 @@ async def test_second_shutdown_is_a_no_op_and_blocks_new_stages(tmp_path, monkey
         session.task.cancel()
 
     session.cancel = cancel
-    daemon._stage = _Stage(_assignment(epoch=1), session=session)
+    daemon._stage = _Stage(_assignment(epoch=1), session=session, ready=True)
     first = asyncio.create_task(daemon.shutdown())
     await asyncio.sleep(0.05)
     await asyncio.wait_for(daemon.shutdown(), 0.1)  # returns at once instead of draining again
@@ -883,9 +913,285 @@ async def test_worker_that_cannot_start_is_reported_at_once(tmp_path, monkeypatc
     async def no_sandbox(*args, **kwargs):
         raise FileNotFoundError("sandbox-exec")
 
+    async def fetched(stage):
+        pass
+
+    monkeypatch.setattr(daemon, "_fetch_model", fetched)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", no_sandbox)
-    await daemon._start_stage(_assignment(epoch=1))
+    await _started(daemon, _assignment(epoch=1))
     [finished] = [m for m in sent if isinstance(m, StageFinished)]
     # Not a stage stuck "loading" until the coordinator's 15-minute start timeout.
     assert finished.reason == "error" and "could not start the worker" in finished.detail
     assert daemon._stage is None and daemon.status == "idle"
+
+
+# ------------------------------------------------------------ a model download never blocks the agent
+
+
+def _fetch_pids(tmp_path):
+    f = tmp_path / "fetch-pids"
+    return [int(x) for x in f.read_text().split()] if f.exists() else []
+
+
+def _gone(pid):
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def _finished(sent):
+    from slashcompute.common.protocol import StageFinished
+
+    return [(m.reason, m.epoch) for m in sent if isinstance(m, StageFinished)]
+
+
+async def test_cancel_during_model_fetch_returns_quickly_and_kills_the_fetch(tmp_path, monkeypatch):
+    """A 7B download used to hold the agent's message loop for 10 minutes: the cancel (and
+    every job assigned after it) sat unread, so the jobs showed "starting" and never ran."""
+    import time
+
+    from slashcompute.common.protocol import CancelStage
+
+    daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch, fetch=_SLOW_FETCH)
+    stage = await daemon._start_stage(_assignment(epoch=1))
+    await _until(lambda: stage.fetch_done)
+    beat = daemon._heartbeat_msg()
+    assert (beat.status, beat.phase) == ("loading", "fetching") and beat.fetch_total_bytes == 10**9
+    assert daemon.opt.paths.read_status()["fetch_done_bytes"]
+    [pid] = _fetch_pids(tmp_path)
+    t0 = time.monotonic()
+    await asyncio.wait_for(daemon._handle(CancelStage(job_id="j", epoch=1)), 10)
+    assert time.monotonic() - t0 < 3
+    assert _gone(pid) and stage.proc is None and stage.starter.done()
+    assert _finished(sent) == [("cancelled", 1)]
+    assert daemon._stage is None and daemon.status == "idle"
+    assert daemon._heartbeat_msg().phase is None
+    assert daemon.opt.paths.read_status()["fetch_done_bytes"] is None
+
+
+async def test_cancel_right_after_assignment_never_starts_the_fetch(tmp_path, monkeypatch):
+    from slashcompute.common.protocol import CancelStage
+
+    daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch, fetch=_SLOW_FETCH)
+    await daemon._handle(_assignment(epoch=1))
+    await daemon._handle(CancelStage(job_id="j", epoch=1))   # no chance for the start to run
+    await asyncio.sleep(0.5)
+    assert _fetch_pids(tmp_path) == [] and daemon._stage is None
+    assert _finished(sent) == [("cancelled", 1)]
+
+
+async def test_new_assignment_during_fetch_preempts_it(tmp_path, monkeypatch):
+    import time
+
+    daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch, fetch=_SLOW_FETCH)
+    first = await daemon._start_stage(_assignment(epoch=1))
+    await _until(lambda: first.fetch_done)
+    [pid] = _fetch_pids(tmp_path)
+    t0 = time.monotonic()
+    second = await asyncio.wait_for(daemon._start_stage(_assignment(epoch=2)), 10)
+    try:
+        assert time.monotonic() - t0 < 3
+        assert _gone(pid) and daemon._stage is second
+        assert (daemon.status, daemon.job_id, daemon.epoch) == ("loading", "j", 2)
+        assert _finished(sent) == [("cancelled", 1)]
+        await _until(lambda: second.fetch_done)               # the new one downloads
+    finally:
+        await daemon._cancel_stage()
+    assert _finished(sent) == [("cancelled", 1), ("cancelled", 2)]
+
+
+async def test_fetch_failure_is_reported_as_a_stage_error(tmp_path, monkeypatch):
+    failing = ('import json, sys; print(json.dumps({"type": "error", '
+               '"detail": "RuntimeError: CAS Client Error"})); sys.exit(1)')
+    daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch, fetch=failing)
+    stage = await _started(daemon, _assignment(epoch=1))
+    from slashcompute.common.protocol import StageFinished
+
+    [finished] = [m for m in sent if isinstance(m, StageFinished)]
+    assert finished.reason == "error" and "model fetch failed: RuntimeError: CAS Client Error" in finished.detail
+    assert stage.proc is None and daemon._stage is None and daemon.status == "idle"
+
+
+async def _agent_against(tmp_path, monkeypatch, on_message):
+    """A real daemon.run() against a coordinator that welcomes it, assigns epoch 1 and hands
+    every message it gets to ``on_message(ws, msg)``."""
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+    from slashcompute.common.protocol import Welcome, dump, parse_agent_message
+
+    monkeypatch.setattr("slashcompute.agent.daemon.benchmark", _fake_profile)
+    _patch_agent_children(tmp_path, monkeypatch, fetch=_SLOW_FETCH)
+    got = []
+
+    async def on_register(ws, n, reg):
+        await ws.send(dump(Welcome(node_id="x", heartbeat_interval_s=0.1)))
+        await ws.send(dump(_assignment(epoch=1)))
+        async for raw in ws:
+            msg = parse_agent_message(raw)
+            got.append(msg)
+            await on_message(ws, msg)
+
+    server, url, _ = await _scripted_coordinator(on_register)
+    daemon = Daemon(AgentOptions(url=url, home=tmp_path, localhost=True, sandbox=True))
+    return daemon, asyncio.create_task(daemon.run()), server, got
+
+
+async def test_shutdown_during_fetch_exits_promptly(tmp_path, monkeypatch):
+    """Stop used to wait out the download (36 minutes on Oct 3), so the app said the training
+    agent was "still stopping" and would not start it again."""
+    import time
+
+    from slashcompute.common.protocol import Heartbeat, StageFinished
+
+    async def nothing(ws, msg):
+        pass
+
+    daemon, running, server, got = await _agent_against(tmp_path, monkeypatch, nothing)
+    try:
+        await _until(lambda: any(isinstance(m, Heartbeat) and m.phase == "fetching"
+                                 and m.fetch_done_bytes for m in got))
+        [pid] = _fetch_pids(tmp_path)
+        t0 = time.monotonic()
+        await asyncio.wait_for(daemon.shutdown(), 10)
+        await asyncio.wait_for(running, 10)
+        assert time.monotonic() - t0 < 4
+        assert _gone(pid)
+        assert [m.reason for m in got if isinstance(m, StageFinished)] == ["cancelled"]
+        assert daemon.opt.paths.read_status()["status"] == "stopped"
+    finally:
+        if not running.done():
+            running.cancel()
+        server.close()
+
+
+async def test_cancel_over_the_socket_is_handled_mid_fetch(tmp_path, monkeypatch):
+    import time
+
+    from slashcompute.common.protocol import CancelStage, Heartbeat, StageFinished, dump
+
+    cancelled_at = []
+
+    async def cancel_once_fetching(ws, msg):
+        if not cancelled_at and isinstance(msg, Heartbeat) and msg.phase == "fetching":
+            cancelled_at.append(time.monotonic())
+            await ws.send(dump(CancelStage(job_id="j", epoch=1)))
+
+    daemon, running, server, got = await _agent_against(tmp_path, monkeypatch, cancel_once_fetching)
+    try:
+        await _until(lambda: any(isinstance(m, StageFinished) for m in got))
+        assert time.monotonic() - cancelled_at[0] < 3
+        [finished] = [m for m in got if isinstance(m, StageFinished)]
+        assert finished.reason == "cancelled"
+        after = got.index(finished)
+        await _until(lambda: any(isinstance(m, Heartbeat) and m.status == "idle" and m.phase is None
+                                 for m in got[after:]))
+        assert all(_gone(pid) for pid in _fetch_pids(tmp_path))
+    finally:
+        await daemon.shutdown()
+        await asyncio.wait_for(running, 10)
+        server.close()
+
+
+async def test_in_process_stage_runs_only_after_prefetch(tmp_path, monkeypatch):
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+    from slashcompute.common.protocol import CancelStage
+
+    calls = []
+
+    async def run_stage(ctx, emit):
+        calls.append(ctx.assignment.epoch)
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr("slashcompute.agent.daemon.run_stage", run_stage)
+    _patch_agent_children(tmp_path, monkeypatch, fetch=_SLOW_FETCH)
+    daemon = Daemon(AgentOptions(url="http://127.0.0.1:9942", home=tmp_path, localhost=True,
+                                 sandbox=False))
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    daemon.send = send
+    stage = await daemon._start_stage(_assignment(epoch=1))
+    await _until(lambda: stage.fetch_done)
+    assert calls == []                                    # not on this loop, mid-download
+    await daemon._handle(CancelStage(job_id="j", epoch=1))
+    await asyncio.sleep(0.2)
+    assert calls == [] and _finished(sent) == [("cancelled", 1)]
+
+    _patch_agent_children(tmp_path, monkeypatch, fetch=_INSTANT_FETCH)
+    await _started(daemon, _assignment(epoch=2))
+    await _until(lambda: calls == [2])
+    await daemon._cancel_stage()
+    assert _finished(sent) == [("cancelled", 1), ("cancelled", 2)]
+
+
+def test_fetch_progress_counts_complete_and_partial_files(tmp_path):
+    from slashcompute.agent.fetch import downloaded_bytes
+
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    expected = {"a": 100, "b": 50_000, "c": 7}
+    (blobs / "a").write_bytes(b"x" * 100)                          # finished
+    (blobs / "b.1234abcd.incomplete").write_bytes(b"x" * 4096)     # ours, half way
+    (blobs / "c.0ld0ld00.incomplete").write_bytes(b"x" * 7)        # another process's
+    (blobs / "zz.99999999.incomplete").write_bytes(b"x" * 4096)    # not a file we fetch
+    done = downloaded_bytes(blobs, expected, ignore=frozenset({"c.0ld0ld00.incomplete"}))
+    assert done == 100 + 4096
+    (blobs / "b.1234abcd.incomplete").rename(blobs / "b")
+    (blobs / "b").write_bytes(b"x" * 50_000)
+    assert downloaded_bytes(blobs, expected, ignore=frozenset({"c.0ld0ld00.incomplete"})) == 50_100
+
+
+def test_sweep_removes_only_unlocked_orphans(tmp_path, monkeypatch):
+    from filelock import FileLock
+
+    from slashcompute.agent import fetch
+
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(tmp_path / "hub"))
+    repo, locks = fetch._cache_dirs("org/model")
+    (repo / "blobs").mkdir(parents=True)
+    locks.mkdir(parents=True)
+    orphan = repo / "blobs" / "aaa.11111111.incomplete"     # its download was killed
+    live = repo / "blobs" / "bbb.22222222.incomplete"       # another process is writing it
+    orphan.write_bytes(b"x")
+    live.write_bytes(b"y")
+    with FileLock(str(locks / "bbb.lock")):
+        removed = fetch.sweep_orphans("org/model")
+    assert removed == [orphan] and not orphan.exists() and live.exists()
+
+
+def test_fetch_child_dies_promptly_on_sigterm(tmp_path):
+    """Stopping a download that is stuck on the network is a SIGTERM, not a 40-minute wait."""
+    import os
+    import socket
+    import subprocess
+    import sys
+    import time
+
+    import slashcompute
+
+    hub = socket.socket()
+    hub.bind(("127.0.0.1", 0))
+    hub.listen(16)                       # accepts connections, never answers: a stalled hub
+    env = {**os.environ, "HF_HOME": str(tmp_path / "hf"),
+           "HF_ENDPOINT": f"http://127.0.0.1:{hub.getsockname()[1]}",
+           "PYTHONPATH": str(Path(slashcompute.__file__).resolve().parents[1])}
+    for k in ("HF_HUB_OFFLINE", "HF_HUB_CACHE"):
+        env.pop(k, None)
+    proc = subprocess.Popen([sys.executable, "-m", "slashcompute.agent.fetch", "org/model"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        time.sleep(1.5)
+        assert proc.poll() is None, proc.stderr.read().decode()
+        t0 = time.monotonic()
+        proc.terminate()
+        assert proc.wait(5) == 143 and time.monotonic() - t0 < 2
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        hub.close()

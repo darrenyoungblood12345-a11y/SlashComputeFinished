@@ -51,6 +51,11 @@ class ModelProfile:
         return self.stage_weight_bytes(0, self.num_layers)
 
 
+# The files a stage needs from a Hugging Face repo (also what the agent's fetch measures).
+MODEL_FILE_PATTERNS = ["*.json", "*.safetensors", "*.py", "tokenizer.model", "*.tiktoken", "*.txt",
+                       "*.jinja"]
+
+
 def resolve_model_path(model: str, download: bool = True) -> Path:
     """Local directory for ``model`` (a path or an HF repo id)."""
     p = Path(model).expanduser()
@@ -58,11 +63,9 @@ def resolve_model_path(model: str, download: bool = True) -> Path:
         return p
     from huggingface_hub import snapshot_download
 
-    patterns = ["*.json", "*.safetensors", "*.py", "tokenizer.model", "*.tiktoken", "*.txt",
-                "*.jinja"]
     if download:
-        return Path(snapshot_download(model, allow_patterns=patterns))
-    return Path(snapshot_download(model, allow_patterns=patterns, local_files_only=True))
+        return Path(snapshot_download(model, allow_patterns=MODEL_FILE_PATTERNS))
+    return Path(snapshot_download(model, allow_patterns=MODEL_FILE_PATTERNS, local_files_only=True))
 
 
 def _local_headers(path: Path) -> dict[str, dict]:

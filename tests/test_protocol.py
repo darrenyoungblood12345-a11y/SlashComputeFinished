@@ -46,3 +46,13 @@ def test_spec_validation():
     with pytest.raises(ValueError, match="not allowed"):
         parse_spec({"dataset_path": "x", "model": "evil/malware-repo"})
     assert parse_spec({"dataset_path": "x"}).kind == "lora_finetune"
+
+
+def test_heartbeat_progress_fields_are_optional():
+    """Older agents send none of them; older coordinators ignore them."""
+    old = P.parse_agent_message({"type": "heartbeat", "node_id": "n", "status": "loading"})
+    assert old.phase is None and old.fetch_done_bytes is None and old.fetch_total_bytes is None
+    new = P.parse_agent_message({"type": "heartbeat", "node_id": "n", "status": "loading",
+                                 "job_id": "j", "epoch": 1, "phase": "fetching",
+                                 "fetch_done_bytes": 5, "fetch_total_bytes": 9, "later_field": 1})
+    assert (new.phase, new.fetch_done_bytes, new.fetch_total_bytes) == ("fetching", 5, 9)

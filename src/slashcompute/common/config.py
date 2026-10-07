@@ -54,7 +54,14 @@ class EngineConfig:
     heartbeat_interval_s: float = 5.0
     heartbeat_timeout_s: float = 20.0
     scheduler_tick_s: float = 1.0
-    stage_start_timeout_s: float = 900.0  # includes model download on first use
+    # A starting epoch aborts after this long without progress: model download bytes, a
+    # stage becoming ready. (Not since the assignment: a big model takes longer to download.)
+    stage_start_timeout_s: float = 900.0
+    # After a start timed out, prefer other Macs for this long (that one made no progress).
+    start_timeout_avoid_s: float = 600.0
+    # A node told to stop a job takes no new work until its agent confirms; give up waiting
+    # after this long unless its heartbeats still name the job.
+    release_timeout_s: float = 60.0
     max_recoveries: int = 20
     # Longest a pipeline neighbour may stay silent (and a dropped peer link may take to
     # reconnect) before the stage gives up. Generous: legitimate gaps include checkpoint

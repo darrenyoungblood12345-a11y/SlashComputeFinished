@@ -23,9 +23,12 @@ Changing the pool address, GPU share, or session restarts the training agent aft
 
 1. Agents register, pass a short GPU canary, and heartbeat.
 2. The coordinator splits the model by layer, sized to each Mac's contributed memory.
-3. Neighbouring stages open a TCP link and run a GPipe LoRA step: activations forward, gradients back.
-4. Each step is metered (FLOPs, memory, time).
-5. `stop` drains after the current step; a crash resumes from the last complete checkpoint.
+3. Each Mac downloads the model the first time. The job card shows the progress, and cancelling stops the download at once. A Mac whose job was cancelled gets new work only after its agent confirms it stopped.
+4. Neighbouring stages open a TCP link and run a GPipe LoRA step: activations forward, gradients back.
+5. Each step is metered (FLOPs, memory, time).
+6. `stop` drains after the current step; a crash resumes from the last complete checkpoint.
+
+Something stuck or unclear? See [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## When the network drops
 

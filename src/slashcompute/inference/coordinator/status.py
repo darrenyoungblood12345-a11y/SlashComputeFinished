@@ -3,17 +3,30 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import Optional
 
 from slashcompute.inference.config import GIB, InferenceSettings
-from slashcompute.inference.coordinator import nodes, registry
+from slashcompute.inference.coordinator import nodes, planner, registry
 
 
 def _named(text: Optional[str], names: dict[str, str]) -> Optional[str]:
     for node_id, name in names.items():
         text = text.replace(node_id, name) if text else text
     return text
+
+
+def _min_memory_gb(row, s: InferenceSettings) -> Optional[int]:
+    """Whole GiB a Mac must lend to run the model alone at the default context (the LLMs tab
+    says so before a chat fails for lack of memory)."""
+    if row is None or row["status"] != "ready" or not row["layout_json"]:
+        return None
+    try:
+        need = planner.single_node_bytes(registry.model_layout(row), s)
+    except (ValueError, KeyError, TypeError):
+        return None
+    return math.ceil(planner.commit_for(need, s) / GIB)
 
 
 def snapshot(conn, s: InferenceSettings) -> dict:
@@ -77,6 +90,7 @@ def snapshot(conn, s: InferenceSettings) -> dict:
             "size_gb": round(((row["size_bytes"] if row else None) or (up["size"] if up else 0)) / 1e9, 2),
             "arch": row["arch"] if row else None, "uploaded": up is not None,
             "heads": heads, "downloading": downloading, "servable": bool(row and row["status"] == "ready" and heads),
+            "min_memory_gb": _min_memory_gb(row, s),
         })
 
     return {

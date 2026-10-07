@@ -284,3 +284,15 @@ def test_relay_mode_uses_the_relay_hop_limit():
     p = run(layout, nodes, latency=lat, settings=relay)
     assert isinstance(p, Plan) and set(p.node_ids) == {'head', 'over-internet'}
     assert '100 ms' in p.explanation and 'too-far' in p.explanation
+
+
+def test_memory_a_mac_must_lend_to_run_a_model_alone():
+    """The LLMs tab says how much to lend before a chat fails for lack of memory."""
+    import math
+
+    from slashcompute.inference.coordinator.planner import commit_for, single_node_bytes
+
+    layout = synthetic_layout('m', 28, int(6.0 * GB), int(0.5 * GB))
+    gib = math.ceil(commit_for(single_node_bytes(layout, S), S) / GIB)
+    assert isinstance(run(layout, [node('a', gib, head=True, file=True)]), Plan)
+    assert isinstance(run(layout, [node('a', gib - 1, head=True, file=True)]), NoPlan)

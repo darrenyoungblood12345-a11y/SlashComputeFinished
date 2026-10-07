@@ -59,6 +59,12 @@ class StageSession:
                 pass
 
 
+# A neighbour may still be downloading its share of the model (many GB), so a stage waits for
+# it as long as the coordinator lets the epoch start; the coordinator's progress-aware start
+# timeout, not this handshake, decides that a start is stuck (and then cancels the stage).
+PEER_HANDSHAKE_TIMEOUT_S = 24 * 3600.0
+
+
 @dataclass
 class WorkerContext:
     assignment: StageAssignment
@@ -85,9 +91,10 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     if asg.next_peer is not None:
         log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
         nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
+                            timeout=PEER_HANDSHAKE_TIMEOUT_S,
                             send_timeout=asg.peer_timeout_s, resume_window=asg.peer_timeout_s)
     if server is not None:
-        prev = await server.accept(timeout=180.0)
+        prev = await server.accept(timeout=None)
         log.info("upstream connected from %s", getattr(prev, "peername", "?"))
     return prev, nxt, server
 

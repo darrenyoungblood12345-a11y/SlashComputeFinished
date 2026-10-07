@@ -31,6 +31,34 @@ class Batch:
         return Batch(self.inputs[sl], self.targets[sl], m, int(m.sum().item()))
 
 
+def check_dataset(path: str | Path) -> int:
+    """Check every row's shape before a job is queued, so a malformed file is refused at
+    submit with its line number instead of failing on a Mac after the model has loaded.
+    Returns the number of rows."""
+    rows = 0
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError as e:
+                raise ValueError(f"dataset line {lineno} is not JSON ({e.msg}); the file needs "
+                                 "one JSON object per line") from None
+            if not isinstance(row, dict):
+                raise ValueError(f"dataset line {lineno} is not a JSON object")
+            ok = (isinstance(row.get("tokens"), list) or isinstance(row.get("text"), str)
+                  or (isinstance(row.get("prompt"), str) and isinstance(row.get("completion"), str))
+                  or isinstance(row.get("messages"), list))
+            if not ok:
+                raise ValueError(f"dataset line {lineno} has keys {sorted(row)}; expected \"text\", "
+                                 "\"prompt\" + \"completion\", \"messages\" or \"tokens\"")
+            rows += 1
+    if not rows:
+        raise ValueError("the dataset has no rows")
+    return rows
+
+
 def load_examples(path: str | Path, model_path: Optional[str | Path], max_seq_len: int) -> list[Example]:
     tokenizer = None
     vocab_size = None

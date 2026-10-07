@@ -103,6 +103,10 @@ class LauncherSettings:
         )
 
 
+# What the LLMs tab may change when it starts serving (never anything training uses).
+INFERENCE_SETTINGS = ("inference_memory_gb", "inference_head", "models_dir", "transport")
+
+
 @dataclass
 class StatusSnapshot:
     coordinator_up: bool = False
@@ -111,6 +115,8 @@ class StatusSnapshot:
     agent_running: bool = False
     agent_status: str = ""
     agent_job_id: Optional[str] = None
+    agent_fetch_done_bytes: Optional[int] = None    # the agent is downloading a job's model
+    agent_fetch_total_bytes: Optional[int] = None
     coordinator_pid: Optional[int] = None
     agent_pid: Optional[int] = None
     lan_ip: str = ""
@@ -232,6 +238,8 @@ class Launcher:
         self._coordinator_proc: Any = None      # the coordinator this launcher spawned, while it runs
         self._coordinator_log_at = 0            # coordinator.log size when it was spawned
         self._stopping: list[Any] = []          # coordinators we stopped, reaped once they exit
+        self._inference_proc: Any = None        # the LLM node we spawned, to report its exit
+        self._inference_log_at = 0
         self.paths = AgentPaths(self.home)
 
     @property
@@ -358,6 +366,9 @@ class Launcher:
         return data if isinstance(data, dict) else {}
 
     def _stop_inference(self, wait: float = 0.0) -> None:
+        if self._inference_proc is not None:   # its exit is expected now: only reap it
+            self._stopping.append(self._inference_proc)
+            self._inference_proc = None
         pid = self.read_inference_pid()
         if pid is None:
             return
@@ -371,6 +382,85 @@ class Launcher:
 
     def _inference_args_path(self) -> Path:
         return self.home / "inference.args"
+
+    def _write_inference_pid(self, pid: int) -> None:
+        self.inference_pid_path.parent.mkdir(parents=True, exist_ok=True)
+        self.inference_pid_path.write_text(f"{pid}\n")
+
+    def _check_inference(self) -> bool:
+        """Reap the LLM node we started once it exits on its own, and say why in last_error
+        (the shell used to keep saying "Serving…" or just "Not serving"). True when it had exited."""
+        proc = self._inference_proc
+        if proc is None or (code := proc.poll()) is None:
+            return False
+        self._inference_proc = None
+        if code != 0:
+            self.last_error = self._inference_exit_reason(code)
+        return True
+
+    def _inference_exit_reason(self, code: int) -> str:
+        log = self.log_dir / "inference.log"
+        try:
+            with open(log, "rb") as fh:
+                fh.seek(self._inference_log_at)   # only what this run wrote
+                lines = [ln.strip() for ln in fh.read().decode("utf-8", "replace").splitlines() if ln.strip()]
+        except OSError:
+            lines = []
+        how = f"was stopped by signal {-code}" if code < 0 else f"exited with code {code}"
+        # The last lines say why (a SystemExit message, or a traceback's final line).
+        why = " | ".join(ln for ln in lines[-2:] if not ln.startswith("Traceback")) or f"see {log}"
+        return f"The LLM node {how}: {why}"
+
+    def _await_node(self, proc: Any, timeout: float = 8.0) -> None:
+        """After starting the LLM node: wait until it reached the coordinator or gave up, so
+        Start serving reports what happened instead of claiming success."""
+        if proc is None:
+            return                                # it was already running
+        deadline = time.monotonic() + timeout
+        st: dict = {}
+        while time.monotonic() < deadline:
+            if self._check_inference():
+                return                            # exited: last_error says why
+            st = self.inference_status()
+            if st.get("pid") == proc.pid and st.get("reason") not in (None, "connecting"):
+                if st.get("reason") == "unsupported":
+                    self.last_error = st.get("last_error") or "The pool's coordinator has no LLM inference."
+                return                            # registered (or told why it can't)
+            time.sleep(0.2)
+        if st.get("pid") == proc.pid and st.get("last_error"):
+            self.last_error = f"The LLM node is still trying to join: {st['last_error']}"
+
+    def set_inference(self, on: bool, **changes: Any) -> StatusSnapshot:
+        """Start or stop only this Mac's LLM node. The training agent is never touched.
+
+        Start serving used to resend every setting through ``start``. A training setting saved
+        since the agent started (its memory, say) then restarted the training agent, which can't
+        stop while it downloads a model, so the click failed with "still stopping"."""
+        allowed = {k: v for k, v in changes.items() if k in INFERENCE_SETTINGS}
+        s = replace(self.load_settings(), **allowed)
+        # Lending to LLMs is contributing; fine-tuning stays as it is right now.
+        s = replace(s, inference=True, contribute=True, training=self._agent_running()) if on \
+            else replace(s, inference=False)
+        s = s.clamp()
+        self.save_settings(s)
+        self.last_error = ""
+        if not on:
+            self._stop_inference()
+            return self.snapshot(s)
+        url = self.coordinator_url(s)
+        try:
+            if s.mode == "host":
+                self._ensure_coordinator(s, url)
+            elif s.mode == "public" and not self.session_for(s):
+                raise LauncherError("Sign in first.")
+            elif not self.poll_health(url):
+                raise LauncherError(f"No coordinator at {url}." if url else "Enter a coordinator URL first.")
+            node_url = self.proxy_url(s) if s.mode == "host" else url
+            self._await_node(self._ensure_inference(self.inference_argv(node_url, s),
+                                                    self.session_for(s, node_url)))
+        except LauncherError as e:
+            self.last_error = str(e)
+        return self.snapshot(s)
 
     def _restart_coordinator(self, settings: LauncherSettings) -> None:
         """The inference transport is fixed when the coordinator starts: restart ours to change it."""
@@ -494,6 +584,29 @@ class Launcher:
         found = self._discover(timeout)
         return normalize_url(found) if found else None
 
+    def _ensure_coordinator(self, s: LauncherSettings, url: str) -> None:
+        """Hosting: run our coordinator (with the chosen LLM transport) and wait for it to answer."""
+        # Ask on loopback first, the LAN address may not answer (bound to 127.0.0.1, slow Wi-Fi).
+        health = self.poll_health(self.proxy_url(s)) or self.poll_health(url)
+        self._check_coordinator()
+        self.own_coordinator_pid()
+        if not health:
+            if self.read_coordinator_pid() is None:   # ours may just be slow to answer: never start two
+                if not self._port_free(self.cfg.coordinator_host, self.cfg.coordinator_port):
+                    self.last_error = PORT_IN_USE.format(port=self.cfg.coordinator_port)
+                    raise LauncherError(self.last_error)
+                self.last_error = ""
+                self._spawn_coordinator(s.transport)
+            if not (self.wait_health(self.proxy_url(s)) or self.poll_health(url)):
+                if self._coordinator_proc is None and self.last_error:
+                    raise LauncherError(self.last_error)   # it exited: nothing to lend to
+                self.last_error = (
+                    f"Coordinator started but is not answering {url}/health yet. "
+                    f"Watch {self.log_dir / 'coordinator.log'}."
+                )
+        elif health.get("inference_transport", "direct") != s.transport:
+            self._restart_coordinator(s)
+
     def start(self, settings: LauncherSettings) -> StatusSnapshot:
         s = settings.clamp()
         self.save_settings(s)
@@ -514,27 +627,8 @@ class Launcher:
         want_agent = lend and s.training
         want_inference = lend and s.inference
 
-        # Hosting: ask on loopback first, the LAN address may not answer (bound to 127.0.0.1, slow Wi-Fi).
-        health = (self.poll_health(self.proxy_url(s)) or self.poll_health(url)) if want_coord else None
         if want_coord:
-            self._check_coordinator()
-            self.own_coordinator_pid()
-        if want_coord and not health:
-            if self.read_coordinator_pid() is None:   # ours may just be slow to answer: never start two
-                if not self._port_free(self.cfg.coordinator_host, self.cfg.coordinator_port):
-                    self.last_error = PORT_IN_USE.format(port=self.cfg.coordinator_port)
-                    raise LauncherError(self.last_error)
-                self.last_error = ""
-                self._spawn_coordinator(s.transport)
-            if not (self.wait_health(self.proxy_url(s)) or self.poll_health(url)):
-                if self._coordinator_proc is None and self.last_error:
-                    raise LauncherError(self.last_error)   # it exited: nothing to lend to
-                self.last_error = (
-                    f"Coordinator started but is not answering {url}/health yet. "
-                    f"Watch {self.log_dir / 'coordinator.log'}."
-                )
-        elif want_coord and health.get("inference_transport", "direct") != s.transport:
-            self._restart_coordinator(s)
+            self._ensure_coordinator(s, url)
 
         agent_url = self.proxy_url(s) if s.mode == "host" else url
         if s.mode in ("join", "public") and not self.poll_health(url):
@@ -591,14 +685,21 @@ class Launcher:
             self._spawn(argv, self.log_dir / "agent.log", session=session)
             write_private(self._agent_args_path(), json.dumps(record))
 
-    def _ensure_inference(self, argv: list[str], session: str) -> None:
-        """Run the LLM node as `argv` with `session`, restarting one started differently."""
+    def _ensure_inference(self, argv: list[str], session: str) -> Any:
+        """Run the LLM node as `argv` with `session`, restarting one started differently.
+        Returns the process when it started one."""
         record = launch_record(argv, session)
         if self.read_inference_pid() is not None and self._read_inference_args() != record:
             self._stop_inference(wait=10.0)   # settings changed: drain, then rejoin with the new ones
-        if self.read_inference_pid() is None:
-            self._spawn(argv, self.log_dir / "inference.log", session=session)
-            write_private(self._inference_args_path(), json.dumps(record))
+        if self.read_inference_pid() is not None:
+            return None
+        log = self.log_dir / "inference.log"
+        self._inference_log_at = log.stat().st_size if log.exists() else 0
+        # Its pid is recorded now: the node writes it only after probing the hardware (seconds),
+        # and a second click in between used to start a second node.
+        self._inference_proc = self._spawn(argv, log, pid_writer=self._write_inference_pid, session=session)
+        write_private(self._inference_args_path(), json.dumps(record))
+        return self._inference_proc
 
     def stop(self) -> StatusSnapshot:
         self.last_error = ""
@@ -649,6 +750,7 @@ class Launcher:
     def snapshot(self, settings: Optional[LauncherSettings] = None) -> StatusSnapshot:
         s = settings.clamp() if settings is not None else self.load_settings()
         self._check_coordinator()
+        self._check_inference()
         url = self.coordinator_url(s)
         health = self.poll_health(self.proxy_url(s)) if s.mode == "host" else None
         health = health or self.poll_health(url) or {}
@@ -669,6 +771,8 @@ class Launcher:
             agent_running=agent_running,
             agent_status=str(agent.get("status", "") or ""),
             agent_job_id=agent.get("job_id"),
+            agent_fetch_done_bytes=agent.get("fetch_done_bytes") if agent_running else None,
+            agent_fetch_total_bytes=agent.get("fetch_total_bytes") if agent_running else None,
             coordinator_pid=self.read_coordinator_pid(),
             agent_pid=agent_pid if agent_running else None,
             lan_ip=self._lan_ip(),

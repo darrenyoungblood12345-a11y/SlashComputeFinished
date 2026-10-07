@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -141,6 +142,17 @@ def usable_bytes(n: NodeCandidate, s: InferenceSettings) -> int:
     return n.committed_bytes - buffer - n.reserved_bytes
 
 
+def single_node_bytes(layout: ModelLayout, s: InferenceSettings, ctx: int | None = None) -> int:
+    """Memory one Mac needs to run ``layout`` alone: weights plus the KV cache at ``ctx``."""
+    return sum(_layer_costs(layout, ctx or s.DEFAULT_CTX)) + layout.head_full_bytes
+
+
+def commit_for(need: int, s: InferenceSettings) -> int:
+    """Memory a Mac must lend so that what is usable after the compute buffer holds ``need``
+    (the inverse of ``usable_bytes`` for a node with nothing reserved)."""
+    return math.ceil((need + s.COMPUTE_BUFFER_FIXED_BYTES) / (1 - s.COMPUTE_BUFFER_FRACTION))
+
+
 def _gb(b: float) -> str:
     return f'{b / GB:.1f} GB'
 
@@ -250,7 +262,7 @@ def plan(layout: ModelLayout, nodes: list[NodeCandidate], out_s: float, settings
     model_key = model_key or layout.name
     eligible, excluded = filter_nodes(nodes, model_key, now, s, exclude)
     costs = _layer_costs(layout, ctx)
-    need = sum(costs) + layout.head_full_bytes
+    need = single_node_bytes(layout, s, ctx)
     need_txt = (f'{layout.name} needs {_gb(need)} at ctx {ctx} '
                 f'(weights {_gb(layout.total_full_bytes)} + KV {_gb(layout.kv_bytes(ctx))})')
 

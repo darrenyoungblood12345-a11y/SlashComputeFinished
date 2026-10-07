@@ -1,3 +1,59 @@
+# Jobs stuck on "starting", and the LLM Send button that can't be clicked
+
+Base: SlashComputeFinished main at f43b677 (byte-identical to the installed /Applications/compute.app).
+Branch: fix/job-start-and-llm-send. Plan: `/Users/darren/.claude/plans/make-sure-you-are-sharded-nest.md`.
+Baseline: 518 passed (2 sandbox tests fail only when the checkout lives under /private/tmp).
+
+Evidence (live logs + coordinator.db on this Mac): 18 of 37 cancelled jobs were assigned and never ran
+a step (11 with Min Macs 1). The agent awaited the whole HF download inside its message loop (10 min
+for a 7B today, ~36 min on Oct 3), so cancels, new assignments and shutdown went unread; the coordinator
+freed the Mac on cancel and sent the next job straight to it. LLMs: no node was serving, so Send was
+disabled with no reason; Start serving went through /api/start and could restart the stuck agent.
+
+- [x] Agent: model download in a killable child (`agent/fetch.py`), off the message loop, with progress
+      in heartbeats and status.json; every stop reports StageFinished(cancelled) once; shutdown mid-download
+      takes ~2 s
+- [x] Coordinator: a cancelled/aborted Mac takes no new work until its agent confirms (60 s fallback unless
+      its heartbeats still name the job); stage_runs closed on cancel and for lost nodes
+- [x] Start timeout counts from the last progress (download bytes, a stage ready); prefer other Macs after a
+      stall; peer handshake waits for a neighbour still downloading
+- [x] Scheduler: a job needing more Macs than the pool has waits with a reason without blocking the queue;
+      Min Macs defaults to 1; datasets checked at submit
+- [x] UI: job card shows download progress / loading / ready and the last try's error separately
+- [x] LLMs tab: reason box under Send with the fixing button (start serving, make head, lend N GB);
+      `/api/inference` starts/stops only the LLM node; node exit reasons surfaced; pid recorded at spawn;
+      paused heads don't make models servable; per-model `min_memory_gb`
+- [x] Window always loads the current app.js/app.css (versioned, no-cache); shell generation 7
+- [x] docs/troubleshooting.md
+- [x] Full suite, stress loop, rebuild + reinstall the app, verify in the real app
+- [ ] PR to SlashComputeFinished
+
+## Results
+
+Full suite: 550 passed, 0 failed (518 at base; 32 new tests; one stale test patch removed).
+Stress: the 15 download/cancel/preempt/shutdown agent tests, 200 runs in a row: 0 failures, slowest run 7.4 s (each run capped at 90 s, so a hang would have shown).
+
+Verified in the reinstalled /Applications/compute.app (installed package diffed equal to src):
+- **Cancel mid-download** (Qwen2.5-14B, 8.3 GB, never cached): the card showed "Downloading the model
+  on MacBookPro: 331 MB of 7.7 GB (4%) · assigned 31s ago"; Cancel at 0.55 GB killed the download in
+  73 ms, the agent reported the stop and the coordinator freed the Mac in the same second; its
+  stage_run closed as "cancelled".
+- **The next job runs**: a 0.5B job submitted right after went starting → running in 11 s and
+  completed 10 steps in 15 s (on Oct 6 the same sequence sat on "starting" until cancelled).
+- **LLMs tab**: pool offline → "Start or join a pool first"; pool up → "No Mac is serving
+  Llama-3.2-3B… yet" with **Start serving on this Mac**; one click started the node against
+  127.0.0.1 (not the stale 10.171.167.131 join URL) and left the training agent's pid alone; then
+  "needs 9 GB lent…; this Mac lends 8 GB. A reply would fail." (a chat at 8 GB indeed failed:
+  "needs 6.9 GB … only 6.7 GB usable"); **Lend 9 GB and restart serving** → Send enabled → the chat
+  answered "2 plus 3 equals 5." at 24.6 tok/s.
+- **Found while verifying**: a starting job's card changed every poll, so the job list was rebuilt
+  every 2 s and its Cancel button replaced under the pointer (clicks lost). Cards now update in place;
+  checked the button element survives polls and the UI Cancel works.
+
+Not verified: a multi-Mac pool (one Mac here), and a 14B download all the way through (8 GB).
+Follow-up (pre-existing, seen on Oct 3 too): replay verifications of single-stage jobs log
+"bundle no longer held".
+
 # Reliability bugs: peer links, agent races, reconnects, scheduling, checkpoints, ring memory, tick
 
 Base: RizzyRoger/SlashCompute main at b357ee3. Branch: fix/reliability-bugs. Baseline: 472 passed

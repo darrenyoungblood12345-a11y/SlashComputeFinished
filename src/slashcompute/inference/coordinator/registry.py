@@ -79,13 +79,14 @@ def est_out_s(layout: ModelLayout, s: InferenceSettings) -> float:
 
 
 def holders(conn, s: InferenceSettings, model_id: str, now: Optional[float] = None) -> list[sqlite3.Row]:
-    """Online nodes that could head this model (have the file and may be head)."""
+    """Online nodes that could head this model right now (have the file, may be head, and take
+    work: a Mac paused for training would refuse the chat that listing it invites)."""
     now = now or time.time()
     out = []
     for r in conn.execute("SELECT * FROM nodes WHERE can_head=1").fetchall():
         files = set(json.loads(r["gguf_files_json"] or "[]"))
         approved = bool(r["approved_head"]) or not s.REQUIRE_HEAD_APPROVAL
-        if model_id in files and approved and nodes.is_online(r, s, now):
+        if model_id in files and approved and r["available"] and nodes.is_online(r, s, now):
             out.append(r)
     return out
 

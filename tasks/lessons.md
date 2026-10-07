@@ -13,3 +13,11 @@
 - Don't rely on the peer's RST: macOS can ignore it under zero-window and only notice at the next persist probe (~5 s). Bound retransmission (TCP_RXT_CONNDROPTIME / TCP_USER_TIMEOUT) and abort a link once its read side ends.
 - `mx.save_safetensors` appends `.safetensors` to a path that lacks it; temp files for atomic writes must keep the extension.
 - Network drops are usually silent: a reconnect grace window must also cover missed heartbeats, not just socket closes.
+- Never await long I/O (a model download) inside a message loop: everything queued behind it, cancels
+  included, goes unread. Run it as a task, and as a child process when it must be stoppable.
+- Free a remote resource only once the remote side confirms it let go (with a bounded fallback); freeing
+  it on our own decision sent new jobs to a Mac still busy with the cancelled one.
+- A fix counts once it is proven in the app the user runs: rebuild and reinstall it, diff the installed
+  package against src, and make sure the window can't keep serving a cached app.js.
+- Start from the user's own logs and databases (`~/.slashcompute/logs`, `sqlite3 -readonly
+  coordinator.db`): they showed the real cause where earlier fixes guessed.

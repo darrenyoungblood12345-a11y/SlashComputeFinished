@@ -70,7 +70,27 @@ class Recovery:
                 job = core.jobs.get(node.assignment.job_id)
                 if job is not None:
                     await self.abort_epoch(job, "drain exceeded grace period", count=False)
+        self._expire_releases()
         await self._abort_stalled()
+
+    def _expire_releases(self) -> None:
+        """Bound how long a node told to stop stays out of new work when its agent never
+        confirms (an older agent, a lost message). One whose heartbeats still name the job
+        stays held: sending it work now is how jobs used to queue behind a download."""
+        limit = self.core.cfg.release_timeout_s
+        for node in self.core.registry.nodes.values():
+            rel = node.releasing
+            if rel is None or time.monotonic() - rel.since < limit:
+                continue
+            if node.still_on(rel.job_id, rel.epoch):
+                if not rel.warned:
+                    rel.warned = True
+                    log.warning("node %s is still busy with cancelled job %s epoch %d after "
+                                "%.0fs; holding it", node.node_id[:8], rel.job_id, rel.epoch, limit)
+                continue
+            log.warning("node %s never confirmed it stopped job %s epoch %d; freeing it",
+                        node.node_id[:8], rel.job_id, rel.epoch)
+            node.releasing = None
 
     async def _abort_stalled(self) -> None:
         """Backstop for a hang nothing else notices (a wedged worker, a link that never
@@ -140,8 +160,10 @@ class Recovery:
                  msg.stage_idx, msg.reason, msg.last_step, f" {msg.detail}" if msg.detail else "")
 
         if msg.reason in ("error", "cancelled"):
+            # A contributor stopping their Mac is not the job's fault (as with on_node_lost).
+            count = not (msg.reason == "cancelled" and node is not None and node.draining)
             await self.abort_epoch(job, f"stage {msg.stage_idx} {msg.reason}: {msg.detail or ''}",
-                                   fatal=msg.fatal)
+                                   count=count, fatal=msg.fatal)
             return
         if len(cur.finished) < len(cur.plans):
             return
@@ -164,14 +186,19 @@ class Recovery:
         cur.closed = True
         log.warning("job %s epoch %d aborted: %s", job.id, cur.epoch, reason)
         for p in cur.plans:
+            self._close_stage_run(job.id, cur.epoch, p.stage_idx, "aborted")  # lost nodes' too
             node = core.registry.get(p.node_id)
             if node is None:
                 continue
-            if node.assignment and node.assignment.job_id == job.id and node.assignment.epoch == cur.epoch:
-                node.assignment = None
-            if p.stage_idx not in cur.finished:
-                await core.send(p.node_id, CancelStage(job_id=job.id, epoch=cur.epoch))
-            self._close_stage_run(job.id, cur.epoch, p.stage_idx, "aborted")
+            mine = (node.assignment is not None and node.assignment.job_id == job.id
+                    and node.assignment.epoch == cur.epoch)
+            if p.stage_idx in cur.finished:
+                if mine:
+                    node.assignment = None
+                continue
+            if mine:
+                core.registry.release(node, job.id, cur.epoch)   # free once its agent stops
+            await core.send(p.node_id, CancelStage(job_id=job.id, epoch=cur.epoch))
         row = job.row
         if fatal:
             await core.fail_job(job, reason)

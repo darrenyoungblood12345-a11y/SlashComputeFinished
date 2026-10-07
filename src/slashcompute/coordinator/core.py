@@ -35,11 +35,12 @@ from slashcompute.coordinator.checkpoints import CheckpointStore
 from slashcompute.coordinator.db import Checkpoint, Database, Job, Node, now
 from slashcompute.coordinator.ledger import Ledger
 from slashcompute.coordinator.recovery import Recovery
-from slashcompute.coordinator.registry import CloseFn, NodeState, Registry, SendFn
+from slashcompute.coordinator.registry import Assignment, CloseFn, NodeState, Registry, SendFn
 from slashcompute.coordinator.scheduler import ACTIVE, TERMINAL, WAITING, JobRuntime, Scheduler
 from slashcompute.coordinator.verification import VerificationManager
 from slashcompute.common.config import allowed_model
 from slashcompute.jobs import LoraFinetuneSpec, parse_spec
+from slashcompute.pipeline.data import check_dataset
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -157,6 +158,7 @@ class Coordinator:
         if not allowed_model(spec.model):
             raise ValueError(f"model {spec.model!r} is not allowed.")
         src = safe_dataset_source(spec.dataset_path)
+        check_dataset(src)
         job_id = uuid.uuid4().hex[:12]
         dest = self.checkpoints.job_dir(job_id) / "dataset.jsonl"
         shutil.copyfile(src, dest)
@@ -188,11 +190,23 @@ class Coordinator:
         cur = job.current
         if cur and not cur.closed:
             cur.closed = True
+            told = 0
             for p in cur.plans:
                 node = self.registry.get(p.node_id)
-                if node and node.assignment and node.assignment.job_id == job.id:
-                    node.assignment = None
+                if p.stage_idx in cur.finished:
+                    if node and node.assignment == Assignment(job.id, cur.epoch, p.stage_idx):
+                        node.assignment = None
+                    continue
+                if node and node.assignment == Assignment(job.id, cur.epoch, p.stage_idx):
+                    # Not free yet: its agent may still be downloading this job's model. A new
+                    # job sent now would queue behind that download and never start.
+                    self.registry.release(node, job.id, cur.epoch)
                 await self.send(p.node_id, CancelStage(job_id=job.id, epoch=cur.epoch))
+                self.recovery._close_stage_run(job.id, cur.epoch, p.stage_idx, "cancelled")
+                told += 1
+            log.info("job %s cancelled (epoch %d: %d stage(s) told to stop)", job.id, cur.epoch, told)
+        else:
+            log.info("job %s cancelled", job.id)
         job.row.status, job.row.finished_at = "cancelled", now()
         self.db.save(job.row)
         self.credits.settle_job(job.id)
@@ -362,16 +376,25 @@ class Coordinator:
             await node.send(Ack(upto=seq))
 
     async def _dispatch(self, node_id: str, msg: BaseModel) -> None:
+        # A node we told to stop says it did: it may take new work again. This touches only
+        # its own release record, so it is safe before the ownership check below.
+        released = isinstance(msg, StageFinished) and self.registry.confirm_release(
+            node_id, msg.job_id, msg.epoch)
         if isinstance(msg, Heartbeat):
-            self.registry.heartbeat(node_id, msg.status)
+            if self.registry.heartbeat(node_id, msg.status, msg.job_id, msg.epoch, phase=msg.phase,
+                                       fetch_done=msg.fetch_done_bytes,
+                                       fetch_total=msg.fetch_total_bytes,
+                                       confirm_after=self.cfg.heartbeat_interval_s):
+                self._fetch_progressed(node_id, msg.job_id, msg.epoch)
         elif isinstance(msg, DrainNotice):
             await self.recovery.on_drain(node_id)
         elif isinstance(msg, (StageReady, StepMetrics, StageFinished)) \
                 and not self._holds_stage(node_id, msg.job_id, msg.epoch, msg.stage_idx):
             # Only the node planned for a stage may report on it; otherwise any
             # node could bill a stranger's budget or end their job.
-            log.warning("dropping %s from %s: not assigned to job %s epoch %d stage %d",
-                        type(msg).__name__, node_id[:8], msg.job_id, msg.epoch, msg.stage_idx)
+            if not released:
+                log.warning("dropping %s from %s: not assigned to job %s epoch %d stage %d",
+                            type(msg).__name__, node_id[:8], msg.job_id, msg.epoch, msg.stage_idx)
         elif isinstance(msg, StageReady):
             await self.scheduler.on_stage_ready(self.jobs[msg.job_id], msg.epoch, msg.stage_idx)
         elif isinstance(msg, StepMetrics):
@@ -384,6 +407,14 @@ class Coordinator:
             await self.verification.on_result(node_id, msg)
         else:
             log.warning("unexpected message from %s: %s", node_id[:8], type(msg).__name__)
+
+    def _fetch_progressed(self, node_id: str, job_id: Optional[str], epoch: Optional[int]) -> None:
+        """A starting epoch whose model is still downloading is making progress: its start
+        timeout counts from the last byte, not from the assignment."""
+        job = self.jobs.get(job_id) if job_id else None
+        cur = job.current if job else None
+        if cur is not None and cur.epoch == epoch and not cur.closed and cur.stage_of(node_id):
+            cur.last_progress = time.monotonic()
 
     def _holds_stage(self, node_id: str, job_id: str, epoch: int, stage_idx: int) -> bool:
         job = self.jobs.get(job_id)
@@ -500,15 +531,26 @@ class Coordinator:
             "wait_s": self.wait_seconds(job),
             "submitted_at": row.submitted_at, "started_at": row.started_at,
             "finished_at": row.finished_at,
-            "stages": [
-                {"stage_idx": p.stage_idx, "node_id": p.node_id, "layers": [p.layer_start, p.layer_end],
-                 "est_bytes": p.est_bytes, "ready": p.stage_idx in cur.ready,
-                 "finished": cur.finished.get(p.stage_idx)}
-                for p in cur.plans
-            ] if cur and not cur.closed else [],
+            "stages": [self._stage_view(job, cur, p) for p in cur.plans] if cur and not cur.closed else [],
+            "starting_s": time.monotonic() - cur.started
+            if cur and not cur.closed and row.status == "starting" else None,
             "adapter_dir": str(self.checkpoints.job_dir(row.id) / "adapter")
             if row.status == "completed" else None,
             **self._job_account_view(job.id),
+        }
+
+    def _stage_view(self, job: JobRuntime, cur, p) -> dict:
+        node = self.registry.get(p.node_id)
+        fetch = node.fetch if node is not None else None
+        fetching = fetch is not None and (fetch.job_id, fetch.epoch) == (job.id, cur.epoch)
+        ready = p.stage_idx in cur.ready
+        return {
+            "stage_idx": p.stage_idx, "node_id": p.node_id, "node_name": node.name if node else None,
+            "layers": [p.layer_start, p.layer_end], "est_bytes": p.est_bytes, "ready": ready,
+            "finished": cur.finished.get(p.stage_idx),
+            "phase": "ready" if ready else "fetching" if fetching else "loading",
+            "fetch_done_bytes": fetch.done_bytes if fetching else None,
+            "fetch_total_bytes": fetch.total_bytes if fetching else None,
         }
 
     def _job_account_view(self, job_id: str) -> dict:
@@ -527,6 +569,9 @@ class Coordinator:
                 "matmul_tflops": n.device.matmul_tflops, "gpu_percent": n.gpu_percent,
                 "status": n.status, "draining": n.draining, "canary_passed": n.canary_passed,
                 "assignment": n.assignment.__dict__ if n.assignment else None,
+                "releasing": {"job_id": n.releasing.job_id, "epoch": n.releasing.epoch}
+                if n.releasing else None,
+                "fetch": n.fetch.__dict__ if n.fetch else None,
                 "data_addr": f"{n.data_host}:{n.data_port}",
                 "user_id": n.user_id,
             })
