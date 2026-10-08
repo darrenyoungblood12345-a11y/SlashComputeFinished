@@ -355,6 +355,10 @@ def test_inference_argv(tmp_path):
     assert argv[argv.index("--url") + 1] == "http://127.0.0.1:8765"
     assert argv[argv.index("--memory-gb") + 1] == "12"
     assert "--no-head" in argv and "--session-token" not in argv   # the session goes through the environment
+    # a model removed from a LAN pool may go to this Mac's Trash; a public pool's coordinator is a stranger's
+    for mode, trash in (("host", True), ("join", True), ("public", False)):
+        argv = launcher.inference_argv("http://127.0.0.1:8765", LauncherSettings(mode=mode))
+        assert ("--trash-removed" in argv) is trash and "--keep-removed" not in argv
     assert launcher.coordinator_argv("relay")[-2:] == ["--inference-transport", "relay"]
     assert "--inference-transport" not in launcher.coordinator_argv()
 

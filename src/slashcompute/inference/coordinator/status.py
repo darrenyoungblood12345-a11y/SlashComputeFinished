@@ -20,7 +20,7 @@ def _named(text: Optional[str], names: dict[str, str]) -> Optional[str]:
 def _min_memory_gb(row, s: InferenceSettings) -> Optional[int]:
     """Whole GiB a Mac must lend to run the model alone at the default context (the LLMs tab
     says so before a chat fails for lack of memory)."""
-    if row is None or row["status"] != "ready" or not row["layout_json"]:
+    if row is None or row["status"] not in ("ready", "disabled") or not row["layout_json"]:
         return None
     try:
         need = planner.single_node_bytes(registry.model_layout(row), s)
@@ -29,8 +29,26 @@ def _min_memory_gb(row, s: InferenceSettings) -> Optional[int]:
     return math.ceil(planner.commit_for(need, s) / GIB)
 
 
-def snapshot(conn, s: InferenceSettings) -> dict:
+def _mac(row) -> tuple:
+    """Node rows that are one Mac (it joined again under a new id): names are hostnames, not unique."""
+    return row["name"], row["chip"], row["total_mem_bytes"]
+
+
+def _load(states: set[str]) -> Optional[str]:
+    """A model's pipelines in one word: loaded (one serves), loading, unloading (only draining ones left)."""
+    if "active" in states:
+        return "loaded"
+    if states & {"planned", "starting", "loading"}:
+        return "loading"
+    return "unloading" if "draining" in states else None
+
+
+def snapshot(conn, s: InferenceSettings, removals: Optional[dict] = None,
+             upload_errors: Optional[dict] = None) -> dict:
+    """``removals``: the service's per-Mac removal state (model -> node id -> {removing, error, kept,
+    kept_folder}); ``upload_errors``: removed model -> why its uploaded copy could not be deleted."""
     now = time.time()
+    removals, upload_errors = removals or {}, upload_errors or {}
     node_rows = conn.execute("SELECT * FROM nodes ORDER BY created_at").fetchall()
     names = {r["id"]: r["name"] for r in node_rows}
 
@@ -55,6 +73,7 @@ def snapshot(conn, s: InferenceSettings) -> dict:
         })
 
     reserved = nodes.reserved_bytes(conn)
+    online_macs = {_mac(r) for r in node_rows if nodes.is_online(r, s, now)}
     node_list = [{
         "id": r["id"], "name": r["name"], "chip": r["chip"],
         "online": nodes.is_online(r, s, now), "available": bool(r["available"]), "draining": bool(r["draining"]),
@@ -78,12 +97,29 @@ def snapshot(conn, s: InferenceSettings) -> dict:
 
     uploads = {r["name"]: r for r in conn.execute("SELECT * FROM model_files").fetchall()}
     model_ids = sorted({r["id"] for r in conn.execute("SELECT id FROM models")} | set(uploads))
+    states: dict[str, set[str]] = {}
+    for p in conn.execute(f"SELECT model_id, state FROM pipelines WHERE state IN "
+                          f"({','.join('?' * len(nodes.LIVE_STATES))})", nodes.LIVE_STATES):
+        states.setdefault(p["model_id"], set()).add(p["state"])
     models = []
     for mid in model_ids:
         row = registry.model_row(conn, mid)
         heads = [r["name"] for r in registry.holders(conn, s, mid, now)]
         downloading = {n["name"]: n["downloads"][mid] for n in node_list if mid in n["downloads"]}
         up = uploads.get(mid)
+        load = _load(states.get(mid, set()))
+        held_by = []
+        for n, r in zip(node_list, node_rows):
+            if mid in n["models_on_disk"]:
+                rm = removals.get(mid, {}).get(n["id"]) or {}
+                held_by.append({"name": n["name"], "online": n["online"], "removing": bool(rm.get("removing")),
+                                "error": rm.get("error"), "kept": bool(rm.get("kept")),
+                                "kept_folder": rm.get("kept_folder"),
+                                # an old row of a Mac that is online under a new node id: not an offline Mac
+                                "superseded": not n["online"] and _mac(r) in online_macs})
+        removed = row is not None and row["status"] == "removed"
+        if removed and not held_by and not load and up is None:
+            continue   # gone everywhere: nothing left to show or do (an uploaded copy left is shown)
         models.append({
             "id": mid, "status": row["status"] if row else "pending",
             "status_reason": row["status_reason"] if row else None,
@@ -91,11 +127,14 @@ def snapshot(conn, s: InferenceSettings) -> dict:
             "arch": row["arch"] if row else None, "uploaded": up is not None,
             "heads": heads, "downloading": downloading, "servable": bool(row and row["status"] == "ready" and heads),
             "min_memory_gb": _min_memory_gb(row, s),
+            "load": load, "held_by": held_by, "restorable": bool(row and row["layout_json"]),
+            # why the uploaded copy of a removed model is still there (None: it went, or not known any more)
+            "upload_error": upload_errors.get(mid) if removed and up is not None else None,
         })
 
     return {
         "now": now, "transport": s.TRANSPORT, "pinned_build": s.PINNED_LLAMA_BUILD,
-        "uploads_enabled": bool(s.MODELS_DIR),
+        "uploads_enabled": bool(s.MODELS_DIR), "model_controls": True,
         "pipelines": pipelines, "nodes": node_list,
         "latency": {"nodes": [names[i] for i in ids], "matrix": matrix},
         "jobs": jobs, "models": models,

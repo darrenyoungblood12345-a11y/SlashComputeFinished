@@ -969,6 +969,18 @@ function renderPool() {
 
 // ------------------------------------------------------------ LLMs
 
+// One busy key per model: its buttons in the Models list, on the Pipeline card and under Send share it.
+const llmKey = (id) => `llm-model:${id}`;
+// Who may unload, stop or remove a model: anyone on a LAN pool, only an admin on a public one
+// (the coordinator's require_admin, said before a click is refused).
+const canManageModels = () => (state.settings || {}).mode !== "public" || !!(state.user && state.user.admin);
+// The pool's coordinator has Unload, Serve and Remove per model; an older one only stops a pipeline.
+const controls = () => !!(state.llm.net && state.llm.net.model_controls);
+const llmModel = (id) => ((state.llm.net && state.llm.net.models) || []).find((m) => m.id === id) || null;
+const LLM_TAG_TONE = {
+  loaded: "ok", loading: "line", unloading: "line", "not served": "warn", removing: "line", removed: "", rejected: "hot",
+};
+
 function llmNodeState(st) {
   const n = st.inference_status || {};
   if (n.available === false) return n.reason || "paused";
@@ -998,8 +1010,9 @@ async function loadLlm() {
 }
 
 // Every known model can be picked, served or not: one nobody serves yet says why under Send.
+// A removed one is listed under Models only until its last copy is gone; it can't be chatted with.
 function llmChoices(l) {
-  const known = l.net ? l.net.models.filter((m) => m.status !== "rejected") : [];
+  const known = l.net ? l.net.models.filter((m) => !["rejected", "removed"].includes(m.status)) : [];
   return known.length ? known : l.models;
 }
 
@@ -1016,6 +1029,12 @@ function llmWhy(st, s, l, unsupported) {
   const n = st.inference_status || {};
   const running = !!st.inference_running;
   if (state.busy.has("llm")) return { text: l.starting ? "Starting llama.cpp on this Mac…" : "Stopping serving on this Mac…" };
+  if (m.status === "disabled") {
+    const text = `${m.id} is not being served: it was stopped for the whole pool.`;
+    return canManageModels()
+      ? { text: `${text} Serve lets the next chat load it again.`, action: { label: "Serve", act: "llm-serving", model: m.id, on: "1" } }
+      : { text: `${text} Ask the pool's admin to serve it again.` };
+  }
   const me = l.net && n.node_id ? l.net.nodes.find((x) => x.id === n.node_id) : null;
   const lent = me ? Number(me.committed_gb) || 0 : 0;
   const need = Number(m.min_memory_gb) || 0;
@@ -1056,12 +1075,17 @@ function renderWhy(why) {
   setText("#l-why-text", why.text);
   const btn = $("#l-why-act");
   const a = why.action;
-  if (state.busy.has("llm")) return;   // withBusy owns the button's label meanwhile
+  // withBusy owns the button while an action pressed here runs ("Starting…"). It disables the button it
+  // drives and nothing else does, so that is the test. A busy key can't tell: the Models list and the
+  // Pipeline card share a model's key, and the box may have moved on to another model meanwhile.
+  if (btn.disabled) return;
   btn.hidden = !a;
   if (!a) return;
   btn.textContent = a.label;
   btn.dataset.act = a.act;
   btn.dataset.gb = a.gb != null ? String(a.gb) : "";
+  btn.dataset.model = a.model || "";
+  btn.dataset.on = a.on || "";
 }
 
 function renderLlm() {
@@ -1071,7 +1095,9 @@ function renderLlm() {
   const net = l.net;
   const up = !!st.coordinator_up;
   const serving = net ? net.nodes.filter((n) => n.online && n.available) : [];
-  const pipe = net && net.pipelines.find((p) => p.model === l.model && !["stopped", "broken"].includes(p.state));
+  const pipes = net ? net.pipelines.filter((p) => p.model === l.model && !["stopped", "broken"].includes(p.state)) : [];
+  // The pipeline serving now, before one that is only finishing its last reply.
+  const pipe = pipes.find((p) => p.state !== "draining") || pipes[0];
   const live = st.inference_transport || (net && net.transport) || "";
 
   const unsupported = up && st.inference_supported === false;
@@ -1081,7 +1107,8 @@ function renderLlm() {
     : choices.length ? `${plural(choices.length, "model")} · none served` : "No models yet",
   !up || unsupported ? "hot" : l.models.length ? "ok" : "warn");
   setText("#l-models", String(l.models.length));
-  setText("#l-models-sub", net ? `${plural(net.models.length, "known model")}, ${l.models.length} ready` : "ready to chat");
+  const known = net ? net.models.filter((m) => m.status !== "removed").length : 0;
+  setText("#l-models-sub", net ? `${plural(known, "known model")}, ${l.models.length} ready` : "ready to chat");
   setText("#l-nodes", String(serving.length));
   setText("#l-nodes-sub", net ? `${plural(net.nodes.length, "Mac")} registered` : "running llama.cpp");
   setText("#l-speed", pipe && (pipe.live_tok_s || pipe.est_tok_s) ? (pipe.live_tok_s || pipe.est_tok_s).toFixed(1) : "—");
@@ -1091,26 +1118,16 @@ function renderLlm() {
   setTag("#l-chat-tag", l.streaming ? "Replying" : pipe ? pipe.state : "Idle", l.streaming ? "ok" : "");
 
   const sel = $("#l-model");
-  renderOnce("llm-models", [choices.map((m) => [m.id, m.size_gb, llmServable(l, m.id)]), l.model], sel, () => choices.length
-    ? choices.map((m) => `<option value="${esc(m.id)}"${m.id === l.model ? " selected" : ""}>${esc(m.id)} · ${esc(m.size_gb)} GB${llmServable(l, m.id) ? "" : " · not served yet"}</option>`).join("")
+  renderOnce("llm-models", [choices.map((m) => [m.id, m.size_gb, m.status, llmServable(l, m.id)]), l.model], sel, () => choices.length
+    ? choices.map((m) => `<option value="${esc(m.id)}"${m.id === l.model ? " selected" : ""}>${esc(m.id)} · ${esc(m.size_gb)} GB${
+      m.status === "disabled" ? " · stopped" : llmServable(l, m.id) ? "" : " · not served yet"}</option>`).join("")
     : `<option value="">No models yet</option>`);
   $("#l-send").disabled = l.streaming || !llmServable(l, l.model) || !up;
   l.why = llmWhy(st, s, l, unsupported);
   renderWhy(l.why);
   $("#l-stop").disabled = !l.streaming;
 
-  const catalog = net ? net.models : [];
-  setText("#l-count", String(catalog.length));
-  renderOnce("llm-catalog", [catalog, up, unsupported], $("#l-catalog"), () => catalog.length ? catalog.map((m) => {
-    const dl = Object.entries(m.downloading || {}).map(([n, f]) => `${n} ${Math.round(f * 100)}%`).join(", ");
-    const tone = m.status === "rejected" ? "is-waiting" : m.servable ? "is-active" : "";
-    const where = m.status === "rejected" ? (m.status_reason || "rejected")
-      : dl ? `downloading on ${dl}` : m.heads.length ? `on ${m.heads.join(", ")}` : "no head has it yet";
-    const del = m.uploaded ? `<button type="button" class="btn ghost sm" data-act="llm-delete" data-model="${esc(m.id)}">Remove</button>` : "";
-    return `<div class="job ${tone}"><div class="job-top"><b>${esc(m.id)}</b>${del}</div>
-      <p class="meta">${esc(m.size_gb)} GB${m.arch ? ` · ${esc(m.arch)}` : ""} · ${esc(where)}</p></div>`;
-  }).join("") : `<p class="empty">${unsupported ? esc(OUTDATED_COORDINATOR)
-    : up ? "No models yet. Upload a GGUF, or put one in a head's models folder." : "Start or join a pool first."}</p>`);
+  renderModels();
 
   const up_ = l.upload;
   $("#l-upbar").hidden = !up_;
@@ -1121,7 +1138,10 @@ function renderLlm() {
   $("#l-pick").classList.toggle("is-disabled", !!up_ || !up || unsupported);
 
   setTag("#l-pipe-tag", pipe ? pipe.state : "None", pipe && pipe.state === "active" ? "ok" : "");
-  renderOnce("llm-pipe", [pipe || null, !!l.model], $("#l-pipe"), () => pipe ? `
+  const stopped = !pipe && (llmModel(l.model) || {}).status === "disabled";
+  // Keyed on what the card shows, not the live speed: a rebuild every reply replaced Unload under the pointer.
+  renderOnce("llm-pipe", [pipe ? [pipe.id, pipe.state, pipe.members, pipe.explanation] : null, !!l.model, stopped,
+    controls(), canManageModels()], $("#l-pipe"), () => pipe ? `
     <table class="macs">
       <thead><tr><th>Mac</th><th>Role</th><th>Layers</th><th>Share</th><th>Memory</th></tr></thead>
       <tbody>${pipe.members.map((m) => `<tr>
@@ -1129,8 +1149,11 @@ function renderLlm() {
         <td class="num">${esc(Number(m.layer_start))}–${esc(Number(m.layer_end) - 1)}</td><td class="num">${Math.round(m.share * 100)}%</td>
         <td class="num">${esc(m.memory_gb)} GB</td></tr>`).join("")}</tbody></table>
     <p class="hint">${esc(pipe.explanation || "")}</p>
-    <button type="button" class="btn ghost sm" data-act="llm-unload" data-pipeline="${esc(pipe.id)}">Unload</button>`
-    : `<p class="empty">${l.model ? "Not loaded. Your first message plans a split across the pool and loads it." : "Pick a model to see how it's split."}</p>`);
+    ${pipeUnload(pipe)}`
+    : `<p class="empty">${!l.model ? "Pick a model to see how it's split."
+      : stopped ? `Not served: it was stopped for the whole pool. ${canManageModels() ? "Press Serve to use it again." : "Only the pool's admin can serve it again."}`
+      : "Not loaded. Your first message plans a split across the pool and loads it."}</p>`);
+  $$("#l-pipe [data-act]").forEach((b) => { b.disabled = state.busy.has(llmKey(b.dataset.model)); });
 
   const running = !!st.inference_running;
   const n = st.inference_status || {};
@@ -1155,6 +1178,165 @@ function renderLlm() {
     toggle.disabled = !state.ov;
   }
   renderChat();
+}
+
+// One row of the Models list: its tag, its buttons (only for someone who may manage models), the line
+// under its name, and a note per thing worth saying, [text, class]. Pure: a poll's model in, the row out.
+function llmRow(m, manage) {
+  const held = m.held_by || [];
+  const removed = m.status === "removed";
+  const inFlight = held.some((h) => h.removing);
+  const tag = m.status === "rejected" ? "rejected"
+    : removed ? (inFlight ? "removing" : "removed")
+    : m.status === "disabled" ? "not served"
+    : m.status === "ready" && m.load ? m.load : "";
+  // A removed model is still "uploaded" only while the coordinator could not delete the pool's copy.
+  const stuck = removed && m.uploaded;
+  const tone = m.status === "rejected" || (removed && (held.some((h) => h.error) || m.upload_error)) ? "is-waiting"
+    : m.servable ? "is-active" : "";
+
+  const acts = [];
+  const act = (a, label, cls, more = {}) => acts.push({ act: a, label, cls, ...more });
+  if (manage) {
+    if (m.status === "ready" && ["loaded", "loading"].includes(m.load)) {
+      act("llm-unload", "Unload", "ghost", { title: "Frees its memory on every Mac. The next chat loads it again." });
+    }
+    if (m.status === "ready") {
+      act("llm-serving", "Stop serving", "ghost", { on: "0",
+        title: "Unloads it on every Mac in the pool and keeps it from loading until Serve is pressed. Its files stay on disk." });
+    }
+    if (m.status === "disabled") act("llm-serving", "Serve", "primary", { on: "1" });
+    if (!removed) {
+      act("llm-remove", "Remove", "danger", { title: "Unloads it and deletes its copies across the pool. Asks first." });
+    } else if (!inFlight) {
+      if (m.restorable) act("llm-serving", "Add back", "ghost", { on: "1", title: "Lists it again, for the Macs that still have it." });
+      if (held.length || stuck) act("llm-remove", "Remove again", "danger");
+    }
+  }
+
+  const dl = Object.entries(m.downloading || {}).map(([n, f]) => `${n} ${Math.round(f * 100)}%`).join(", ");
+  const heads = m.heads || [];
+  const where = m.status === "rejected" ? (m.status_reason || "rejected")
+    : removed ? "removed from this pool"
+    : dl ? `downloading on ${dl}` : heads.length ? `on ${heads.join(", ")}` : "no head has it yet";
+  const meta = `${m.size_gb} GB${m.arch ? ` · ${m.arch}` : ""} · ${where}`;
+
+  const notes = [];
+  if (m.status === "disabled") notes.push(["Stopped for the whole pool: no Mac loads it until Serve is pressed. Its files stay on disk.", "info"]);
+  if (m.load === "unloading") notes.push(["Unloading: the reply in progress finishes first.", "info"]);
+  if (removed) {
+    const again = manage ? " Press Remove again once it is back." : "";
+    const retry = manage ? " Press Remove again." : "";
+    // The reason is unknown after the coordinator restarts: it only knows the file is still there.
+    if (stuck) {
+      notes.push(m.upload_error ? [`The pool's uploaded copy could not be deleted: ${m.upload_error}.${retry}`, ""]
+        : [`The pool's uploaded copy is still there.${retry}`, "info"]);
+    }
+    held.forEach((h) => {
+      if (h.removing) notes.push([`Removing from ${h.name}…`, "info"]);
+      else if (h.error) notes.push([`${h.name}: ${h.error}`, ""]);
+      else if (h.superseded) notes.push([`An old record of ${h.name} still lists a copy.${retry}`, "info"]);
+      else if (!h.online) notes.push([`${h.name} is offline and keeps its copy.${again}`, "info"]);
+      else if (h.kept) notes.push([`${keptWhere(h)} Delete it there by hand if you want it gone.`, "info"]);
+      else notes.push([`Still on ${h.name}.${retry}`, "info"]);
+    });
+  }
+  return { tag, tone, acts, meta, notes };
+}
+
+// Where a Mac kept its copy of a removed model. An older node does not say which folder.
+function keptWhere(h) {
+  if (h.kept_folder === "models") return `Kept in ${h.name}'s own models folder.`;
+  if (h.kept_folder === "app") return `Kept in ${h.name}'s app folder (~/.slashcompute/models): this pool has no record of sending that copy.`;
+  return `Kept on ${h.name}.`;
+}
+
+function modelCard(m, v) {
+  const tag = v.tag ? `<span class="tag ${esc(LLM_TAG_TONE[v.tag] || "")}">${esc(v.tag)}</span>` : "";
+  const acts = v.acts.map((a) => `<button type="button" class="btn ${esc(a.cls)} sm" data-act="${esc(a.act)}" data-model="${esc(m.id)}"`
+    + `${a.on ? ` data-on="${esc(a.on)}"` : ""}${a.title ? ` title="${esc(a.title)}"` : ""}>${esc(a.label)}</button>`).join("");
+  return `<div class="job ${esc(v.tone)}">
+    <div class="job-top"><b title="${esc(m.id)}">${esc(m.id)}</b>${tag}</div>
+    <p class="meta"></p><div class="notes"></div>${acts ? `<div class="acts">${acts}</div>` : ""}
+  </div>`;
+}
+
+// The parts of a model row that change between polls (downloads, notes, busy buttons), set in place.
+function patchModelCard(card, v, busy) {
+  if (!card || !v) return;
+  const meta = card.querySelector(".meta");
+  if (meta && meta.textContent !== v.meta) meta.textContent = v.meta;
+  const notes = card.querySelector(".notes");
+  const html = v.notes.map(([text, cls]) => `<p class="note ${esc(cls)}">${esc(text)}</p>`).join("");
+  if (notes && notes.dataset.html !== html) {
+    notes.innerHTML = html;
+    notes.dataset.html = html;
+  }
+  card.querySelectorAll(".acts .btn").forEach((b) => { b.disabled = busy; });
+}
+
+// The Models list. Rebuilt only when a row's tag or buttons change, never for a download's progress,
+// so a button is not replaced under the pointer; the rest of each row is patched in place.
+function renderModels() {
+  const net = state.llm.net;
+  const up = !!status().coordinator_up;
+  const unsupported = up && status().inference_supported === false;
+  const catalog = net ? net.models : [];
+  const manage = controls() && canManageModels();
+  const rows = catalog.map((m) => llmRow(m, manage));
+  setText("#l-count", String(catalog.filter((m) => m.status !== "removed").length));
+  const hint = !catalog.length ? ""
+    : !controls() ? "This pool's coordinator runs an older /compute: update the hosting Mac to unload, stop or remove models here."
+    : !manage ? "Only the pool's admin can unload, stop or remove models." : "";
+  renderOnce("llm-catalog", [catalog.map((m, i) => [m.id, rows[i].tag, rows[i].tone, rows[i].acts]), up, unsupported, controls(), hint],
+    $("#l-catalog"), () => (catalog.length ? catalog.map((m, i) => modelCard(m, rows[i])).join("")
+      : `<p class="empty">${unsupported ? esc(OUTDATED_COORDINATOR)
+        : up ? "No models yet. Upload a GGUF, or put one in a head's models folder." : "Start or join a pool first."}</p>`)
+      + (hint ? `<p class="hint">${esc(hint)}</p>` : ""));
+  $$("#l-catalog .job").forEach((card, i) => patchModelCard(card, rows[i], !!catalog[i] && state.busy.has(llmKey(catalog[i].id))));
+}
+
+// Unload on the Pipeline card: per model on a pool with model controls, per pipeline on an older one.
+function pipeUnload(pipe) {
+  if (pipe.state === "draining") return `<button type="button" class="btn ghost sm" disabled>Unloading…</button>`;
+  if (!controls()) {
+    return `<button type="button" class="btn ghost sm" data-act="llm-unload" data-model="${esc(pipe.model)}" data-pipeline="${esc(pipe.id)}">Unload</button>`;
+  }
+  return canManageModels() ? `<button type="button" class="btn ghost sm" data-act="llm-unload" data-model="${esc(pipe.model)}">Unload</button>` : "";
+}
+
+// What Remove is about to do, asked before anything happens.
+function removeQuestion(m, publicPool = (state.settings || {}).mode === "public") {
+  const held = m.held_by || [];
+  const names = (hs) => [...new Set(hs.map((h) => h.name))];
+  const online = names(held.filter((h) => h.online));
+  // A Mac that came back under a new id still has its old, offline row (the pool matches name, chip and
+  // memory): it is online, not offline too. Two Macs that only share a name are both named.
+  const offline = names(held.filter((h) => !h.online && !h.superseded));
+  // A download already under way still finishes (the pool stops only new ones), and that Mac keeps it.
+  const copying = Object.keys(m.downloading || {});
+  const lines = [`Remove ${m.id} from this pool?`, "",
+    "It is unloaded now on every Mac; a reply in progress finishes first."];
+  if (m.uploaded) lines.push("The pool's uploaded copy is deleted.");
+  if (online.length) {
+    // A Mac deletes only the copies this pool sent it; any other copy is the Mac owner's file.
+    lines.push(`On ${online.join(", ")}: copies this pool sent are deleted. Any other copy (in a Mac's own models folder, say) `
+      + (publicPool ? "stays where it is: a public pool never moves files to the Trash." : "goes to that Mac's Trash."));
+  }
+  if (offline.length) lines.push(`Macs that are offline keep their copy for now: ${offline.join(", ")}. Press Remove again once they are back.`);
+  if (copying.length) lines.push(`Macs still downloading it keep the copy they finish: ${copying.join(", ")}. Press Remove again once they are done.`);
+  if (!held.length && !copying.length) lines.push("No Mac has a copy.");
+  lines.push("", "It stays out of the pool until it is added back or uploaded again.");
+  return lines.join("\n");
+}
+
+// What Remove did, for its toast. upload_error is only the reason the pool's uploaded copy is still there.
+function removedNote(r) {
+  const parts = [`Removed ${r.model}.`];
+  if (r.upload_error) parts.push(`The pool's uploaded copy could not be deleted: ${r.upload_error}.`);
+  if ((r.macs || []).length) parts.push(`Deleting its copies on ${r.macs.join(", ")}.`);
+  if ((r.offline || []).length) parts.push(`Offline, still holding it: ${r.offline.join(", ")}.`);
+  return parts.join(" ");
 }
 
 function chatFooter(net) {
@@ -1415,7 +1597,7 @@ function serveLlm(btn, on, changes = {}) {
     else if (snap.last_error) toast(snap.last_error, "bad");
     else if (on && !snap.inference_running) toast("The LLM node did not start: see ~/.slashcompute/logs/inference.log.", "bad");
     else toast(on ? "Serving. This Mac hosts LLM layers whenever a chat needs them."
-      : "Stopped serving. The current reply finishes first.");
+      : "Stopped serving on this Mac.");
   });
 }
 
@@ -1436,15 +1618,45 @@ const actions = {
     state.llm.messages = [];
     renderChat();
   },
-  "llm-unload": (btn) => withBusy("llm-unload", btn, "Unloading…", async () => {
-    await post(`/api/coord/inference/pipelines/${encodeURIComponent(btn.dataset.pipeline)}/stop`);
-    toast("Unloading after the current reply.");
-    await loadLlm();
-  }),
-  "llm-delete": (btn) => withBusy(`llm-del-${btn.dataset.model}`, btn, "Removing…", async () => {
-    await api(`/api/coord/inference/models/${encodeURIComponent(btn.dataset.model)}`, { method: "DELETE" });
-    await loadLlm();
-  }),
+  // The model travels in the body, never the path: the shell's proxy rebuilds decoded paths.
+  "llm-unload": (btn) => {
+    const id = btn.dataset.model || "";
+    const loading = (llmModel(id) || {}).load === "loading";
+    return withBusy(llmKey(id), btn, "Unloading…", async () => {
+      if (btn.dataset.pipeline) {
+        // An older coordinator: stop the one pipeline on the Pipeline card.
+        await post(`/api/coord/inference/pipelines/${encodeURIComponent(btn.dataset.pipeline)}/stop`);
+        toast("Unloading after the current reply.");
+      } else {
+        const r = await post("/api/coord/inference/models/unload", { model: id });
+        toast(!(r && r.pipelines) ? `${id} was not loaded.`
+          : `Unloading ${id}. The reply in progress finishes first${loading ? "; a chat waiting for it loads it again" : ""}.`);
+      }
+      await loadLlm();
+    });
+  },
+  "llm-serving": (btn) => {
+    const id = btn.dataset.model || "";
+    const on = btn.dataset.on === "1";   // a real boolean: the coordinator refuses anything else
+    const back = (llmModel(id) || {}).status === "removed";
+    return withBusy(llmKey(id), btn, !on ? "Stopping…" : back ? "Adding…" : "Starting…", async () => {
+      await post("/api/coord/inference/models/serving", { model: id, on });
+      toast(!on ? `Stopped serving ${id} on every Mac. The reply in progress finishes first; its files stay on disk.`
+        : back ? `Added ${id} back. Macs that still have it can serve it.`
+        : `Serving ${id} again. The next chat loads it.`);
+      await loadLlm();
+    });
+  },
+  "llm-remove": (btn) => {
+    const id = btn.dataset.model || "";
+    if (state.busy.has(llmKey(id))) return;
+    if (!window.confirm(removeQuestion(llmModel(id) || { id }))) return;
+    return withBusy(llmKey(id), btn, "Removing…", async () => {
+      const r = { model: id, ...(await post("/api/coord/inference/models/remove", { model: id })) };
+      toast(removedNote(r), r.upload_error ? "bad" : "ok");
+      await loadLlm();
+    });
+  },
   "toggle-contribute": (btn) => {
     const st = status();
     if (st.agent_draining) return;   // already stopping: the agent exits on its own

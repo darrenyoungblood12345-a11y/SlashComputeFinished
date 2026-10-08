@@ -84,7 +84,7 @@ def auto_memory_gb(total_bytes: int) -> float:
 
 def build_config(url: str, home: Path, name: Optional[str], models_dir: str, memory_gb: float, head: bool,
                  probe_port: int, benchmark: str, session_token: str, inference_token: str, ip: str,
-                 total_mem_bytes: int) -> NodeConfig:
+                 total_mem_bytes: int, trash_removed: bool = False) -> NodeConfig:
     from slashcompute.inference.node import binaries
 
     return NodeConfig(
@@ -93,14 +93,14 @@ def build_config(url: str, home: Path, name: Optional[str], models_dir: str, mem
         models_dir=models_dir, download_dir=str(home / "models"), probe_port=probe_port,
         state_file=str(home / "inference" / "node_state.json"), status_file=str(home / "inference" / "status.json"),
         agent_status_file=str(home / "agent" / "status.json"), ip=ip, benchmark=benchmark,
-        session_token=session_token, inference_token=inference_token,
+        session_token=session_token, inference_token=inference_token, trash_removed=trash_removed,
         commitment=Commitment(memory_gb=memory_gb or auto_memory_gb(total_mem_bytes), may_be_head=head),
     )
 
 
 async def run_node(cfg: NodeConfig, home: Path, fake: bool = False) -> None:
     from slashcompute.inference.node import hardware, latency
-    from slashcompute.inference.node.agent import Agent, load_state, save_state, scan_models
+    from slashcompute.inference.node.agent import Agent, load_state, model_folders, save_state, scan_models
 
     log = setup_logging("slashcompute.inference.node")
     shutdown = asyncio.Event()
@@ -129,10 +129,11 @@ async def run_node(cfg: NodeConfig, home: Path, fake: bool = False) -> None:
                                    device=cfg.commitment.device or None, basket_model=cfg.basket_model,
                                    basket_ref=(cfg.basket_ref_prompt_tps, cfg.basket_ref_gen_tps))
         engine.pid_file = pids
+    folders = model_folders(cfg.model_dirs)   # before the scan: a file added meanwhile is picked up after it
     files = scan_models(cfg.model_dirs)
     state = load_state(cfg.state_file)
     agent = Agent(cfg, engine, info=info, build=build, ip=cfg.ip, gguf_files=files, latency_fn=latency.measure,
-                  state=state, probe_fn=latency.serve_probe)
+                  state=state, probe_fn=latency.serve_probe, folders=folders)
     if not await connect(agent, shutdown, log):
         return
     engine.node_id = agent.node_id
@@ -179,6 +180,10 @@ def start(
     inference_token: Optional[str] = typer.Option(None, envvar="SLASHCOMPUTE_INF_TOKEN",
                                                   help="Shared secret if the coordinator requires one"),
     localhost: bool = typer.Option(False, help="Advertise 127.0.0.1 (same-machine cluster)"),
+    trash_removed: bool = typer.Option(False, "--trash-removed/--keep-removed",
+                                       help="When the pool removes a model, move a copy it did not send here (one "
+                                            "in --models-dir, for example) to the Trash; the copies it sent are "
+                                            "always deleted"),
     fake: bool = typer.Option(False, hidden=True, help="Simulated engine (demos and tests)"),
 ):
     """Join the pool's LLM network. Runs in the foreground; SIGTERM leaves gracefully."""
@@ -192,7 +197,7 @@ def start(
         raise typer.Exit(1)
     info_mem = hardware.detect().get("total_mem_bytes") or 0
     cfg = build_config(url, h, name, models_dir, memory_gb, head, probe_port, benchmark, session_token or "",
-                       inference_token or "", "127.0.0.1" if localhost else lan_ip(), info_mem)
+                       inference_token or "", "127.0.0.1" if localhost else lan_ip(), info_mem, trash_removed)
     pf = pid_file(h)
     pf.parent.mkdir(parents=True, exist_ok=True)
     pf.write_text(f"{os.getpid()}\n")

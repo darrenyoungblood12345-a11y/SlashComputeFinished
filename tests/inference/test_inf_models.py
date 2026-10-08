@@ -7,25 +7,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from inf_gguf_fixtures import dense_model, write_gguf
-from inf_harness import FakeNode, chat, fast_settings, start_harness
-from slashcompute.inference.gguf import parse_header
+from inf_gguf_fixtures import tiny_gguf
+from inf_harness import FakeNode, chat, fast_settings, start_harness, upload, wait_for
 from slashcompute.inference.node.agent import scan_models
-
-
-def tiny_gguf(n_layers: int = 2) -> bytes:
-    """A small but complete GGUF (header + zeroed tensor data)."""
-    h = parse_header(dense_model(n_layers=n_layers, emb=64, ff=128, heads=4, kv_heads=2, vocab=100))
-    tensors = [(t.name, t.dims, t.ggml_type) for t in h.tensors]
-    return write_gguf(dict(h.kv), tensors, with_data=True)
-
-
-async def wait_for(cond, timeout=5.0):
-    for _ in range(int(timeout / 0.05)):
-        if cond():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError("condition not met")
 
 
 @pytest.fixture
@@ -33,11 +17,6 @@ async def cluster(tmp_path):
     h = await start_harness(fast_settings(MODELS_DIR=str(tmp_path / "coord-models")), tmp=str(tmp_path / "nodes"))
     yield h
     await h.stop()
-
-
-async def upload(h, name: str, data: bytes) -> httpx.Response:
-    async with httpx.AsyncClient(base_url=h.node_url, timeout=30) as c:
-        return await c.post("/models/upload", params={"name": name}, content=data)
 
 
 def reported_files(h, name: str) -> str:
@@ -141,7 +120,9 @@ async def test_files_are_only_served_to_nodes(cluster):
     async with httpx.AsyncClient(base_url=h.node_url) as c:
         assert (await c.get("/models/files/tiny.gguf")).status_code == 401
         assert (await c.delete("/models/tiny.gguf")).status_code == 200
-        assert (await c.get("/status")).json()["models"][0]["uploaded"] is False
+        assert (await c.get("/status")).json()["models"] == []          # removed, and no Mac holds a copy
+        assert not (Path(h.settings.MODELS_DIR) / "tiny.gguf").exists()
+        assert (await c.delete("/models/tiny.gguf")).status_code == 404   # nothing left to remove
 
 
 async def test_shared_token_guards_uploads_and_chat(tmp_path):

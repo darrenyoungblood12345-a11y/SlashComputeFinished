@@ -4,7 +4,8 @@ Lifecycle: planned -> starting -> loading -> active -> draining -> stopped | bro
 - starting: each worker agent starts its RPC server (LAN IP or 127.0.0.1 behind the relay)
 - loading:  the head starts llama-server --rpc ... --tensor-split ... and streams weights out
 - active:   requests for the model are routed here (one at a time, -np 1)
-- draining: finish the in-flight job, then stop (idle timeout, training took the Mac, or a member left)
+- draining: finish the in-flight job, then stop (idle timeout, training took the Mac, a member left, or
+            the model was unloaded, stopped or removed in the LLMs tab)
 - broken:   a member missed heartbeats or the head lost an RPC worker; in-flight jobs fail with a
             retryable error and the request is re-planned without that node
 """
@@ -49,6 +50,11 @@ class IllegalTransition(RuntimeError):
 
 class NoCapacity(RuntimeError):
     pass
+
+
+class ModelUnavailable(NoCapacity):
+    """The model was stopped or removed in the LLMs tab (or never was ready): a 404, not a busy pool."""
+    status = 404
 
 
 class PipelineFailed(RuntimeError):
@@ -151,12 +157,18 @@ class PipelineManager:
         return [r for r in self.runtimes.values()
                 if r.state not in TERMINAL and (model_id is None or r.model_id == model_id)]
 
+    def _check_model(self, model_id: str) -> None:
+        why = registry.unavailable(registry.model_row(self.conn, model_id), model_id)
+        if why:
+            raise ModelUnavailable(why)
+
     # ------------------------------------------------------------ routing
 
     async def get_pipeline(self, model_id: str, ctx: int, exclude=()) -> Runtime:
         lock = self._model_locks.setdefault(model_id, asyncio.Lock())
         excluded = set(exclude)
         async with lock:
+            self._check_model(model_id)  # stopped while this request waited for the lock: don't reuse a pipeline
             usable = [r for r in self.live(model_id) if r.ctx >= ctx and not excluded & set(r.node_ids)]
             rt = next((r for r in usable if r.state == "active"), None)
             if rt is None:
@@ -174,7 +186,9 @@ class PipelineManager:
     async def _create(self, model_id: str, ctx: int, exclude=()) -> Runtime:
         p = self.plan_for(model_id, ctx, exclude)
         deadline = time.time() + self.s.PIPELINE_FORM_TIMEOUT_SECONDS
+        waiting_for = None   # logged once per change, not on every one-second pass
         while isinstance(p, NoPlan):
+            self._check_model(model_id)  # Stop serving / Remove while waiting: refuse now, not at the deadline
             draining = [r for r in self.live() if r.state == "draining"]
             forming = [r for r in self.live() if r.state in ("planned", "starting", "loading")]
             # an idle pipeline of the same model is fair game too when its ctx is too small for this request
@@ -186,10 +200,12 @@ class PipelineManager:
                 # form (e.g. planned with a node that just dropped): wait for one to settle, then re-plan
                 waits = [asyncio.ensure_future(r.done.wait()) for r in draining]
                 waits += [asyncio.ensure_future(r.ready.wait()) for r in forming]
-                log.info("waiting for %d draining / %d forming pipeline(s) before planning %s",
-                         len(draining), len(forming), model_id)
-                try:
-                    await asyncio.wait(waits, timeout=max(0.1, deadline - time.time()),
+                if waiting_for != (now_waiting := ({r.id for r in draining}, {r.id for r in forming})):
+                    waiting_for = now_waiting
+                    log.info("waiting for %d draining / %d forming pipeline(s) before planning %s",
+                             len(draining), len(forming), model_id)
+                try:  # at most a second: the model may be stopped meanwhile
+                    await asyncio.wait(waits, timeout=max(0.1, min(1.0, deadline - time.time())),
                                        return_when=asyncio.FIRST_COMPLETED)
                 finally:
                     for w in waits:
@@ -321,6 +337,21 @@ class PipelineManager:
                 return
             self._set_state(rt, "stopped", reason)
         self._stop_processes(rt)
+
+    async def unload(self, model_id: str, reason: str) -> int:
+        """Stop every live pipeline of a model: active ones drain (the reply in progress finishes),
+        forming ones break. Returns how many it stopped (draining ones are already on their way)."""
+        n = 0
+        for rt in self.live(model_id):
+            if rt.state == "active":
+                self._set_state(rt, "draining", reason)  # now, so the next status poll shows it
+                self._spawn(self.stop_pipeline(rt.id, reason))
+            elif rt.state in ("planned", "starting", "loading"):
+                await self.break_pipeline(rt.id, f"stopped while forming: {reason}")
+            else:
+                continue
+            n += 1
+        return n
 
     def recover(self, reason: str = "coordinator restarted") -> None:
         """At startup: pipelines a previous run left live have no runtime here and would hold their
@@ -594,7 +625,8 @@ async def serve(mgr: PipelineManager, model_id: str, body: dict, ctx: int, reque
             return
         except NoCapacity as e:
             fail_job(mgr.conn, job_id, str(e), False)
-            yield {"type": "error", "status": 503, "error": str(e), "retryable": False, "job_id": job_id}
+            yield {"type": "error", "status": getattr(e, "status", None) or 503, "error": str(e), "retryable": False,
+                   "job_id": job_id}
             return
         yield {"type": "final", "summary": summary, "finish_reason": final.get("finish_reason"),
                "usage": final.get("usage"), "output_head": head}

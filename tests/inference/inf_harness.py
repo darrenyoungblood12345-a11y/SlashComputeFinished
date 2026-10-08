@@ -171,3 +171,16 @@ async def chat(h: Harness, model: str, content: str = "hi", max_tokens: int = 8,
         return await c.post("/v1/chat/completions", headers=headers or {}, json={
             "model": model, "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens,
             "stream": stream})
+
+
+async def upload(h: Harness, name: str, data: bytes) -> httpx.Response:
+    async with httpx.AsyncClient(base_url=h.node_url, timeout=30) as c:
+        return await c.post("/models/upload", params={"name": name}, content=data)
+
+
+async def wait_for(cond, timeout: float = 5.0) -> None:
+    for _ in range(int(timeout / 0.05)):
+        if cond():
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("condition not met")

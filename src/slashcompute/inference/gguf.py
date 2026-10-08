@@ -203,9 +203,17 @@ def shard_paths(path: str | Path) -> list[Path]:
     if not m:
         return [path]
     pattern = glob.escape(str(path.parent / m.group(1))) + f'-*-of-{m.group(3)}.gguf'
-    return sorted(Path(p) for p in glob.glob(pattern))
+    # the glob's * also matches another model's shards ("x-big-00001-of-00003.gguf" for "x"): keep exact ones
+    return sorted(p for p in map(Path, glob.glob(pattern))
+                  if (s := SHARD_RE.match(p.name)) and s.group(1) == m.group(1))
 
 
 def is_first_shard_or_single(name: str) -> bool:
     m = SHARD_RE.match(name)
     return not m or m.group(2) == '00001'
+
+
+def plain_gguf(name) -> bool:
+    """A bare GGUF file name (no folder, not hidden): the only kind a removal may touch."""
+    return (isinstance(name, str) and name.endswith('.gguf') and not name.startswith('.')
+            and '/' not in name and '\\' not in name and '\0' not in name)

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import struct
 
-from slashcompute.inference.gguf import tensor_nbytes
+from slashcompute.inference.gguf import parse_header, tensor_nbytes
 
 F32, F16, Q4_K, Q8_0 = 0, 1, 12, 8
 
@@ -108,3 +108,10 @@ def moe_model(n_layers: int = 4, emb: int = 256, ff: int = 128, experts: int = 8
         ]
     tensors.append(('output.weight', (emb, vocab), Q8_0))
     return write_gguf(kv, tensors)
+
+
+def tiny_gguf(n_layers: int = 2) -> bytes:
+    """A small but complete GGUF (header + zeroed tensor data)."""
+    h = parse_header(dense_model(n_layers=n_layers, emb=64, ff=128, heads=4, kv_heads=2, vocab=100))
+    tensors = [(t.name, t.dims, t.ggml_type) for t in h.tensors]
+    return write_gguf(dict(h.kv), tensors, with_data=True)

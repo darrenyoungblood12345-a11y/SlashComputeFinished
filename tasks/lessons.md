@@ -40,3 +40,9 @@
 - Under `.claude/worktrees` the venv's `.pth` files come back with the macOS hidden flag after every
   `uv run` sync, and Python 3.13 skips hidden `.pth` files. Run tests as
   `PYTHONPATH=src uv run --no-sync pytest …` and start servers with `PYTHONPATH=src`.
+- To stop tasks that use httpx/anyio, cancel until they are really done: anyio can swallow a native cancel
+  that lands while it opens a connection, and a loop that survives one cancel keeps a node alive forever.
+- A node's advertised files must follow the disk (rescan when a model folder changes): a GGUF trashed by
+  hand stayed advertised, so the planner kept picking that head and every load failed.
+- On a host Mac the coordinator's upload folder is the node's download folder. Anything that deletes there
+  must know who owns the file (a record of what each pool sent); never delete by name alone.

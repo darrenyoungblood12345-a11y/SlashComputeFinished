@@ -9,14 +9,17 @@ steps aside while the MLX agent is training, and drains before leaving.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import logging
 import os
 import statistics
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -30,10 +33,19 @@ from slashcompute.inference.node.relay import HeadProxy, bridge_stream
 log = logging.getLogger("slashcompute.inference.node")
 GIB = 1024 ** 3
 TOKEN_HEADER = "X-Inference-Token"
+STOPPED_EARLY_MAX = 256   # pipelines whose stop overtook their start, remembered (ids are never reused)
 
 
 class CommitmentError(RuntimeError):
     pass
+
+
+class StoppedWhileLoading(EngineError):
+    """The pool stopped a pipeline before its start finished (Unload, Stop serving, Remove): expected, not a
+    fault, so it is not shown as this Mac's last error. The coordinator still gets the failed start."""
+
+    def __init__(self, message: str = "stopped while loading"):
+        super().__init__(message, pipeline_broken=False)
 
 
 def in_hours(hours, now: Optional[datetime] = None) -> bool:
@@ -49,24 +61,167 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _missing_bytes(path: Path, header) -> int:
+    """How much of the tensor data its header promises is not in the file yet (a copy still under way)."""
+    end = header.data_start + max((t.offset + t.nbytes for t in header.tensors), default=0)
+    return max(0, end - path.stat().st_size)
+
+
 def scan_models(dirs: list[str]) -> list[dict]:
-    """GGUFs on disk (first shard of split models), with parsed headers for the coordinator."""
-    from slashcompute.inference.gguf import is_first_shard_or_single, read_header_file, shard_paths
+    """GGUFs on disk (first shard of split models), with parsed headers for the coordinator. A file still
+    being copied in (shorter than its header says), or a split model with parts still to come, is left out
+    until it is whole: the coordinator keeps the first layer table it gets."""
+    from slashcompute.inference.gguf import SHARD_RE, is_first_shard_or_single, read_header_file, shard_paths
     out, seen = [], set()
     for d in dirs:
         root = Path(d).expanduser()
         for f in sorted(root.glob("*.gguf")) if root.is_dir() else []:
-            if f.name in seen or not is_first_shard_or_single(f.name):
+            if f.name in seen or f.name.startswith(".") or not is_first_shard_or_single(f.name):
                 continue
             try:
                 parts = shard_paths(f)
-                headers = [read_header_file(p).to_json() for p in parts]
+                if (m := SHARD_RE.match(f.name)) and len(parts) != int(m.group(3)):
+                    log.info("skipping %s for now: %d of %s parts on disk", f.name, len(parts), int(m.group(3)))
+                    continue
+                headers = [read_header_file(p) for p in parts]
+                missing = sum(_missing_bytes(p, h) for p, h in zip(parts, headers))
             except Exception as e:  # noqa: BLE001
                 log.warning("skipping %s: %s", f.name, e)
                 continue
+            if missing:
+                log.info("skipping %s for now: %.1f GB of it is not on disk yet (still being copied?)",
+                         f.name, missing / 1e9)
+                continue
             seen.add(f.name)
-            out.append({"name": f.name, "size": sum(p.stat().st_size for p in parts), "headers": headers})
+            out.append({"name": f.name, "size": sum(p.stat().st_size for p in parts),
+                        "headers": [h.to_json() for h in headers]})
     return out
+
+
+def model_folders(dirs: list[str]) -> tuple:
+    """A cheap fingerprint of the model folders: each one's visible GGUFs with size and mtime (None: no such
+    folder). It changes when a file is dropped in, moved to the Trash, put back, or still growing (a copy)."""
+    out = []
+    for d in dirs:
+        try:
+            with os.scandir(Path(d).expanduser()) as it:
+                entries = [e for e in it if e.name.endswith(".gguf") and not e.name.startswith(".")]
+            files = []
+            for e in entries:
+                with contextlib.suppress(OSError):   # gone between the listing and the stat
+                    st = e.stat()
+                    files.append((e.name, st.st_size, st.st_mtime_ns))
+            out.append(tuple(sorted(files)))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+def move_to_trash(path: Path) -> None:
+    """Move a file to the macOS Trash, as Finder does (Put Back works). Raises OSError when it can't;
+    a file in someone's own models folder is never deleted instead."""
+    try:
+        import objc
+        from Foundation import NSURL, NSFileManager
+    except ImportError as e:
+        raise OSError(errno.ENOTSUP, "the Trash is not available on this Mac") from e
+    with objc.autorelease_pool():
+        url = NSURL.fileURLWithPath_(str(path))
+        ok, _, err = NSFileManager.defaultManager().trashItemAtURL_resultingItemURL_error_(url, None, None)
+        if not ok:
+            raise OSError(errno.EIO, str(err.localizedDescription()) if err is not None else "not moved to the Trash")
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve() or (a.is_dir() and b.is_dir() and os.path.samefile(a, b))
+    except OSError:
+        return False
+
+
+def _listing(d: Path) -> set[str]:
+    try:
+        return set(os.listdir(d))
+    except OSError:
+        return set()
+
+
+def remove_model_files(name: str, models_dir: str, download_dir: str, trash: bool,
+                       deletable: frozenset[str] | set[str] = frozenset()) -> dict:
+    """Remove every shard of a model from this Mac. In ``download_dir`` the shards named in ``deletable``
+    (the ones the asking pool sent here) and their partial download are deleted. Every other copy there,
+    and every copy in the user's own ``models_dir``, goes to the Trash when ``trash``, else stays: ``kept``
+    lists each one with its folder, "models" (``models_dir``) or "app" (``download_dir``). When both are one
+    folder it is the user's: Trash, never delete. Only exact names from a folder's listing count: APFS
+    would open 'Model.gguf' for 'model.gguf', a different model. Tries every file, then raises one
+    OSError naming the files that failed (names only: the coordinator shows it to the pool)."""
+    from slashcompute.inference.gguf import plain_gguf, shard_paths
+
+    if not plain_gguf(name):
+        raise ValueError(f"not a model file name: {name!r}")
+    user, app = Path(models_dir).expanduser(), Path(download_dir).expanduser()
+    out: dict[str, list] = {"trashed": [], "deleted": [], "kept": []}
+    failed = []
+
+    def why(f: Path, e: OSError) -> str:
+        return f"{f.name}: {(e.strerror or type(e).__name__).replace(str(f.parent) + os.sep, '')}"
+
+    def delete(f: Path) -> None:
+        try:
+            f.unlink()
+            out["deleted"].append(f.name)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            failed.append(why(f, e))
+
+    folders = [(user, "models", frozenset())] if _same_dir(user, app) else \
+        [(app, "app", frozenset(deletable)), (user, "models", frozenset())]
+    for d, label, ours in folders:
+        listed = _listing(d)
+        for f in shard_paths(d / name):
+            if f.name not in listed or not f.is_file():
+                continue
+            if f.name in ours:
+                delete(f)
+            elif not trash:
+                out["kept"].append({"name": f.name, "folder": label})
+            else:
+                try:
+                    move_to_trash(f)
+                    out["trashed"].append(f.name)
+                except OSError as e:
+                    failed.append(why(f, e))
+        if name in ours and f".{name}.part" in listed:
+            delete(d / f".{name}.part")
+    if failed:
+        raise OSError("; ".join(failed))   # no errno: str() is then exactly this text
+    return out
+
+
+def still_ours(download_dir: str, sent: dict[str, dict]) -> set[str]:
+    """The files a coordinator sent into ``download_dir`` (``sent``: name -> {size, mtime_ns} as downloaded)
+    that are still the file it sent: one written over since (this Mac's own upload when it hosts a pool,
+    say) is not."""
+    app = Path(download_dir).expanduser()
+    out = set()
+    for name, rec in sent.items():
+        with contextlib.suppress(OSError):
+            st = (app / name).stat()
+            if (st.st_size, st.st_mtime_ns) == (rec.get("size"), rec.get("mtime_ns")):
+                out.add(name)
+    return out
+
+
+def save_json(path: Path, data) -> None:
+    """Write JSON atomically: a crash mid-write leaves the previous file, never half of one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:6]}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def training_busy(status_file: str) -> bool:
@@ -94,13 +249,22 @@ class Agent:
                  client: Optional[httpx.AsyncClient] = None, state: Optional[dict] = None,
                  heartbeat_seconds: Optional[float] = None,
                  probe_fn: Optional[Callable[[str, int], Awaitable]] = None,
-                 busy_fn: Optional[Callable[[], bool]] = None):
+                 busy_fn: Optional[Callable[[], bool]] = None, folders: Optional[tuple] = None):
         self.cfg = cfg
         self.engine = engine
         self.info = info
         self.build = build
         self.ip = ip
         self.gguf_files = gguf_files
+        # the model folders as of that scan (take it before scanning, so a change during the scan is seen)
+        self.folders = folders if folders is not None else model_folders(cfg.model_dirs)
+        self.reported: Optional[list] = None            # the files the coordinator has last been told about
+        self.report_due = False                           # the coordinator asked for them again
+        self.models_kick = asyncio.Event()                # wakes models_loop before its next pass
+        self._scan_lock = asyncio.Lock()                  # scan + report one at a time: the latest scan wins
+        # files this node downloaded, per coordinator: only those may that coordinator delete again
+        self.downloaded_file = Path(cfg.state_file).expanduser().with_name("downloaded.json")
+        self.downloaded: dict[str, dict[str, dict]] = _load_downloaded(self.downloaded_file)
         self.latency_fn = latency_fn
         self.client = client or httpx.AsyncClient(base_url=cfg.coordinator_url, timeout=httpx.Timeout(60, connect=10))
         self.state = state if state is not None else {}
@@ -124,6 +288,9 @@ class Agent:
         self.last_available: Optional[bool] = None
         self.last_reason = ""
         self.last_error = ""
+        self.stopping: set[str] = set()                   # pipelines whose stop is running now
+        # pipelines stopped before their start ran (both in one poll): the start is refused when it comes
+        self.stopped_early: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._tasks: set[asyncio.Task] = set()
         self.stopped = asyncio.Event()
 
@@ -169,6 +336,7 @@ class Agent:
         self.head_approved = bool(data.get("head_approved"))
         await self._set_transport(data.get("transport", "direct"))
         self.state.update(node_id=self.node_id, token=self.token)
+        self.reported = _listing_key(self.gguf_files)
         log.info("registered as %s (%s transport)", self.node_id, self.transport)
 
     async def start(self, benchmark: Optional[dict] = None) -> None:
@@ -176,6 +344,7 @@ class Agent:
         bench = benchmark or await self.engine.benchmark()
         await self._post("/nodes/benchmark", bench)
         self._spawn(self.heartbeat_loop())
+        self._spawn(self.models_loop())
         self._spawn(self.command_loop())
 
     async def leave(self) -> None:
@@ -184,10 +353,18 @@ class Agent:
             await self.client.post("/nodes/heartbeat", headers=self.headers, timeout=5,
                                    json={"available": False, "llama_build": self.build, "leaving": True})
 
+    async def cancel_tasks(self) -> None:
+        """Cancel every task of this agent and wait until each has ended. A cancel that lands while httpx
+        opens a connection can be swallowed: anyio cancels its other connect attempts once one succeeds and
+        takes the two cancels for one of its own. So a task still running a moment later is cancelled again,
+        and so is any task one of them spawned meanwhile (a command handled after the list was taken)."""
+        while pending := {t for t in self._tasks if not t.done()}:
+            for t in pending:
+                t.cancel()
+            await asyncio.wait(pending, timeout=1.0)
+
     async def stop(self) -> None:
-        for t in list(self._tasks):
-            t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self.cancel_tasks()
         await self.engine.stop_all()
         for pid in list(self.proxies):
             await self._close_proxies(pid)
@@ -236,9 +413,12 @@ class Agent:
             await self.register()
             return
         with contextlib.suppress(ValueError):
-            t = r.json().get("transport")
-            if t:
-                await self._set_transport(t)
+            data = r.json()
+            if data.get("report_models"):   # back from offline, or the pool forgot this Mac's files meanwhile
+                self.report_due = True
+                self.models_kick.set()
+            if data.get("transport"):
+                await self._set_transport(data["transport"])
         self.write_status()
 
     async def heartbeat_loop(self) -> None:
@@ -250,6 +430,39 @@ class Agent:
                 log.warning("heartbeat failed: %s", e)
                 self.write_status()
             await asyncio.sleep(self.heartbeat_seconds)
+
+    async def models_loop(self) -> None:
+        """Keep the pool's list of this Mac's models current: a file dropped in, moved to the Trash or put
+        back by hand shows without a restart. Its own task, so a slow scan (a big folder on a slow disk)
+        or a slow report never holds up a heartbeat."""
+        while True:
+            try:
+                await self.sync_models()
+            except Exception as e:  # noqa: BLE001 - tried again next pass
+                log.warning("could not report this Mac's models: %s", e)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.models_kick.wait(), self.heartbeat_seconds)
+            self.models_kick.clear()
+
+    async def sync_models(self, rescan: bool = False) -> None:
+        """Tell the coordinator which GGUFs this Mac has. Rescans when ``rescan`` (after a download or a
+        removal) or when the folders changed since the last scan, and reports when ``rescan``, when the
+        coordinator asked for it, or when the list differs from the last one reported (a report that failed
+        is retried). One at a time, so the coordinator always ends up with the latest scan."""
+        async with self._scan_lock:
+            folders = await asyncio.to_thread(model_folders, self.cfg.model_dirs)   # before the scan it covers
+            if rescan or folders != self.folders:
+                self.gguf_files = await asyncio.to_thread(scan_models, self.cfg.model_dirs)
+                self.folders = folders
+            listing = _listing_key(self.gguf_files)
+            if rescan or self.report_due or listing != self.reported:
+                if listing != self.reported and self.reported is not None and not rescan:
+                    log.info("models on disk changed: %s", [f["name"] for f in self.gguf_files])
+                self.report_due = False   # a request that arrives during the POST asks again
+                self.reported = None      # unknown until the coordinator answers
+                await self._post("/nodes/models", {"files": self.gguf_files})
+                self.reported = listing
+                self.write_status()
 
     def write_status(self) -> None:
         """What the /compute shell shows for this Mac's inference node."""
@@ -292,6 +505,9 @@ class Agent:
         try:
             result = await self.dispatch(cmd["kind"], cmd["payload"])
             body = {"ok": True, "result": result}
+        except StoppedWhileLoading as e:   # Unload / Stop serving while it loaded: nothing went wrong here
+            log.info("command %s: %s", cmd["kind"], e)
+            body = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         except Exception as e:  # noqa: BLE001 - report every failure to the coordinator
             log.warning("command %s failed: %s", cmd["kind"], e)
             self.last_error = f"{cmd['kind']}: {e}"
@@ -332,33 +548,68 @@ class Agent:
         self.rtt_ms = statistics.median(rtts)
         return self.rtt_ms
 
+    def _refuse_if_stopped(self, pid: str) -> None:
+        """A start whose stop already ran (the coordinator queued both before this Mac polled; stops run
+        first) must not load anything."""
+        if pid in self.stopped_early:
+            del self.stopped_early[pid]
+            raise StoppedWhileLoading("stopped before loading")
+
+    def _stopped_meanwhile(self, pid: str) -> bool:
+        """Whether a failed start failed because its pipeline was stopped (llama.cpp killed mid-load)."""
+        return pid in self.stopping or pid not in self.in_use
+
     async def dispatch(self, kind: str, p: dict) -> dict:
         pid = p.get("pipeline_id")
         if kind == "start_worker":
+            self._refuse_if_stopped(pid)
             self._enforce(pid, p["mem_bytes"])
             self.in_use[pid] = p["mem_bytes"]
             try:
                 res = await self.engine.start_worker(pid, {**p, "device": self.cfg.commitment.device})
-            except Exception:
+            except Exception as e:
+                stopped = self._stopped_meanwhile(pid)
                 self.in_use.pop(pid, None)
+                if stopped:
+                    raise StoppedWhileLoading() from e
                 raise
+            if pid not in self.in_use:   # stopped while starting: the stop found nothing to stop yet
+                await self.engine.stop_worker(pid)
+                raise StoppedWhileLoading()
             if self.transport == "relay":
                 self.local_rpc[pid] = res["endpoint"]
                 return {"endpoint": f"relay:{self.node_id}"}
             return res
         if kind == "start_head":
+            self._refuse_if_stopped(pid)
             self._enforce(pid, p["mem_bytes"])
             self.in_use[pid] = p["mem_bytes"]
             try:
                 if self.transport == "relay":
                     p = await self._relay_head_spec(p)
-                return await self.engine.start_head(pid, p)
-            except Exception:
+                res = await self.engine.start_head(pid, p)
+            except Exception as e:
+                stopped = self._stopped_meanwhile(pid)
                 self.in_use.pop(pid, None)
                 await self._close_proxies(pid)
+                if stopped:
+                    raise StoppedWhileLoading() from e
                 raise
+            if pid not in self.in_use:   # stopped while loading (Unload, Stop serving): don't leave it running
+                await self.engine.stop_head(pid)
+                await self._close_proxies(pid)
+                raise StoppedWhileLoading()
+            return res
         if kind in ("stop_worker", "stop_head"):
-            await (self.engine.stop_worker if kind == "stop_worker" else self.engine.stop_head)(pid)
+            if pid not in self.in_use:   # its start has not run yet (same poll): refuse it when it does
+                self.stopped_early[pid] = None
+                while len(self.stopped_early) > STOPPED_EARLY_MAX:
+                    self.stopped_early.popitem(last=False)
+            self.stopping.add(pid)
+            try:
+                await (self.engine.stop_worker if kind == "stop_worker" else self.engine.stop_head)(pid)
+            finally:
+                self.stopping.discard(pid)
             self.in_use.pop(pid, None)
             self.local_rpc.pop(pid, None)
             await self._close_proxies(pid)
@@ -387,6 +638,8 @@ class Agent:
             return {"results": await self.latency_fn(p["peers"])}
         if kind == "download_model":
             return await self.download_model(p)
+        if kind == "remove_model":
+            return await self.remove_model(p)
         raise ValueError(f"unknown command {kind}")
 
     async def _relay_head_spec(self, p: dict) -> dict:
@@ -426,6 +679,53 @@ class Agent:
             log.warning("stream for %s failed: %s", p["job_id"], e)
         finally:
             await body.aclose()  # cancel_job: stop the engine (llama-server) generating for nobody
+
+    async def remove_model(self, p: dict) -> dict:
+        """The model was removed from the pool: delete the copy this pool sent here, and move any other copy
+        (one in this Mac's models folder, its own uploads when it hosts a pool, one another pool sent) to the
+        Trash only when the pool asked for it and this Mac allows it (--trash-removed); else keep it."""
+        trash = bool(p.get("trash")) and self.cfg.trash_removed
+        try:
+            sent = await asyncio.to_thread(still_ours, self.cfg.download_dir,
+                                           dict(self.downloaded.get(self.cfg.coordinator_url, {})))
+            res = await asyncio.to_thread(remove_model_files, p.get("filename"), self.cfg.models_dir,
+                                          self.cfg.download_dir, trash, sent)
+            log.info("removed %s: %s", p.get("filename"), res)
+            self._forget_downloads(res["deleted"])
+            return res
+        finally:   # report what is on disk now, whatever happened: a stale list would keep the model listed
+            try:
+                await self.sync_models(rescan=True)
+            except httpx.HTTPError as e:
+                log.warning("could not report models after removing %s: %s", p.get("filename"), e)
+                self.write_status()
+
+    # ------------------------------------------------------------ what each pool sent this Mac
+
+    def _remember_download(self, path: Path) -> None:
+        try:
+            st = path.stat()
+        except OSError as e:
+            log.warning("could not record the download of %s: %s", path.name, e)
+            return
+        self.downloaded.setdefault(self.cfg.coordinator_url, {})[path.name] = \
+            {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        self._save_downloads()
+
+    def _forget_downloads(self, names) -> None:
+        """Deleted: no pool may claim a file of that name later (it would be someone else's)."""
+        names = set(names)
+        if not any(names & set(files) for files in self.downloaded.values()):
+            return
+        self.downloaded = {url: {n: rec for n, rec in files.items() if n not in names}
+                           for url, files in self.downloaded.items()}
+        self._save_downloads()
+
+    def _save_downloads(self) -> None:
+        try:
+            save_json(self.downloaded_file, self.downloaded)
+        except OSError as e:   # then this pool can't delete it later, only Trash or keep it: safe
+            log.warning("could not record the downloaded models: %s", e)
 
     def _existing(self, filename: str, size: Optional[int], sha256: Optional[str]) -> Optional[Path]:
         for d in self.cfg.model_dirs:
@@ -468,15 +768,31 @@ class Agent:
                     raise ValueError("sha256 mismatch")
                 os.replace(tmp, dest)
                 found = dest
+                self._remember_download(dest)
             finally:
                 if own is not None:
                     await own.aclose()
                 tmp.unlink(missing_ok=True)
                 self.downloads.pop(name, None)
-        self.gguf_files = await asyncio.to_thread(scan_models, self.cfg.model_dirs)
-        await self._post("/nodes/models", {"files": self.gguf_files})
-        self.write_status()
+        await self.sync_models(rescan=True)
         return {"path": str(found), "sha256": sha or ""}
+
+
+def _listing_key(files: list[dict]) -> list:
+    return [(f["name"], f.get("size")) for f in files]
+
+
+def _load_downloaded(path: Path) -> dict[str, dict[str, dict]]:
+    """``downloaded.json``: coordinator URL -> file name -> {size, mtime_ns} as downloaded. Unreadable: none
+    (then no pool deletes anything here; copies go to the Trash or stay)."""
+    try:
+        data = load_state(str(path))
+    except OSError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {url: {n: rec for n, rec in files.items() if isinstance(rec, dict)}
+            for url, files in data.items() if isinstance(files, dict)}
 
 
 # ------------------------------------------------------------ real-node startup

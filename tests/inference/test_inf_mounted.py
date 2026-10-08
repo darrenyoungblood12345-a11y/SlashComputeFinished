@@ -233,18 +233,28 @@ async def test_public_model_and_pipeline_management_is_admin_only(pool):
     [pipeline_id] = h.svc.mgr.runtimes
 
     async def manage(headers, pipeline="p-missing"):
+        missing = {"model": "missing.gguf"}
         async with httpx.AsyncClient(base_url=h.node_url, headers=headers) as c:
             return [(await c.post("/models/upload", params={"name": "m.txt"}, content=b"")).status_code,
                     (await c.delete("/models/missing.gguf")).status_code,
-                    (await c.post(f"/pipelines/{pipeline}/stop")).status_code]
+                    (await c.post(f"/pipelines/{pipeline}/stop")).status_code,
+                    (await c.post("/models/unload", json=missing)).status_code,
+                    (await c.post("/models/serving", json={**missing, "on": False})).status_code,
+                    (await c.post("/models/remove", json=missing)).status_code]
 
-    allowed = [400, 404, 404]                                           # past auth: bad file name, unknown names
-    assert await manage({}) == ([401] * 3 if public else allowed)
-    assert await manage({"Authorization": "Bearer invalid"}) == ([401] * 3 if public else allowed)
+    allowed = [400, 404, 404, 404, 404, 404]                            # past auth: bad file name, unknown names
+    assert await manage({}) == ([401] * 6 if public else allowed)
+    assert await manage({"Authorization": "Bearer invalid"}) == ([401] * 6 if public else allowed)
     user = {"Authorization": f"Bearer {user_token}"}
-    assert await manage(user) == ([403] * 3 if public else allowed)
+    assert await manage(user) == ([403] * 6 if public else allowed)
     if public:
         assert (await manage(user, pipeline_id))[2] == 403 and pipeline_id in h.svc.mgr.runtimes
+        async with httpx.AsyncClient(base_url=h.node_url, headers=user) as c:
+            for path, body in (("/models/serving", {"model": QWEN, "on": False}), ("/models/unload", {"model": QWEN}),
+                               ("/models/remove", {"model": QWEN})):
+                assert (await c.post(path, json=body)).status_code == 403
+        assert h.svc.mgr.runtimes[pipeline_id].state == "active"
+        assert h.conn.execute("SELECT status FROM models WHERE id=?", (QWEN,)).fetchone()[0] == "ready"
     assert await manage({"Cookie": f"slashcompute_session={admin_token}"}) == allowed   # the web shell's cookie
     stopper = {"Authorization": f"Bearer {admin_token}"} if public else {}
     assert (await manage(stopper, pipeline_id))[2] == 200
