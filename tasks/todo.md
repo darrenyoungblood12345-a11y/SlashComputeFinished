@@ -215,13 +215,34 @@ on the shell served from a scratch home â†’ repeat until a hunt finds nothing â†
 Plan: /Users/darren/.claude/plans/great-this-project-is-cheerful-koala.md. Baseline: 184 passed
 (tests/inference, test_web_inference.py, test_web.py).
 
-- [ ] Coordinator: `disabled`/`removed` statuses, guarded resurrection paths, `_check_model`, `mgr.unload`,
+- [x] Coordinator: `disabled`/`removed` statuses, guarded resurrection paths, `_check_model`, `mgr.unload`,
       `set_serving`, `remove_model`, routes `/models/{unload,serving,remove}`, DELETE = remove without Trash, status fields
-- [ ] Node: `remove_model` command (Trash user copies, delete app copies, all shards, rescan + report),
+- [x] Node: `remove_model` command (Trash user copies, delete app copies, all shards, rescan + report),
       `--trash-removed` gate from the launcher (LAN modes only), start/stop leak fix, skip dotfiles
-- [ ] UI: per-model rows (state tag, Unload / Stop serving / Serve / Remove / Add back / Remove again),
+- [x] UI: per-model rows (state tag, Unload / Stop serving / Serve / Remove / Add back / Remove again),
       stable render keys + in-place patch, confirm, pipeline card, chat select + why box, admin gating
-- [ ] Docs: troubleshooting LLMs tab
-- [ ] Tests: model controls suite, node runtime, auth matrix, DOM harness
-- [ ] Review workflow + fixes; race tests looped; full suite
-- [ ] Scratch pool in the browser; rebuild DMG; install; verify in /Applications/compute.app
+- [x] Docs: troubleshooting LLMs tab
+- [x] Tests: model controls suite, node runtime, auth matrix, DOM harness
+- [x] Review workflow + fixes; race tests looped; full suite
+- [x] Scratch pool in the browser (coordinator :18765, shell :8790, two fake nodes): Unload, Stop serving +
+      refusal + Serve under Send, Remove of an upload (pool + pushed copies deleted), Remove to the real Trash,
+      a file moved away by hand reported in ~2 s, a kept copy, Add back; 760 px layout; no console errors
+- [x] Rebuild DMG (llama.cpp b11160 from the previous bundle); installed to /Applications/compute.app (old
+      bundle backed up in the session scratchpad); installed slashcompute diffs clean against src; the scratch
+      pool run with the installed Python moved a test GGUF to the Trash through PyObjC
+- [ ] With the user: start the real app, Remove the stale Qwen3.8-27B and Llama-3.2-3B, Stop serving / Serve /
+      Unload on Qwen3.5-0.8B
+
+## Review (2026-10-07)
+
+- Commits on `feat/llm-model-controls`: the feature (c8564a9) and the review fixes. Full suite 688 tests:
+  all pass except one timing test in tests/test_transport.py that passes on its own (machine load).
+- Each model in the LLMs tab now has Unload (not sticky), a pool-wide Stop serving / Serve switch (sticky,
+  chats refused with a one-click Serve), and Remove (a tombstone; copies the pool sent are deleted, other
+  copies go to the Trash on LAN pools and stay on public ones; Add back or a re-upload restores it).
+- Two review rounds (15 confirmed findings, then 6) fixed: a foreign pool deleting this Mac's own uploads,
+  case-insensitive APFS name matches, stale offline node rows pinning a removed model, a failed upload
+  delete orphaning the file, stop-before-start leaks, a stuck shutdown when anyio swallowed a cancel, split
+  models reported before all parts arrive. Nodes now rescan their model folders when they change.
+- Not done here: whole-Mac Stop serving still kills the reply in progress (only the toast was fixed; a
+  separate task was suggested); llama.cpp's RPC tensor cache is not cleared by Remove (documented).
