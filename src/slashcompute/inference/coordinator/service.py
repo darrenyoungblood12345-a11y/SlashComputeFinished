@@ -47,6 +47,9 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+\.gguf$")
 DOWNLOAD_TIMEOUT_S = 6 * 3600
 REMOVE_TIMEOUT_S = 120
 DEFAULT_MAX_TOKENS = 256
+# uploads heads may fetch: a removed model's row stays only until its file is deleted, and is never sent again
+DISTRIBUTED = ("SELECT f.* FROM model_files f LEFT JOIN models m ON m.id = f.name "
+               "WHERE m.status IS NOT 'removed'")
 
 
 def completion_limit(body: dict) -> int:
@@ -111,11 +114,22 @@ def _model_field(body: dict) -> str:
 
 def _removal_error(name: str, error: str) -> str:
     """A Mac's failed removal as the LLMs tab shows it (the node's text names files, never folders)."""
-    if "unknown command" in error:   # nodes from before remove_model
-        return f"runs an older /compute: update it, or delete {name} from its models folder by hand"
+    if "unknown command" in error:   # nodes from before remove_model; the pool can't tell which folder has it
+        return (f"runs an older /compute: update it, or delete {name} by hand from its models folder "
+                "or from ~/.slashcompute/models")
     if "timed out" in error:
         return "did not answer in time"
     return re.sub(r"^\w+Error: ", "", error)
+
+
+def _kept_folder(kept: list) -> Optional[str]:
+    """Where a Mac kept its copy: "models" (its own models folder) or "app" (~/.slashcompute/models, a copy
+    this pool did not send there). A node that names files only kept them in its models folder."""
+    folders = {k.get("folder") if isinstance(k, dict) else "models" for k in kept}
+    return next((f for f in ("models", "app") if f in folders), None)
+
+
+_same_mac = status._mac
 
 
 class InferenceService:
@@ -132,9 +146,15 @@ class InferenceService:
         self.online: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
         self.pushing: set[tuple[str, str]] = set()
-        # model -> node id -> {"removing", "error", "kept"} while a Mac removes its copy, or after it failed
-        # or kept it (an entry that finished cleanly is dropped). In memory only: Remove again redoes it.
+        # model -> node id -> {"removing", "error", "kept", "kept_folder"} while a Mac removes its copy, or after
+        # it failed or kept it (an entry that finished cleanly is dropped). In memory only: Remove again redoes it.
         self.removals: dict[str, dict[str, dict]] = {}
+        # removed model -> why its uploaded copy could not be deleted (its model_files row stays until it is).
+        # In memory only: after a restart the row still shows, without the reason.
+        self.upload_errors: dict[str, str] = {}
+        # nodes asked to report their models at their next heartbeat: a Remove forgot what one reported while
+        # it was offline, or it was offline (its command poll can bring it back before its heartbeat does)
+        self.forgotten: set[str] = set()
         self.latency_kick: Optional[asyncio.Event] = None
         if settings.MODELS_DIR:
             Path(settings.MODELS_DIR).expanduser().mkdir(parents=True, exist_ok=True)
@@ -298,7 +318,7 @@ class InferenceService:
         """Send ``download_model`` for every uploaded GGUF to each online head-capable node lacking it."""
         if not self.s.MODELS_DIR:
             return 0
-        files = self.conn.execute("SELECT * FROM model_files").fetchall()
+        files = self.conn.execute(DISTRIBUTED).fetchall()
         rows = self.conn.execute("SELECT * FROM nodes WHERE can_head=1").fetchall()
         sent = 0
         for n in rows:
@@ -371,6 +391,7 @@ class InferenceService:
                               (name, size, digest, time.time()))
             registry.store_layout(self.conn, name, layout, "upload", mflops, size_bytes=size, sha256=digest, **keep)
         self.removals.pop(name, None)
+        self.upload_errors.pop(name, None)
         pushed = self.push_models()
         log.info("uploaded %s (%.2f GB); pushing to %d head(s)", name, size / 1e9, pushed)
         return {"name": name, "size": size, "sha256": digest, "layers": layout.n_layers, "pushed": pushed}
@@ -413,6 +434,8 @@ class InferenceService:
                 self.conn.execute("UPDATE models SET status='ready', status_reason=NULL, updated_at=? WHERE id=?",
                                   (time.time(), name))
             self.removals.pop(name, None)
+            self.upload_errors.pop(name, None)   # an uploaded copy still there is the pool's again...
+            self.push_models()                   # ...and sent to the heads again
             log.info("model %s: serving again", name)
             return {"ok": True, "serving": True, "pipelines": 0}
         if status not in ("ready", "disabled"):
@@ -427,39 +450,67 @@ class InferenceService:
 
     async def remove_model(self, name: str, trash: bool) -> dict:
         """Drop a model from the pool: unload it, delete the uploaded copy and ask every online Mac that
-        has it to delete the app's copy (and, with ``trash``, move one in its own models folder to the Trash).
-        The row stays as a tombstone so node reports don't bring the model back."""
+        has it to delete the copy this pool sent there (and, with ``trash``, move any other copy to its Trash).
+        The row stays as a tombstone so node reports don't bring the model back.
+
+        An offline Mac keeps its copy and the row waits for it. Remove again stops waiting (its report is
+        forgotten), and so does an old row of a Mac that is back under a new node id: when it is back for real
+        it reports its files again and is listed again. The uploaded copy's model_files row stays until its
+        file is deleted, so a failed delete stays listed and Remove again retries it."""
         if not registry.plain_gguf(name):
             raise HTTPException(400, "model must be a .gguf file name")
         row = registry.model_row(self.conn, name)
+        again = row is not None and row["status"] == "removed"
         uploaded = self.conn.execute("SELECT 1 FROM model_files WHERE name=?", (name,)).fetchone() is not None
         holders = [r for r in self.conn.execute("SELECT * FROM nodes ORDER BY created_at").fetchall()
                    if name in json.loads(r["gguf_files_json"] or "[]")]
-        if not ((row is not None and row["status"] != "removed") or uploaded or holders):
+        if not ((row is not None and not again) or uploaded or holders):
             raise HTTPException(404, f"no model {name!r} to remove")
+        online = [r for r in holders if nodes.is_online(r, self.s)]
+        # every Mac online now, holder or not: an old row of one of them is not an offline Mac to wait for
+        back = {_same_mac(r) for r in self.conn.execute("SELECT * FROM nodes").fetchall()
+                if nodes.is_online(r, self.s)}
+        away = [r for r in holders if not nodes.is_online(r, self.s)]
+        forget = [r for r in away if again or _same_mac(r) in back]
         now = time.time()
-        with tx(self.conn):
+        with tx(self.conn):   # the status first: pushes and downloads of a removed model stop at once
             self.conn.execute("INSERT OR IGNORE INTO models (id, created_at) VALUES (?, ?)", (name, now))
             self.conn.execute("UPDATE models SET status='removed', status_reason=?, updated_at=? WHERE id=?",
                               ("removed in the LLMs tab", now, name))
-            self.conn.execute("DELETE FROM model_files WHERE name=?", (name,))  # stops pushes and downloads
-        if uploaded and self.s.MODELS_DIR:
+            for r in forget:
+                files = [f for f in json.loads(r["gguf_files_json"] or "[]") if f != name]
+                self.conn.execute("UPDATE nodes SET gguf_files_json=? WHERE id=?", (json.dumps(files), r["id"]))
+        self.forgotten.update(r["id"] for r in forget)
+        upload_error = self._delete_upload(name) if uploaded else None
+        await self.mgr.unload(name, "removed from the app")
+        for r in online:
+            entry = {"removing": True, "error": None, "kept": False, "kept_folder": None}
+            self.removals.setdefault(name, {})[r["id"]] = entry
+            self.spawn(self._remove_on(r["id"], name, trash, entry))
+        macs = [r["name"] for r in online]
+        # each offline Mac once, and not one that is online under its new node id
+        offline = list({_same_mac(r): r["name"] for r in away if _same_mac(r) not in back}.values())
+        log.info("model %s removed (uploaded copy: %s); asking %s; no longer waiting for %d offline report(s)",
+                 name, uploaded, macs or "no Mac", len(forget))
+        return {"ok": True, "model": name, "macs": macs, "offline": offline, "uploaded": uploaded,
+                "upload_error": upload_error}
+
+    def _delete_upload(self, name: str) -> Optional[str]:
+        """Delete the copy uploaded to the pool, then its model_files row. None when it is gone; else why not
+        (the reason only): the row then stays, so the model stays listed and Remove again tries again. Only
+        a name with a row is ever deleted here, never another file that happens to have that name."""
+        if self.s.MODELS_DIR:
             try:
                 (Path(self.s.MODELS_DIR).expanduser() / name).unlink(missing_ok=True)
             except OSError as e:
-                log.warning("could not delete the uploaded %s: %s", name, e.strerror or e)
-        await self.mgr.unload(name, "removed from the app")
-        macs, offline = [], []
-        for r in holders:
-            if not nodes.is_online(r, self.s):
-                offline.append(r["name"])
-                continue
-            macs.append(r["name"])
-            entry = {"removing": True, "error": None, "kept": False}
-            self.removals.setdefault(name, {})[r["id"]] = entry
-            self.spawn(self._remove_on(r["id"], name, trash, entry))
-        log.info("model %s removed (uploaded copy: %s); asking %s", name, uploaded, macs or "no Mac")
-        return {"ok": True, "model": name, "macs": macs, "offline": offline, "uploaded": uploaded}
+                reason = e.strerror or type(e).__name__
+                self.upload_errors[name] = reason
+                log.warning("could not delete the uploaded %s: %s", name, reason)
+                return reason
+        with tx(self.conn):
+            self.conn.execute("DELETE FROM model_files WHERE name=?", (name,))
+        self.upload_errors.pop(name, None)
+        return None
 
     async def _remove_on(self, node_id: str, name: str, trash: bool, entry: dict) -> None:
         try:
@@ -468,7 +519,8 @@ class InferenceService:
             log.warning("removing %s on %s failed: %s", name, node_id, e)
             entry.update(removing=False, error=_removal_error(name, str(e)))
             return
-        entry.update(removing=False, kept=bool(res.get("kept")))
+        kept = (res or {}).get("kept") or []
+        entry.update(removing=False, kept=bool(kept), kept_folder=_kept_folder(kept))
         per_node = self.removals.get(name, {})
         if not entry["kept"] and per_node.get(node_id) is entry:   # done: nothing left to show for this Mac
             del per_node[node_id]
@@ -515,7 +567,7 @@ def make_router(svc: InferenceService) -> APIRouter:
 
     @r.get("/status")
     async def status_view():
-        return status.snapshot(conn, s, svc.removals)
+        return status.snapshot(conn, s, svc.removals, svc.upload_errors)
 
     # ------------------------------------------------------------ nodes
 
@@ -562,6 +614,7 @@ def make_router(svc: InferenceService) -> APIRouter:
         if body.get("coordinator_rtt_ms") is not None:
             svc.store_rtt(node_id, body["coordinator_rtt_ms"])
         svc.online.add(node_id)
+        svc.forgotten.discard(node_id)   # it just reported its files
         svc.kick_latency()
         if fields["can_head"]:
             svc.push_models(node_id)
@@ -588,7 +641,12 @@ def make_router(svc: InferenceService) -> APIRouter:
             await mgr.drain_node(row["id"], reason)
         if available and not row["available"] and row["can_head"]:
             svc.push_models(row["id"])
-        return {"ok": True, "transport": s.TRANSPORT}
+        # back from offline (``row`` is from before this beat), or a Remove forgot what it had reported: ask
+        # for a fresh list of its models. The first also covers a restart of this coordinator (``forgotten``
+        # is in memory), since a Mac whose report was forgotten was offline then.
+        report = row["id"] in svc.forgotten or not nodes.is_online(row, s)
+        svc.forgotten.discard(row["id"])
+        return {"ok": True, "transport": s.TRANSPORT, "report_models": report}
 
     @r.post("/nodes/commitment")
     async def commitment(body: dict, request: Request):
@@ -619,6 +677,7 @@ def make_router(svc: InferenceService) -> APIRouter:
         files = body.get("files", [])
         conn.execute("UPDATE nodes SET gguf_files_json=? WHERE id=?",
                      (json.dumps(sorted({f["name"] for f in files})), row["id"]))
+        svc.forgotten.discard(row["id"])
         svc.accept_headers(row["id"], files)
         return {"ok": True}
 
@@ -635,6 +694,8 @@ def make_router(svc: InferenceService) -> APIRouter:
     @r.get("/agent/commands")
     async def agent_commands(request: Request, wait: float = 25.0):
         row = svc.node_from(request)
+        if not nodes.is_online(row, s):   # back before its heartbeat: that heartbeat would see it online
+            svc.forgotten.add(row["id"])
         conn.execute("UPDATE nodes SET last_heartbeat=? WHERE id=?", (time.time(), row["id"]))
         commands = await bus.poll(row["id"], min(wait, s.COMMAND_LONG_POLL_SECONDS))
         if not commands and bus.closing.is_set():  # an empty 200 would have agents re-poll in a hot loop
@@ -676,7 +737,7 @@ def make_router(svc: InferenceService) -> APIRouter:
     async def model_file(name: str, request: Request):
         svc.node_from(request)
         root = svc.models_dir()
-        row = conn.execute("SELECT name FROM model_files WHERE name=?", (name,)).fetchone()
+        row = conn.execute(f"{DISTRIBUTED} AND f.name=?", (name,)).fetchone()   # never a removed one
         if row is None or not (root / name).is_file():
             raise HTTPException(404, "no such uploaded model")
         return FileResponse(root / name, media_type="application/octet-stream")

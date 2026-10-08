@@ -1075,8 +1075,10 @@ function renderWhy(why) {
   setText("#l-why-text", why.text);
   const btn = $("#l-why-act");
   const a = why.action;
-  // withBusy owns the button's label meanwhile: this Mac's Start serving, or a model's Serve.
-  if (state.busy.has("llm") || (btn.dataset.model && state.busy.has(llmKey(btn.dataset.model)))) return;
+  // withBusy owns the button while an action pressed here runs ("Starting…"). It disables the button it
+  // drives and nothing else does, so that is the test. A busy key can't tell: the Models list and the
+  // Pipeline card share a model's key, and the box may have moved on to another model meanwhile.
+  if (btn.disabled) return;
   btn.hidden = !a;
   if (!a) return;
   btn.textContent = a.label;
@@ -1188,7 +1190,10 @@ function llmRow(m, manage) {
     : removed ? (inFlight ? "removing" : "removed")
     : m.status === "disabled" ? "not served"
     : m.status === "ready" && m.load ? m.load : "";
-  const tone = m.status === "rejected" || (removed && held.some((h) => h.error)) ? "is-waiting" : m.servable ? "is-active" : "";
+  // A removed model is still "uploaded" only while the coordinator could not delete the pool's copy.
+  const stuck = removed && m.uploaded;
+  const tone = m.status === "rejected" || (removed && (held.some((h) => h.error) || m.upload_error)) ? "is-waiting"
+    : m.servable ? "is-active" : "";
 
   const acts = [];
   const act = (a, label, cls, more = {}) => acts.push({ act: a, label, cls, ...more });
@@ -1205,7 +1210,7 @@ function llmRow(m, manage) {
       act("llm-remove", "Remove", "danger", { title: "Unloads it and deletes its copies across the pool. Asks first." });
     } else if (!inFlight) {
       if (m.restorable) act("llm-serving", "Add back", "ghost", { on: "1", title: "Lists it again, for the Macs that still have it." });
-      if (held.length) act("llm-remove", "Remove again", "danger");
+      if (held.length || stuck) act("llm-remove", "Remove again", "danger");
     }
   }
 
@@ -1221,15 +1226,29 @@ function llmRow(m, manage) {
   if (m.load === "unloading") notes.push(["Unloading: the reply in progress finishes first.", "info"]);
   if (removed) {
     const again = manage ? " Press Remove again once it is back." : "";
+    const retry = manage ? " Press Remove again." : "";
+    // The reason is unknown after the coordinator restarts: it only knows the file is still there.
+    if (stuck) {
+      notes.push(m.upload_error ? [`The pool's uploaded copy could not be deleted: ${m.upload_error}.${retry}`, ""]
+        : [`The pool's uploaded copy is still there.${retry}`, "info"]);
+    }
     held.forEach((h) => {
       if (h.removing) notes.push([`Removing from ${h.name}…`, "info"]);
       else if (h.error) notes.push([`${h.name}: ${h.error}`, ""]);
+      else if (h.superseded) notes.push([`An old record of ${h.name} still lists a copy.${retry}`, "info"]);
       else if (!h.online) notes.push([`${h.name} is offline and keeps its copy.${again}`, "info"]);
-      else if (h.kept) notes.push([`Kept in ${h.name}'s own models folder: delete it there by hand if you want it gone.`, "info"]);
-      else notes.push([`Still on ${h.name}.${manage ? " Press Remove again." : ""}`, "info"]);
+      else if (h.kept) notes.push([`${keptWhere(h)} Delete it there by hand if you want it gone.`, "info"]);
+      else notes.push([`Still on ${h.name}.${retry}`, "info"]);
     });
   }
   return { tag, tone, acts, meta, notes };
+}
+
+// Where a Mac kept its copy of a removed model. An older node does not say which folder.
+function keptWhere(h) {
+  if (h.kept_folder === "models") return `Kept in ${h.name}'s own models folder.`;
+  if (h.kept_folder === "app") return `Kept in ${h.name}'s app folder (~/.slashcompute/models): this pool has no record of sending that copy.`;
+  return `Kept on ${h.name}.`;
 }
 
 function modelCard(m, v) {
@@ -1289,24 +1308,32 @@ function pipeUnload(pipe) {
 // What Remove is about to do, asked before anything happens.
 function removeQuestion(m, publicPool = (state.settings || {}).mode === "public") {
   const held = m.held_by || [];
-  const online = held.filter((h) => h.online).map((h) => h.name);
-  const offline = held.filter((h) => !h.online).map((h) => h.name);
+  const names = (hs) => [...new Set(hs.map((h) => h.name))];
+  const online = names(held.filter((h) => h.online));
+  // A Mac that came back under a new id still has its old, offline row (the pool matches name, chip and
+  // memory): it is online, not offline too. Two Macs that only share a name are both named.
+  const offline = names(held.filter((h) => !h.online && !h.superseded));
+  // A download already under way still finishes (the pool stops only new ones), and that Mac keeps it.
+  const copying = Object.keys(m.downloading || {});
   const lines = [`Remove ${m.id} from this pool?`, "",
     "It is unloaded now on every Mac; a reply in progress finishes first."];
-  if (m.uploaded) lines.push("The copy uploaded to the pool is deleted.");
+  if (m.uploaded) lines.push("The pool's uploaded copy is deleted.");
   if (online.length) {
-    lines.push(publicPool
-      ? `On ${online.join(", ")}: the app's copy is deleted. A copy in a Mac's own models folder stays: a public pool never moves files to the Trash.`
-      : `On ${online.join(", ")}: the app's copy is deleted, and a copy in the Mac's own models folder goes to its Trash.`);
+    // A Mac deletes only the copies this pool sent it; any other copy is the Mac owner's file.
+    lines.push(`On ${online.join(", ")}: copies this pool sent are deleted. Any other copy (in a Mac's own models folder, say) `
+      + (publicPool ? "stays where it is: a public pool never moves files to the Trash." : "goes to that Mac's Trash."));
   }
   if (offline.length) lines.push(`Macs that are offline keep their copy for now: ${offline.join(", ")}. Press Remove again once they are back.`);
-  if (!held.length) lines.push("No Mac has a copy.");
+  if (copying.length) lines.push(`Macs still downloading it keep the copy they finish: ${copying.join(", ")}. Press Remove again once they are done.`);
+  if (!held.length && !copying.length) lines.push("No Mac has a copy.");
   lines.push("", "It stays out of the pool until it is added back or uploaded again.");
   return lines.join("\n");
 }
 
+// What Remove did, for its toast. upload_error is only the reason the pool's uploaded copy is still there.
 function removedNote(r) {
   const parts = [`Removed ${r.model}.`];
+  if (r.upload_error) parts.push(`The pool's uploaded copy could not be deleted: ${r.upload_error}.`);
   if ((r.macs || []).length) parts.push(`Deleting its copies on ${r.macs.join(", ")}.`);
   if ((r.offline || []).length) parts.push(`Offline, still holding it: ${r.offline.join(", ")}.`);
   return parts.join(" ");
@@ -1625,8 +1652,8 @@ const actions = {
     if (state.busy.has(llmKey(id))) return;
     if (!window.confirm(removeQuestion(llmModel(id) || { id }))) return;
     return withBusy(llmKey(id), btn, "Removing…", async () => {
-      const r = await post("/api/coord/inference/models/remove", { model: id });
-      toast(removedNote({ model: id, ...r }));
+      const r = { model: id, ...(await post("/api/coord/inference/models/remove", { model: id })) };
+      toast(removedNote(r), r.upload_error ? "bad" : "ok");
       await loadLlm();
     });
   },

@@ -186,6 +186,7 @@ class PipelineManager:
     async def _create(self, model_id: str, ctx: int, exclude=()) -> Runtime:
         p = self.plan_for(model_id, ctx, exclude)
         deadline = time.time() + self.s.PIPELINE_FORM_TIMEOUT_SECONDS
+        waiting_for = None   # logged once per change, not on every one-second pass
         while isinstance(p, NoPlan):
             self._check_model(model_id)  # Stop serving / Remove while waiting: refuse now, not at the deadline
             draining = [r for r in self.live() if r.state == "draining"]
@@ -199,8 +200,10 @@ class PipelineManager:
                 # form (e.g. planned with a node that just dropped): wait for one to settle, then re-plan
                 waits = [asyncio.ensure_future(r.done.wait()) for r in draining]
                 waits += [asyncio.ensure_future(r.ready.wait()) for r in forming]
-                log.info("waiting for %d draining / %d forming pipeline(s) before planning %s",
-                         len(draining), len(forming), model_id)
+                if waiting_for != (now_waiting := ({r.id for r in draining}, {r.id for r in forming})):
+                    waiting_for = now_waiting
+                    log.info("waiting for %d draining / %d forming pipeline(s) before planning %s",
+                             len(draining), len(forming), model_id)
                 try:  # at most a second: the model may be stopped meanwhile
                     await asyncio.wait(waits, timeout=max(0.1, min(1.0, deadline - time.time())),
                                        return_when=asyncio.FIRST_COMPLETED)

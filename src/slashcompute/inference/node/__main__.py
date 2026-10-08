@@ -100,7 +100,7 @@ def build_config(url: str, home: Path, name: Optional[str], models_dir: str, mem
 
 async def run_node(cfg: NodeConfig, home: Path, fake: bool = False) -> None:
     from slashcompute.inference.node import hardware, latency
-    from slashcompute.inference.node.agent import Agent, load_state, save_state, scan_models
+    from slashcompute.inference.node.agent import Agent, load_state, model_folders, save_state, scan_models
 
     log = setup_logging("slashcompute.inference.node")
     shutdown = asyncio.Event()
@@ -129,10 +129,11 @@ async def run_node(cfg: NodeConfig, home: Path, fake: bool = False) -> None:
                                    device=cfg.commitment.device or None, basket_model=cfg.basket_model,
                                    basket_ref=(cfg.basket_ref_prompt_tps, cfg.basket_ref_gen_tps))
         engine.pid_file = pids
+    folders = model_folders(cfg.model_dirs)   # before the scan: a file added meanwhile is picked up after it
     files = scan_models(cfg.model_dirs)
     state = load_state(cfg.state_file)
     agent = Agent(cfg, engine, info=info, build=build, ip=cfg.ip, gguf_files=files, latency_fn=latency.measure,
-                  state=state, probe_fn=latency.serve_probe)
+                  state=state, probe_fn=latency.serve_probe, folders=folders)
     if not await connect(agent, shutdown, log):
         return
     engine.node_id = agent.node_id
@@ -180,8 +181,9 @@ def start(
                                                   help="Shared secret if the coordinator requires one"),
     localhost: bool = typer.Option(False, help="Advertise 127.0.0.1 (same-machine cluster)"),
     trash_removed: bool = typer.Option(False, "--trash-removed/--keep-removed",
-                                       help="When the pool removes a model, move its copy in --models-dir to the "
-                                            "Trash (the app's own downloads are always deleted)"),
+                                       help="When the pool removes a model, move a copy it did not send here (one "
+                                            "in --models-dir, for example) to the Trash; the copies it sent are "
+                                            "always deleted"),
     fake: bool = typer.Option(False, hidden=True, help="Simulated engine (demos and tests)"),
 ):
     """Join the pool's LLM network. Runs in the foreground; SIGTERM leaves gracefully."""

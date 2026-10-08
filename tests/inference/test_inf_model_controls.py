@@ -2,6 +2,7 @@
 
 import asyncio
 import errno
+import json
 import os
 import threading
 import time
@@ -15,8 +16,9 @@ from inf_harness import FakeNode, chat, fast_settings, start_harness, upload, wa
 from slashcompute.inference.coordinator import nodes
 from slashcompute.inference.coordinator.layers import synthetic_layout
 from slashcompute.inference.coordinator.pipelines import serve
+from slashcompute.inference.coordinator.service import _removal_error
 from slashcompute.inference.node import agent as agent_mod
-from slashcompute.inference.node.agent import scan_models
+from slashcompute.inference.node.agent import Agent, scan_models
 from slashcompute.inference.node.fake_engine import FakeEngine
 
 GB = 10 ** 9
@@ -77,6 +79,14 @@ def reported_files(h, name: str) -> str:
     return h.conn.execute("SELECT gguf_files_json FROM nodes WHERE id=?", (h.ids[name],)).fetchone()[0]
 
 
+def files_of(h, node_id: str) -> str:
+    return h.conn.execute("SELECT gguf_files_json FROM nodes WHERE id=?", (node_id,)).fetchone()[0]
+
+
+def online(h, node_id: str) -> bool:
+    return nodes.is_online(h.conn.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone(), h.settings)
+
+
 def pipeline_states(h) -> list[str]:
     return [r["state"] for r in h.conn.execute("SELECT state FROM pipelines ORDER BY created_at")]
 
@@ -106,6 +116,43 @@ async def holding(h, name: str, index: int, where: str = "models", **cfg):
     d.mkdir(parents=True, exist_ok=True)
     (d / TINY).write_bytes(tiny_gguf())
     return await h.add_node(FakeNode(name, 16, may_be_head=True), index, gguf_files=scan_models([str(d)]), **cfg)
+
+
+async def asleep(h, agent: Agent) -> None:
+    """The Mac sleeps: its node sends nothing (no heartbeat, no command poll) until it wakes."""
+    await agent.cancel_tasks()
+    await wait_for(lambda: not online(h, agent.node_id))
+
+
+async def restarted(h, old: Agent) -> Agent:
+    """The same Mac's node process started again: same folders and identity, nothing else kept in memory."""
+    await old.stop()
+    await old.client.aclose()
+    # the old process's long poll still waits on the coordinator until it times out: a command it took is lost
+    await asyncio.sleep(h.settings.COMMAND_LONG_POLL_SECONDS + 0.2)
+    engine = FakeEngine(old.cfg.name, h.cluster, ip=old.ip)
+    new = Agent(old.cfg, engine, info=old.info, build=old.build, ip=old.ip, gguf_files=scan_models(old.cfg.model_dirs),
+                latency_fn=old.latency_fn, client=httpx.AsyncClient(base_url=h.node_url, timeout=30),
+                state=dict(old.state), busy_fn=lambda: False)
+    await new.register()
+    engine.node_id = new.node_id
+    await new.start()
+    h.agents[old.cfg.name] = new
+    return new
+
+
+def stuck(monkeypatch, path: Path) -> list:
+    """Deleting ``path`` fails (a locked file, a changed folder permission) until the list is cleared."""
+    real = Path.unlink
+    on = [True]
+
+    def unlink(self, missing_ok=False):
+        if on and self == path:
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        return real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    return on
 
 
 @pytest.fixture
@@ -302,7 +349,8 @@ async def test_remove_clears_every_copy(cluster, trash):
     assert (await chat(h, TINY)).status_code == 200
     r = await post(h, "/models/remove", {"model": TINY})
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "model": TINY, "macs": ["A", "B"], "offline": [], "uploaded": True}
+    assert r.json() == {"ok": True, "model": TINY, "macs": ["A", "B"], "offline": [], "uploaded": True,
+                        "upload_error": None}
     assert model_status(h, TINY) == "removed"
     await wait_for(lambda: not h.svc.removals)
     assert not (Path(h.settings.MODELS_DIR) / TINY).exists()
@@ -356,7 +404,8 @@ async def test_a_removed_model_stays_gone_until_added_back_or_uploaded_again(clu
     await keeper._post("/nodes/models", {"files": scan_models(keeper.cfg.model_dirs)})
     m = await model(h, TINY)
     assert m["status"] == "removed" and m["restorable"] and not m["servable"]
-    assert m["held_by"] == [{"name": "keeper", "online": True, "removing": False, "error": None, "kept": True}]
+    assert m["held_by"] == [{"name": "keeper", "online": True, "removing": False, "error": None, "kept": True,
+                             "kept_folder": "models", "superseded": False}]
     assert await listed(h) == []
     r = await chat(h, TINY)
     assert r.status_code == 404 and "removed" in r.json()["detail"]
@@ -425,7 +474,9 @@ async def test_a_layer_table_reported_for_a_removed_model_is_kept_but_the_model_
 
 async def test_failed_removals_are_shown_per_mac_and_remove_again_clears_them(cluster, monkeypatch, tmp_path):
     h = cluster
-    old = await holding(h, "old", 0, where="downloads")
+    old = await h.add_node(FakeNode("old", 16, may_be_head=True), 0, gguf_files=[])
+    assert (await upload(h, TINY, tiny_gguf())).status_code == 200            # pushed to old's downloads
+    await wait_for(lambda: TINY in reported_files(h, "old"))
     real = old.dispatch
     updated = False
 
@@ -442,11 +493,12 @@ async def test_failed_removals_are_shown_per_mac_and_remove_again_clears_them(cl
 
     monkeypatch.setattr(agent_mod, "move_to_trash", locked)
     r = await post(h, "/models/remove", {"model": TINY})
-    assert r.json()["macs"] == ["old", "B"]
+    assert r.json()["macs"] == ["old", "B"] and r.json()["uploaded"] is True
     await wait_for(lambda: not h.svc.removing(TINY))
     m = await model(h, TINY)
     held = {x["name"]: x for x in m["held_by"]}
-    assert held["old"]["error"].startswith("runs an older /compute") and TINY in held["old"]["error"]
+    assert held["old"]["error"] == (f"runs an older /compute: update it, or delete {TINY} by hand from its "
+                                    "models folder or from ~/.slashcompute/models")   # it can't tell which
     assert held["B"]["error"] == f"{TINY}: Permission denied: {TINY}"            # names, never folders
     assert str(tmp_path) not in str(await status(h))
     assert (node_dir(h, "old", "downloads") / TINY).exists() and (node_dir(h, "B") / TINY).exists()
@@ -471,13 +523,17 @@ async def test_a_mac_that_keeps_removed_models_and_an_offline_one_are_listed(clu
     await wait_for(lambda: not nodes.is_online(
         h.conn.execute("SELECT * FROM nodes WHERE id=?", (h.ids["away"],)).fetchone(), h.settings))
     r = await post(h, "/models/remove", {"model": TINY})
-    assert r.json() == {"ok": True, "model": TINY, "macs": ["keeper"], "offline": ["away"], "uploaded": False}
+    assert r.json() == {"ok": True, "model": TINY, "macs": ["keeper"], "offline": ["away"], "uploaded": False,
+                        "upload_error": None}
     await wait_for(lambda: not h.svc.removing(TINY))
     assert (node_dir(h, "keeper") / TINY).exists() and not any(trash.iterdir())
     m = await model(h, TINY)
     assert m["status"] == "removed"
-    assert m["held_by"] == [{"name": "keeper", "online": True, "removing": False, "error": None, "kept": True},
-                            {"name": "away", "online": False, "removing": False, "error": None, "kept": False}]
+    assert m["held_by"] == [
+        {"name": "keeper", "online": True, "removing": False, "error": None, "kept": True, "kept_folder": "models",
+         "superseded": False},
+        {"name": "away", "online": False, "removing": False, "error": None, "kept": False, "kept_folder": None,
+         "superseded": False}]
 
 
 async def test_the_older_uis_delete_never_moves_files_to_the_trash(cluster, trash):
@@ -503,3 +559,266 @@ async def test_bad_requests(two_node):
     for name in ("../x.gguf", ".x.gguf", "x.txt"):
         assert (await post(h, "/models/remove", {"model": name})).status_code == 400
     assert model_status(h, QWEN) == "ready"
+
+
+async def test_remove_deletes_only_the_copies_this_pool_sent(cluster, trash):
+    h = cluster
+    a = await h.add_node(FakeNode("A", 16, may_be_head=True), 0, gguf_files=[])
+    assert (await upload(h, TINY, tiny_gguf())).status_code == 200            # this pool sends it to A
+    await wait_for(lambda: TINY in reported_files(h, "A"))
+    record = Path(a.cfg.state_file).with_name("downloaded.json")
+    assert list(json.loads(record.read_text())[a.cfg.coordinator_url]) == [TINY]
+    a = await restarted(h, a)                                                 # the record outlives the process
+    # copies the pool did not send: an older push, this Mac's own upload when it hosts, another pool's push
+    await holding(h, "B", 1, where="downloads", trash_removed=True)          # a LAN pool's Mac
+    await holding(h, "C", 2, where="downloads")                              # a public pool's Mac
+    r = await post(h, "/models/remove", {"model": TINY})
+    assert r.json()["macs"] == ["A", "B", "C"]
+    await wait_for(lambda: not h.svc.removing(TINY))
+    assert not (node_dir(h, "A", "downloads") / TINY).exists()                 # deleted...
+    assert [p.name for p in trash.iterdir()] == [TINY]                        # ...only B's went to the Trash
+    assert not (node_dir(h, "B", "downloads") / TINY).exists() and (node_dir(h, "C", "downloads") / TINY).exists()
+    assert json.loads(record.read_text()) == {a.cfg.coordinator_url: {}}     # gone: no longer this pool's
+    m = await model(h, TINY)
+    assert m["held_by"] == [{"name": "C", "online": True, "removing": False, "error": None, "kept": True,
+                             "kept_folder": "app", "superseded": False}]
+
+
+async def test_an_uploaded_copy_that_could_not_be_deleted_stays_listed_until_remove_again_deletes_it(
+        cluster, monkeypatch):
+    h = cluster
+    assert (await upload(h, TINY, tiny_gguf())).status_code == 200
+    up = Path(h.settings.MODELS_DIR) / TINY
+    locked = stuck(monkeypatch, up)
+    r = await post(h, "/models/remove", {"model": TINY})
+    assert r.json() == {"ok": True, "model": TINY, "macs": [], "offline": [], "uploaded": True,
+                        "upload_error": "Operation not permitted"}                # the reason, nothing else
+    assert up.exists()
+    m = await model(h, TINY)
+    assert m["status"] == "removed" and m["uploaded"] and m["upload_error"] == "Operation not permitted"
+    assert m["held_by"] == [] and not m["servable"]
+    # it is not sent to a head that joins now, and no node can fetch it any more
+    late = await h.add_node(FakeNode("late", 16, may_be_head=True), 0, gguf_files=[])
+    assert h.svc.push_models() == 0 and not h.svc.pushing
+    async with httpx.AsyncClient(base_url=h.node_url, headers=late.headers) as c:
+        assert (await c.get(f"/models/files/{TINY}")).status_code == 404
+    h.svc.upload_errors.clear()                                               # the pool restarted: reason unknown
+    m = await model(h, TINY)
+    assert m["uploaded"] and m["upload_error"] is None
+    r = await post(h, "/models/remove", {"model": TINY})                      # Remove again tries again...
+    assert r.json()["uploaded"] is True and r.json()["upload_error"] == "Operation not permitted"
+    locked.clear()
+    r = await post(h, "/models/remove", {"model": TINY})                      # ...and deletes it once it can
+    assert r.json()["uploaded"] is True and r.json()["upload_error"] is None
+    assert not up.exists() and await model(h, TINY) is None
+    assert h.conn.execute("SELECT COUNT(*) FROM model_files").fetchone()[0] == 0
+    assert (await post(h, "/models/remove", {"model": TINY})).status_code == 404
+    assert not (Path(late.cfg.download_dir) / TINY).exists()
+
+
+async def test_a_stuck_upload_comes_back_with_its_model(cluster, monkeypatch):
+    h = cluster
+    assert (await upload(h, TINY, tiny_gguf())).status_code == 200
+    locked = stuck(monkeypatch, Path(h.settings.MODELS_DIR) / TINY)
+    assert (await post(h, "/models/remove", {"model": TINY})).json()["upload_error"] == "Operation not permitted"
+    locked.clear()
+    await h.add_node(FakeNode("late", 16, may_be_head=True), 0, gguf_files=[])
+    assert (await post(h, "/models/serving", {"model": TINY, "on": True})).json()["serving"] is True   # Add back
+    m = await model(h, TINY)
+    assert m["status"] == "ready" and m["uploaded"] and m["upload_error"] is None
+    await wait_for(lambda: TINY in reported_files(h, "late"))                  # sent to the heads again
+    assert (await chat(h, TINY)).status_code == 200
+    locked.append(True)
+    assert (await post(h, "/models/remove", {"model": TINY})).json()["upload_error"] == "Operation not permitted"
+    locked.clear()
+    await wait_for(lambda: not h.svc.removing(TINY))
+    assert (await upload(h, TINY, tiny_gguf())).status_code == 200            # uploading it again works too
+    m = await model(h, TINY)
+    assert m["status"] == "ready" and m["upload_error"] is None
+
+
+async def test_remove_again_never_deletes_a_file_of_that_name_the_pool_did_not_upload(cluster):
+    h = cluster
+    await holding(h, "keeper", 0)                                             # keeps its copy: stays listed
+    assert (await post(h, "/models/remove", {"model": TINY})).json()["uploaded"] is False
+    await wait_for(lambda: not h.svc.removing(TINY))
+    # the host's own node keeps another pool's push there, or the user pointed a models folder at it
+    stray = Path(h.settings.MODELS_DIR) / TINY
+    stray.write_bytes(b"GGUF not this pool's")
+    assert (await post(h, "/models/remove", {"model": TINY})).json()["uploaded"] is False
+    async with httpx.AsyncClient(base_url=h.node_url) as c:
+        assert (await c.delete(f"/models/{TINY}")).json()["uploaded"] is False   # the older UI's Remove
+    await wait_for(lambda: not h.svc.removing(TINY))
+    assert stray.read_bytes() == b"GGUF not this pool's"
+
+
+async def test_remove_again_stops_waiting_for_an_offline_mac_and_lists_it_again_once_back(cluster):
+    h = cluster
+    away = await holding(h, "away", 0)                                        # keeps its copy
+    await asleep(h, away)
+    r = await post(h, "/models/remove", {"model": TINY})
+    assert r.json()["macs"] == [] and r.json()["offline"] == ["away"]
+    assert [x["online"] for x in (await model(h, TINY))["held_by"]] == [False]   # waiting for it
+    r = await post(h, "/models/remove", {"model": TINY})                      # Remove again: stop waiting
+    assert r.status_code == 200 and r.json()["offline"] == ["away"]
+    assert reported_files(h, "away") == "[]" and await model(h, TINY) is None
+    assert (await post(h, "/models/remove", {"model": TINY})).status_code == 404
+    # the pool restarts (forgetting whom it forgot), then the Mac wakes and its command poll gets in first
+    h.svc.forgotten.clear()
+    away._spawn(away.command_loop())
+    await wait_for(lambda: online(h, away.node_id))
+    away._spawn(away.heartbeat_loop())
+    away._spawn(away.models_loop())
+    await wait_for(lambda: TINY in reported_files(h, "away"))                 # it still has it: listed again
+    m = await model(h, TINY)
+    assert m["status"] == "removed" and await listed(h) == []
+    assert m["held_by"] == [{"name": "away", "online": True, "removing": False, "error": None, "kept": False,
+                             "kept_folder": None, "superseded": False}]
+
+
+async def test_a_mac_back_from_offline_is_asked_for_its_models(cluster):
+    h = cluster
+    mac = await holding(h, "mac", 0)
+    await mac.heartbeat()
+    assert mac.report_due is False                                            # online all along: not asked
+    await asleep(h, mac)
+    await mac.heartbeat()                                                     # its first beat back
+    assert mac.report_due is True
+    await mac.sync_models()
+    assert mac.report_due is False
+
+
+async def test_an_old_row_of_a_mac_back_under_a_new_id_is_not_waited_for(cluster, trash):
+    h = cluster
+    first = await holding(h, "mac", 0, trash_removed=True)
+    old_id = first.node_id
+    await asleep(h, first)
+    await first.stop()
+    await first.client.aclose()
+    await holding(h, "mac", 0, trash_removed=True)                            # its node state was lost: a new id
+    assert h.conn.execute("SELECT COUNT(*) FROM nodes WHERE name='mac'").fetchone()[0] == 2
+    r = await post(h, "/models/remove", {"model": TINY})
+    assert r.json()["macs"] == ["mac"] and r.json()["offline"] == []          # one Mac, named once
+    await wait_for(lambda: not h.svc.removing(TINY))
+    assert files_of(h, old_id) == "[]" and [p.name for p in trash.iterdir()] == [TINY]
+    assert await model(h, TINY) is None
+
+
+async def test_an_old_row_of_a_mac_back_without_the_file_is_not_waited_for(cluster):
+    h = cluster
+    first = await holding(h, "mac", 0)
+    old_id = first.node_id
+    await asleep(h, first)
+    await first.stop()
+    await first.client.aclose()
+    (node_dir(h, "mac") / TINY).unlink()                                       # deleted by hand meanwhile
+    await h.add_node(FakeNode("mac", 16, may_be_head=True), 0, gguf_files=[])   # back, under a new id
+    held = (await model(h, TINY))["held_by"]
+    assert [(x["name"], x["online"], x["superseded"]) for x in held] == [("mac", False, True)]
+    r = await post(h, "/models/remove", {"model": TINY})
+    assert r.json()["macs"] == [] and r.json()["offline"] == []                # it is online: not waited for
+    assert files_of(h, old_id) == "[]" and await model(h, TINY) is None
+
+
+async def test_an_offline_mac_with_an_old_row_too_is_named_once(cluster):
+    h = cluster
+    first = await holding(h, "mac", 0)
+    await asleep(h, first)
+    await first.stop()
+    await first.client.aclose()
+    await asleep(h, await holding(h, "mac", 0))                               # back under a new id, then asleep
+    r = await post(h, "/models/remove", {"model": TINY})
+    assert r.json()["macs"] == [] and r.json()["offline"] == ["mac"]
+
+
+async def test_two_macs_with_one_name_are_not_taken_for_one(cluster, trash):
+    h = cluster
+    other = await holding(h, "MacBook Pro", 0)
+    other_id = other.node_id
+    await asleep(h, other)
+    await other.stop()
+    await other.client.aclose()
+    h.conn.execute("UPDATE nodes SET chip='Apple M1', total_mem_bytes=? WHERE id=?", (16 * 2 ** 30, other_id))
+    await holding(h, "MacBook Pro", 1, trash_removed=True)                    # a different Mac, the same name
+    r = await post(h, "/models/remove", {"model": TINY})
+    assert r.json()["macs"] == ["MacBook Pro"] and r.json()["offline"] == ["MacBook Pro"]
+    await wait_for(lambda: not h.svc.removing(TINY))
+    assert TINY in files_of(h, other_id)                                      # still waited for
+    assert [(x["name"], x["online"]) for x in (await model(h, TINY))["held_by"]] == [("MacBook Pro", False)]
+    assert (await post(h, "/models/remove", {"model": TINY})).status_code == 200   # Remove again
+    assert files_of(h, other_id) == "[]" and await model(h, TINY) is None
+
+
+async def test_a_file_moved_away_by_hand_and_put_back_shows_without_a_restart(cluster, tmp_path):
+    h = cluster
+    await holding(h, "mac", 0)                                                # keeps removed models
+    f, aside = node_dir(h, "mac") / TINY, tmp_path / "aside.gguf"
+    os.replace(f, aside)                                                      # moved to the Trash in Finder
+    await wait_for(lambda: reported_files(h, "mac") == "[]")
+    assert await listed(h) == []
+    os.replace(aside, f)                                                      # Put Back
+    await wait_for(lambda: TINY in reported_files(h, "mac"))
+    assert await listed(h) == [TINY]
+    assert (await post(h, "/models/remove", {"model": TINY})).status_code == 200
+    await wait_for(lambda: not h.svc.removing(TINY))
+    os.replace(f, aside)
+    await wait_for(lambda: reported_files(h, "mac") == "[]")
+    assert await model(h, TINY) is None                                       # no copy left: off the list
+    os.replace(aside, f)
+    await wait_for(lambda: TINY in reported_files(h, "mac"))
+    m = await model(h, TINY)                                                  # back, but still removed
+    assert m["status"] == "removed" and [x["name"] for x in m["held_by"]] == ["mac"] and await listed(h) == []
+
+
+async def test_a_model_still_being_copied_in_is_reported_once_whole(cluster):
+    h = cluster
+    await h.add_node(FakeNode("mac", 16, may_be_head=True), 0, gguf_files=[])
+    data = tiny_gguf()
+    f = node_dir(h, "mac") / TINY
+    f.parent.mkdir(parents=True)
+    f.write_bytes(data[:-100])
+    await asyncio.sleep(10 * h.settings.HEARTBEAT_SECONDS)                    # several passes of the folder sync
+    assert reported_files(h, "mac") == "[]" and await model(h, TINY) is None
+    with f.open("ab") as fh:
+        fh.write(data[-100:])
+    await wait_for(lambda: TINY in reported_files(h, "mac"))
+    assert await listed(h) == [TINY]
+
+
+async def test_heartbeats_go_on_while_a_slow_folder_scan_runs(cluster, monkeypatch):
+    h = cluster
+    mac = await holding(h, "mac", 0)
+    entered, release = threading.Event(), threading.Event()
+    real = agent_mod.scan_models
+
+    def slow_scan(dirs):                                                      # a big folder on a slow disk
+        entered.set()
+        release.wait(10)
+        return real(dirs)
+
+    monkeypatch.setattr(agent_mod, "scan_models", slow_scan)
+    beats = []
+    beat = mac.heartbeat
+
+    async def counted():
+        beats.append(time.monotonic())
+        await beat()
+
+    mac.heartbeat = counted
+    (node_dir(h, "mac") / "other.gguf").write_bytes(tiny_gguf())             # a change: the next pass rescans
+    try:
+        await wait_for(entered.is_set)
+        beats.clear()
+        await asyncio.sleep(2.5 * h.settings.OFFLINE_AFTER_SECONDS)
+        assert len(beats) >= 5 and online(h, mac.node_id)
+    finally:
+        release.set()
+    await wait_for(lambda: "other.gguf" in reported_files(h, "mac"))
+
+
+def test_how_a_failed_removal_reads():
+    assert _removal_error(TINY, "remove_model on node n-1 timed out after 120s") == "did not answer in time"
+    assert _removal_error(TINY, f"OSError: {TINY}: Permission denied") == f"{TINY}: Permission denied"
+    assert _removal_error(TINY, "ValueError: unknown command remove_model") == (
+        f"runs an older /compute: update it, or delete {TINY} by hand from its models folder or from "
+        "~/.slashcompute/models")
