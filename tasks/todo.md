@@ -230,8 +230,11 @@ Plan: /Users/darren/.claude/plans/great-this-project-is-cheerful-koala.md. Basel
 - [x] Rebuild DMG (llama.cpp b11160 from the previous bundle); installed to /Applications/compute.app (old
       bundle backed up in the session scratchpad); installed slashcompute diffs clean against src; the scratch
       pool run with the installed Python moved a test GGUF to the Trash through PyObjC
-- [ ] With the user: start the real app, Remove the stale Qwen3.8-27B and Llama-3.2-3B, Stop serving / Serve /
-      Unload on Qwen3.5-0.8B
+- [x] In the installed app on the user's pool (with their OK): Start serving brought up the coordinator and a node
+      with --trash-removed; removed the stale Qwen3.8-27B and Llama-3.2-3B (confirm: "No Mac has a copy");
+      Stop serving Qwen3.5-0.8B refused chats (HTTP 404 + Serve under Send) and stayed stopped across Stop,
+      app quit and relaunch; Serve; a real llama.cpp reply (512 tokens, done); Unload stopped the pipeline and
+      llama-server with no error on the Mac. ~/models untouched.
 
 ## Review (2026-10-07)
 
