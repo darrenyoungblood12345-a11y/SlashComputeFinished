@@ -6,7 +6,9 @@ import pytest
 
 from inf_harness import FakeNode, chat, fast_settings, start_harness
 from slashcompute.inference.coordinator.layers import synthetic_layout
-from slashcompute.inference.coordinator.pipelines import TRANSITIONS, IllegalTransition, check_transition, serve
+from slashcompute.inference.coordinator.pipelines import (
+    TRANSITIONS, IllegalTransition, check_transition, new_job, serve,
+)
 from slashcompute.inference.node.config import Commitment
 from slashcompute.inference.node.engine import EngineError
 from slashcompute.inference.node.fake_engine import FakeEngine
@@ -210,6 +212,29 @@ async def test_idle_pipeline_is_torn_down():
                 break
         assert pipelines(h)[0]["state"] == "stopped"
         assert h.agents["worker"].in_use == {} and h.agents["head"].in_use == {}
+    finally:
+        await h.stop()
+
+
+async def test_coordinator_restart_fails_the_jobs_it_left_unfinished(tmp_path):
+    """A crash leaves the jobs it was serving 'queued' or 'running' forever: nothing will finish them."""
+    settings = fast_settings(DB_PATH=str(tmp_path / "inference.db"))
+    h = await start_harness(settings)
+    try:
+        queued = new_job(h.conn, QWEN, "u1", {}, False)
+        running = new_job(h.conn, QWEN, "u1", {}, True)
+        done = new_job(h.conn, QWEN, "u1", {}, False)
+        h.conn.execute("UPDATE jobs SET state='running' WHERE id=?", (running,))
+        h.conn.execute("UPDATE jobs SET state='done', finished_at=1.0 WHERE id=?", (done,))
+    finally:
+        await h.stop()
+    h = await start_harness(settings)
+    try:
+        jobs = {j["id"]: j for j in h.conn.execute("SELECT * FROM jobs").fetchall()}
+        for job_id in (queued, running):
+            assert jobs[job_id]["state"] == "failed" and jobs[job_id]["error"] == "coordinator restarted"
+            assert jobs[job_id]["retryable"] == 1 and jobs[job_id]["finished_at"]
+        assert jobs[done]["state"] == "done" and jobs[done]["finished_at"] == 1.0
     finally:
         await h.stop()
 

@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from slashcompute.common.jsonbool import body_bool
 from slashcompute.inference import PREFIX
 from slashcompute.inference import flops as fl
-from slashcompute.inference.accounting import Accounting, AccountingError, NullAccounting
+from slashcompute.inference.accounting import ACCOUNT_PREFIX, Accounting, AccountingError, NullAccounting
 from slashcompute.inference.config import GIB, InferenceSettings
 from slashcompute.inference.coordinator import nodes, registry, status
 from slashcompute.inference.coordinator.bus import CommandBus, CommandFailed, JobStreams
@@ -171,6 +171,10 @@ class InferenceService:
         self.latency_kick = asyncio.Event()
         self.bus.closing = asyncio.Event()  # bound to this run's event loop
         self.mgr.recover()
+        try:
+            self.accounting.recover()
+        except Exception:  # noqa: BLE001 - a bookkeeping failure must not keep the pool from starting
+            log.exception("refunding the reservations of a previous run failed")
         if self.s.BACKGROUND_TASKS:
             for loop in (self.monitor_loop, self.tick_loop, self.latency_loop):
                 self.spawn(loop())
@@ -829,7 +833,7 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         engine_body = {k: v for k, v in body.items()
                        if k not in ("stream", "stream_options", "model", "max_completion_tokens", "n_predict")}
         engine_body["max_tokens"] = max_tokens
-        account_id = "inf-" + uuid.uuid4().hex[:12]
+        account_id = ACCOUNT_PREFIX + uuid.uuid4().hex[:12]
         reserved = False
         if user_id:
             # a true upper bound (the charge is capped at it); settle() refunds the rest

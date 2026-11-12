@@ -19,7 +19,7 @@ from slashcompute.community.credits import POT_ID, CreditError
 from slashcompute.community.grants import GrantError
 from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
-from slashcompute.coordinator.db import User
+from slashcompute.coordinator.db import CreditTxn, User
 from slashcompute.coordinator.inference_accounting import CoreAccounting
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
@@ -325,6 +325,31 @@ def test_leaderboard_ranks_generated(core):
     board = core.credits.leaderboard()
     assert [row["name"] for row in board] == ["Bea", "Ann"]
     assert board[0]["lifetime_earned"] == 50.0
+
+
+def test_settle_open_jobs_refunds_only_the_accounts_under_its_prefix(core):
+    user, _ = _account(core.auth)
+    core.credits.post(user.id, "earn", 1000.0)
+    core.credits.reserve_job(user.id, "inf-crashed", 400.0)      # a chat cut off by a crash
+    core.credits.consume_job("inf-crashed", 150.0)
+    core.credits.reserve_job(user.id, "inf-settled", 100.0)      # one that finished normally
+    core.credits.consume_job("inf-settled", 30.0)
+    core.credits.settle_job("inf-settled")
+    core.credits.reserve_job(user.id, "a1b2c3d4e5f6", 200.0)     # a training job, still running
+    core.credits.reserve_job(user.id, "inf_x", 50.0)             # "_" is not a wildcard
+    assert core.credits.balance(user.id) == pytest.approx(1000 - 400 - 30 - 200 - 50)
+
+    assert core.credits.settle_open_jobs("inf-") == 1
+    assert core.credits.balance(user.id) == pytest.approx(1000 - 150 - 30 - 200 - 50)
+    assert core.credits.reserved_in_flight(user.id) == pytest.approx(250.0)   # the other two holds
+    acct = core.credits.job_account("inf-crashed")
+    assert acct.reserved_flops == acct.spent_flops == 150.0
+    # nothing left open: running it again releases nothing twice
+    assert core.credits.settle_open_jobs("inf-") == 0
+    assert core.credits.balance(user.id) == pytest.approx(1000 - 150 - 30 - 200 - 50)
+    with core.db.session() as s:
+        releases = s.exec(select(CreditTxn).where(CreditTxn.kind == "release")).all()
+    assert sorted((r.job_id, r.amount) for r in releases) == [("inf-crashed", 250.0), ("inf-settled", 70.0)]
 
 
 # --------------------------------------------------------------------------- grants

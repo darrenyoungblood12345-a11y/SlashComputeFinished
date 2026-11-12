@@ -251,6 +251,21 @@ class Credits:
                 s.add(CreditTxn(user_id=acct.user_id, kind="release", amount=leftover, job_id=job_id))
                 s.commit()
 
+    def settle_open_jobs(self, prefix: str) -> int:
+        """Settle every account whose id starts with ``prefix`` and still holds unspent credits.
+
+        For startup, when nothing that reserved under that prefix can still be running.
+        Returns how many accounts it settled; a second pass finds none.
+        """
+        with self.db.session() as s:
+            open_ids = s.exec(select(JobAccount.job_id).where(
+                JobAccount.job_id.startswith(prefix, autoescape=True),
+                JobAccount.reserved_flops > JobAccount.spent_flops,
+            )).all()
+        for job_id in open_ids:
+            self.settle_job(job_id)
+        return len(open_ids)
+
     def donate(self, donor_id: str, recipient_id: str, grant_id: str, flops: float) -> None:
         if flops <= 0:
             raise CreditError("Donation must be positive.")
