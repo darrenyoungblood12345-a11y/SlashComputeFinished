@@ -443,6 +443,11 @@ async def _dial(host: str, port: int, hello: dict, timeout: float, retry_interva
             why = f"peer rejected hello: {ack.meta.get('reason') or ack.meta}"
         except (LinkClosed, asyncio.TimeoutError) as e:
             why = f"hello failed: {str(e) or 'no reply'}"
+        except BaseException:
+            # Cancelled mid-hello: no caller holds this connection yet, so nobody else would
+            # close it, and the peer may already have taken it as its upstream link.
+            link.abort()
+            raise
         await link.close()
         if loop.time() > deadline:
             raise LinkClosed(why)
@@ -473,8 +478,16 @@ class LinkServer:
         self._server: Optional[asyncio.base_events.Server] = None
 
     async def start(self) -> "LinkServer":
+        # Bound first, served second: asyncio yields once after it starts serving, and a cancel
+        # landing there would drop the only reference to a live listener (the port then stays
+        # bound for the life of the process).
         self._server = await asyncio.start_server(self._on_conn, self.host, self.port,
-                                                  reuse_address=True)
+                                                  reuse_address=True, start_serving=False)
+        try:
+            await self._server.start_serving()
+        except BaseException:
+            self._server.close()
+            raise
         self.port = self._server.sockets[0].getsockname()[1]
         return self
 

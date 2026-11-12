@@ -83,19 +83,30 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     server = None
     prev = nxt = None
     # Downstream listens; upstream dials (see transport.peer).
-    if asg.stage_idx > 0:
-        server = await LinkServer(ctx.data_bind, ctx.data_port, hello,
-                                  send_timeout=asg.peer_timeout_s,
-                                  resume_window=asg.peer_timeout_s).start()
-        log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
-    if asg.next_peer is not None:
-        log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
-        nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
-                            timeout=PEER_HANDSHAKE_TIMEOUT_S,
-                            send_timeout=asg.peer_timeout_s, resume_window=asg.peer_timeout_s)
-    if server is not None:
-        prev = await server.accept(timeout=None)
-        log.info("upstream connected from %s", getattr(prev, "peername", "?"))
+    try:
+        if asg.stage_idx > 0:
+            server = await LinkServer(ctx.data_bind, ctx.data_port, hello,
+                                      send_timeout=asg.peer_timeout_s,
+                                      resume_window=asg.peer_timeout_s).start()
+            log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
+        if asg.next_peer is not None:
+            log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
+            nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
+                                timeout=PEER_HANDSHAKE_TIMEOUT_S,
+                                send_timeout=asg.peer_timeout_s, resume_window=asg.peer_timeout_s)
+        if server is not None:
+            prev = await server.accept(timeout=None)
+            log.info("upstream connected from %s", getattr(prev, "peername", "?"))
+    except BaseException:
+        # The caller only gets these once the handshake returns, so a cancel or a failure in
+        # the middle of it must let go of them here: a listener left bound keeps this agent's
+        # data port, and no later stage in this process (--no-sandbox) could listen on it.
+        # The listener first: closing it frees the port before anything below can wait.
+        if server is not None:
+            await server.close()
+        if nxt is not None:
+            await nxt.close()
+        raise
     return prev, nxt, server
 
 

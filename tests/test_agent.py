@@ -357,6 +357,135 @@ async def test_bad_dataset_reports_a_fatal_stage_error(tmp_path, tiny_model):
     assert "unrecognised dataset row keys" in sent[0].detail
 
 
+# ------------------------------------------------------------ peer handshake cleanup
+
+
+def _free_port():
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _peer_ctx(tmp_path, port, next_port=None):
+    """A downstream stage (it listens on ``port``), dialing ``next_port`` when it is a middle one."""
+    from slashcompute.agent.worker import WorkerContext
+    from slashcompute.common.protocol import PeerAddr
+
+    nxt = PeerAddr(node_id="next", host="127.0.0.1", port=next_port) if next_port else None
+    asg = _assignment(stage_idx=1).model_copy(update={"next_peer": nxt, "peer_timeout_s": 5.0})
+    return WorkerContext(assignment=asg, http=None, job_dir=tmp_path / "job", data_bind="127.0.0.1",
+                         data_port=port, gpu_percent=100, node_id="n")
+
+
+async def _bind_again(port):
+    """What the agent's next stage does with its data port; EADDRINUSE while a listener leaks."""
+    server = await LinkServer("127.0.0.1", port, {"job_id": "next", "epoch": 1}).start()
+    await server.close()
+
+
+async def test_cancelled_peer_handshake_frees_the_data_port(tmp_path):
+    """A stage cancelled while it waited for its neighbours kept its listener (run_stage only
+    gets the links once the handshake returns), so on a --no-sandbox agent no later stage
+    could bind the data port until the process restarted."""
+    from slashcompute.agent.worker import _peer_links
+
+    port = _free_port()
+    for i in range(120):                       # a cancel landing anywhere from start() to accept()
+        task = asyncio.create_task(_peer_links(_peer_ctx(tmp_path, port)))
+        for _ in range(i % 12):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _bind_again(port)
+
+
+async def test_cancelled_peer_handshake_closes_the_link_it_already_dialed(tmp_path):
+    from slashcompute.agent.worker import _peer_links
+    from slashcompute.transport import LinkClosed, LinkTimeout
+
+    port = _free_port()
+    for i in range(24):
+        hello = {"job_id": "j", "epoch": 1}
+        # A short resume window: a connection dropped mid-hello ends the link once it passes.
+        downstream = await LinkServer("127.0.0.1", 0, hello, resume_window=0.2).start()
+        task = asyncio.create_task(_peer_links(_peer_ctx(tmp_path, port, downstream.port)))
+        dialed = None
+        try:
+            dialed = await downstream.accept(timeout=10)
+            if i % 2:                                      # odd: the dial has returned, the stage
+                await asyncio.sleep(0.02)                  # waits for its upstream; even: mid-hello
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _bind_again(port)
+            with pytest.raises(LinkClosed) as closed:      # not left holding a dead connection
+                await dialed.recv(5)
+            assert not isinstance(closed.value, LinkTimeout)
+        finally:
+            task.cancel()
+            if dialed is not None:                         # or downstream.close() waits for it
+                await dialed.close()
+            await downstream.close()
+
+
+async def test_failed_peer_handshake_frees_the_data_port(tmp_path, monkeypatch):
+    from slashcompute.agent import worker
+
+    monkeypatch.setattr(worker, "PEER_HANDSHAKE_TIMEOUT_S", 0.05)
+    port = _free_port()
+    for _ in range(12):
+        nobody = _free_port()                  # the next stage never comes up: the dial gives up
+        with pytest.raises(OSError):
+            await worker._peer_links(_peer_ctx(tmp_path, port, nobody))
+        await _bind_again(port)
+
+
+async def test_stage_cancelled_during_the_handshake_lets_the_next_stage_listen(tmp_path, tiny_model):
+    """The same through run_stage, twice on one port: what an in-process agent does when the
+    coordinator cancels an epoch that is still connecting and assigns the next one."""
+    from slashcompute.agent.worker import WorkerContext, run_stage
+    from slashcompute.common.protocol import StageAssignment, StageFinished
+    from slashcompute.jobs import LoraFinetuneSpec
+
+    port = _free_port()
+    spec = LoraFinetuneSpec(model=str(tiny_model), dataset_path="unused.jsonl", steps=2, batch_size=2,
+                            microbatches=1, lora_rank=4)
+
+    async def listening():
+        try:
+            _, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            return False
+        writer.close()
+        return True
+
+    for epoch in (1, 2):
+        asg = StageAssignment(job_id="j", epoch=epoch, stage_idx=1, num_stages=2, layer_start=3,
+                              layer_end=6, num_layers=6, spec=spec, checkpoint_every=10,
+                              verify_ring_size=2)
+        ctx = WorkerContext(assignment=asg, http=None, job_dir=tmp_path / f"job-{epoch}",
+                            data_bind="127.0.0.1", data_port=port, gpu_percent=100, node_id="n")
+        sent = []
+
+        async def emit(msg):
+            sent.append(msg)
+
+        task = asyncio.create_task(run_stage(ctx, emit))
+        for _ in range(600):                   # loading the tiny model comes first
+            if task.done() or await listening():
+                break
+            await asyncio.sleep(0.05)
+        assert not task.done(), sent           # epoch 2 failed here with "address already in use"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [type(m) for m in sent] == [StageFinished] and sent[0].reason == "cancelled"
+    await _bind_again(port)
+
+
 # A sandboxed worker whose stage runs until drained: the real stdio CLI around a fake stage.
 
 
