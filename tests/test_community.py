@@ -148,6 +148,56 @@ def test_google_login_creates_user(core, monkeypatch):
     assert again.id == user.id
 
 
+def test_google_login_revokes_a_preclaimed_password_account(core, monkeypatch):
+    # Someone registers the victim's address with their own password before the victim arrives.
+    _, attacker_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
+    }
+    user, token = core.auth.login_google("id-token")
+    assert user.google_sub == "sub-victim"
+    assert core.auth.user_from_token(token).id == user.id
+    # Google verified the mailbox; the password and sessions from before it are gone.
+    assert core.auth.user_from_token(attacker_token) is None
+    with pytest.raises(AuthError) as e:
+        core.auth.login("victim@lan.test", "attacker-pw1")
+    assert e.value.status == 401
+    # Signing in again keeps the owner's own sessions.
+    again, token2 = core.auth.login_google("id-token")
+    assert again.id == user.id
+    assert core.auth.user_from_token(token) is not None
+    assert core.auth.user_from_token(token2) is not None
+
+
+def test_google_login_revokes_the_password_of_an_already_linked_account(core, monkeypatch):
+    # Accounts linked before the reclaim existed still carry the password they were made with.
+    user, old_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
+    user.google_sub = "sub-victim"
+    core.db.save(user)
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
+    }
+    core.auth.login_google("id-token")
+    assert core.auth.user_from_token(old_token) is None
+    with pytest.raises(AuthError):
+        core.auth.login("victim@lan.test", "attacker-pw1")
+
+
+def test_concurrent_google_takeover_keeps_every_new_session(core, monkeypatch):
+    _, attacker_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
+    }
+    results, errors = _race(8, lambda i: core.auth.login_google("id-token"))
+    assert errors == []
+    assert core.auth.user_from_token(attacker_token) is None
+    # Only the first sign-in revokes: a later one must not log the others out again.
+    assert all(core.auth.user_from_token(tok) is not None for _, tok in results)
+
+
 def test_logout_drops_session(core):
     _, token = _account(core.auth)
     assert core.auth.user_from_token(token) is not None

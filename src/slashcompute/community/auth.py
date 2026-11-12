@@ -168,10 +168,28 @@ class Auth:
             )) or self.get_by_email(info["email"])
         if user is None:
             raise AuthError("Google sign-in failed.", 401)
-        if user.google_sub != info["sub"]:
-            user.google_sub = info["sub"]
-            self.db.save(user)
+        if user.google_sub != info["sub"] or not user.password_hash.startswith("google$"):
+            user = self._reclaim_for_google(user.id, info["sub"])
         return self._issue(user)
+
+    def _reclaim_for_google(self, user_id: str, sub: str) -> User:
+        """Bind a verified Google identity to an existing account and revoke what came before.
+
+        Nobody checked who registered this email: left in place, the password and sessions of
+        whoever claimed it first would keep opening the account next to its real owner.
+        """
+        with self._create_lock, self.db.session() as s:
+            user = s.get(User, user_id)
+            # A concurrent sign-in got here first: keep the session it has just issued.
+            if user.google_sub == sub and user.password_hash.startswith("google$"):
+                return user
+            user.google_sub = sub
+            user.password_hash = "google$" + secrets.token_hex(16)
+            for row in s.exec(select(SessionRow).where(SessionRow.user_id == user_id)).all():
+                s.delete(row)
+            s.add(user)
+            s.commit()
+            return user
 
     def logout(self, token: str) -> None:
         with self.db.session() as s:
