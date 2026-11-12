@@ -71,7 +71,14 @@ async def test_upload_is_validated(cluster):
     assert (await upload(h, "notes.txt", b"hello")).status_code == 400
     r = await upload(h, "junk.gguf", b"definitely not a gguf file")
     assert r.status_code == 422
+    # a hidden name: no Mac lists dotfiles and Remove refuses them, so it would sit on disk unusable
+    for hidden in (".model.gguf", "..gguf", "._model.gguf"):
+        r = await upload(h, hidden, tiny_gguf())
+        assert r.status_code == 400 and "must not start with a dot" in r.json()["detail"], (hidden, r.text)
+    assert (await upload(h, "model.gguf\n", tiny_gguf())).status_code == 400
     assert not any(Path(h.settings.MODELS_DIR).iterdir())       # nothing left behind
+    assert h.conn.execute("SELECT COUNT(*) FROM models").fetchone()[0] == 0
+    assert h.conn.execute("SELECT COUNT(*) FROM model_files").fetchone()[0] == 0
 
 
 async def test_upload_is_pushed_to_heads_and_becomes_servable(cluster):

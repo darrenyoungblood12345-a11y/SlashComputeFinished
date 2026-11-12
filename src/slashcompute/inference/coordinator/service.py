@@ -381,8 +381,11 @@ class InferenceService:
             raise HTTPException(409, f"{name} is still being removed from the pool's Macs; try again in a moment")
 
     async def receive_upload(self, request: Request, name: str) -> dict:
-        if not _SAFE_NAME.match(name or ""):
-            raise HTTPException(400, "file name must look like model-name.gguf (letters, digits, . _ -)")
+        # plain_gguf is what a node's scan and Remove accept: a name they would skip (a dotfile) must not
+        # get onto disk here, where nothing could list, serve or remove it again
+        if not _SAFE_NAME.match(name or "") or not registry.plain_gguf(name):
+            raise HTTPException(400, "file name must look like model-name.gguf (letters, digits, . _ -) "
+                                     "and must not start with a dot")
         root = self.models_dir()
         self._refuse_while_removing(name)   # a Mac still deleting it would delete the new copy too
         dest = root / name
