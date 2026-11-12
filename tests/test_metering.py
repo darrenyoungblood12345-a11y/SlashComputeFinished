@@ -1,6 +1,8 @@
 import pytest
 
-from slashcompute.metering import UsageRecorder, forward_flops, stage_step_flops
+from slashcompute.metering import (
+    UsageRecorder, forward_flops, max_stage_step_flops, stage_step_flops,
+)
 from slashcompute.pipeline.model_profile import ModelProfile
 from slashcompute.pipeline.schedule import StepStats
 
@@ -38,3 +40,19 @@ def test_recorder_accumulates():
     assert u.flops == stage_step_flops(p, 2, 4, 10, 10, True)
     r.sample(s)
     assert r.steps == 2 and r.total_flops == 2 * u.flops
+
+
+@pytest.mark.parametrize("layers", [(0, 4), (0, 2), (2, 4)])
+def test_no_honest_step_reports_more_than_the_stage_ceiling(layers):
+    """The coordinator bills a step up to this ceiling, so what a stage meters for any batch
+    the job allows (rows padded to at most max_seq_len) must fit under it, with no slack."""
+    p, batch_size, max_seq_len = _profile(), 4, 32
+    ceiling = max_stage_step_flops(p, *layers, batch_size, max_seq_len)
+    reported = [
+        UsageRecorder(p, *layers).sample(StepStats(
+            step=1, loss=None, tokens_processed=batch_size * seq, loss_tokens=0, seq_len=seq,
+            wall_s=1.0, busy_s=1.0, peak_mem_bytes=1, resident_mem_bytes=1, in_digest="a",
+            out_digest="b")).flops
+        for seq in range(1, max_seq_len + 1)]
+    assert max(reported) == reported[-1] == ceiling
+    assert reported == sorted(reported)

@@ -21,8 +21,10 @@ from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
 from slashcompute.coordinator.db import CreditTxn, User
 from slashcompute.coordinator.inference_accounting import CoreAccounting
+from slashcompute.coordinator.partitioner import StagePlan
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
+from slashcompute.pipeline.model_profile import profile_model
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +65,13 @@ def _spec(tiny_model, tiny_dataset, **kw):
     base = dict(model=str(tiny_model), dataset_path=str(tiny_dataset), steps=2,
                 batch_size=2, microbatches=1, lora_rank=4, min_stages=1)
     return LoraFinetuneSpec(**(base | kw))
+
+
+def _one_stage_epoch(job):
+    """Epoch 1 as the scheduler starts it on one Mac: the whole model as stage 0. Steps are
+    billed against the stage the coordinator planned, so a step test needs one."""
+    job.profile = profile_model(job.spec.model)
+    return EpochState(epoch=1, plans=[StagePlan(0, "n1", 0, job.profile.num_layers, 0)])
 
 
 def _account(auth, email="ada@lan.test", password="password1", name="Ada"):
@@ -752,7 +761,7 @@ def test_steps_earn_and_spend_one_to_one(core):
     core.credits.contribute(user.id, 1e12, 0)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 5e9)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):
@@ -777,7 +786,7 @@ def test_anonymous_job_does_not_mint_credits(core):
     user, token = _account(core.auth)
     core.auth.accept_terms(user)
     job = core.submit(_spec(tiny_model, tiny_dataset))
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
 
     async def send(_):
         return None
@@ -801,7 +810,7 @@ def test_budget_exhaust_cancels_job(core):
     core.credits.contribute(user.id, 1e12, 0)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1e9)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):
@@ -828,7 +837,7 @@ def test_grant_split_on_step(core):
     core.credits.contribute(user.id, 1e12, 0)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1e10)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):
@@ -853,7 +862,7 @@ def test_last_step_mints_only_charged_flops(core):
     core.credits.contribute(user.id, 1e12, 0)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1.5e9)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):
@@ -913,7 +922,7 @@ def test_training_share_without_eligible_host_goes_to_pot(core, banned):
     host, host_tok, chatter = _host_and_chatter(core)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(chatter.id, job.id, 5e9)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):

@@ -282,9 +282,11 @@ def _usage(flops):
 
 
 @pytest.fixture
-def victim_job(env):
-    """A victim's job assigned to an honest node, plus a signed-in attacker node."""
+def victim_job(env, request):
+    """A victim's job assigned to an honest node, plus a signed-in attacker node.
+    Its FLOP budget is 1e15 unless the test passes another (indirect parametrize)."""
     client, core, tiny_model, tiny_dataset = env
+    max_flops = getattr(request, "param", 1e15)
     victim, attacker, host = (_account(client, f"{n}@lan.test") for n in ("victim", "attacker", "host"))
     core.credits.contribute(core.auth.session_user(victim).id, 1e15, 0)
     honest = _node(client, "honest", host)
@@ -293,7 +295,7 @@ def victim_job(env):
         "/jobs/upload", headers=_hdr(victim),
         files={"dataset": ("train.jsonl", tiny_dataset.read_bytes(), "application/jsonl")},
         data={"model": str(tiny_model), "steps": 50, "batch_size": 2, "microbatches": 1,
-              "max_flops": 1e15},
+              "max_flops": max_flops},
     )
     assert r.status_code == 200, r.text
     asg = P.parse_coordinator_message(honest.receive_text())
@@ -321,6 +323,89 @@ def test_unassigned_node_cannot_bill_another_users_job(victim_job):
         in_digest="x", out_digest="y", usage=_usage(1e9))))
     _flush(core, honest, "honest")
     assert client.get(f"/jobs/{asg.job_id}").json()["spent_flops"] == 1e9
+
+
+def _stage_cost(asg):
+    """The most one step of ``asg``'s stage can cost: the metering formula with every row of
+    the batch as long as the job allows."""
+    from slashcompute.metering import stage_step_flops
+    from slashcompute.pipeline.model_profile import profile_model
+
+    spec = asg.spec
+    return stage_step_flops(profile_model(spec.model), asg.layer_start, asg.layer_end,
+                            spec.batch_size * spec.max_seq_len, spec.max_seq_len,
+                            asg.layer_end == asg.num_layers)
+
+
+def _step(asg, step, flops):
+    msg = P.StepMetrics(job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx, step=step,
+                        loss=0.1, in_digest="x", out_digest="y", usage=_usage(flops))
+    return json.dumps(msg.model_dump())        # as a node may send it: NaN and Infinity included
+
+
+def test_assigned_node_cannot_bill_more_than_its_stage_can_cost(victim_job):
+    """The node that holds the stage used to name its own price: one step claiming the whole
+    budget was paid in full and ended the job as "FLOP budget spent"."""
+    client, core, asg, honest, bad, _ = victim_job
+    host_id = core.registry.get("honest").user_id
+    honest.send_text(_step(asg, 1, 1e15))
+    _flush(core, honest, "honest")
+    job = client.get(f"/jobs/{asg.job_id}").json()
+    assert job["spent_flops"] == _stage_cost(asg) < 1e10
+    assert job["status"] not in ("cancelled", "failed") and job["error"] is None
+    assert core.credits.lifetime_earned(host_id) == _stage_cost(asg)
+
+
+@pytest.mark.parametrize("claim", [float("nan"), float("inf"), -1e15])
+def test_a_step_claim_that_is_not_a_cost_cannot_corrupt_the_budget(victim_job, claim):
+    client, core, asg, honest, bad, _ = victim_job
+    honest.send_text(_step(asg, 1, claim))
+    honest.send_text(_step(asg, 2, 1e6))
+    _flush(core, honest, "honest")
+    spent = client.get(f"/jobs/{asg.job_id}").json()["spent_flops"]
+    assert spent == (_stage_cost(asg) if claim > 0 else 0) + 1e6
+
+
+def test_only_steps_the_epoch_can_run_are_billed(victim_job):
+    """A job of 50 steps resumed from step 10 has steps 11..50 left: nothing else is billable,
+    so a stage can never bill more than those steps at the most a step can cost."""
+    client, core, asg, honest, bad, _ = victim_job
+    core.jobs[asg.job_id].current.resume_step = 10
+    for step in (-3, 0, 10, 51, 10**9):
+        honest.send_text(_step(asg, step, 1e15))
+    _flush(core, honest, "honest")
+    assert client.get(f"/jobs/{asg.job_id}").json()["spent_flops"] == 0
+    assert not core.ledger.job_records(asg.job_id)
+
+    for step in range(1, 61):
+        honest.send_text(_step(asg, step, 1e15))
+    honest.send_text(P.dump(P.Heartbeat(node_id="honest", status="idle")))
+    deadline = time.time() + 10
+    while core.registry.get("honest").status != "idle":
+        assert time.time() < deadline, "heartbeat never handled"
+        time.sleep(0.02)
+    job = client.get(f"/jobs/{asg.job_id}").json()
+    assert job["spent_flops"] == pytest.approx(40 * _stage_cost(asg))
+    assert [r.step for r in core.ledger.job_records(asg.job_id)] == list(range(11, 51))
+    assert job["status"] not in ("cancelled", "failed")
+
+
+@pytest.mark.parametrize("victim_job", [1e9], indirect=True)
+def test_step_that_spends_the_budget_is_still_verified(victim_job):
+    """The step that used up the budget cancelled the job and returned before the
+    verification policy saw it, so the last (and largest possible) payout was never checked."""
+    client, core, asg, honest, bad, _ = victim_job
+    core.cfg.verify_rate = 1.0
+    honest.send_text(_step(asg, 1, _stage_cost(asg)))          # more than the 1e9 budget
+    fetch = P.parse_coordinator_message(honest.receive_text())
+    assert isinstance(fetch, P.VerifyFetch)                    # asked before the stage is stopped
+    assert (fetch.job_id, fetch.epoch, fetch.stage_idx, fetch.step) == (asg.job_id, asg.epoch, 0, 1)
+    assert isinstance(P.parse_coordinator_message(honest.receive_text()), P.CancelStage)
+    _flush(core, honest, "honest")
+    job = client.get(f"/jobs/{asg.job_id}").json()
+    assert (job["status"], job["error"], job["spent_flops"]) == ("cancelled", "FLOP budget spent", 1e9)
+    [v] = [v for v in client.get("/verifications").json() if v["kind"] == "replay"]
+    assert (v["job_id"], v["step"], v["target_node_id"]) == (asg.job_id, 1, "honest")
 
 
 @pytest.mark.parametrize("reason", ["error", "done"])
