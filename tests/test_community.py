@@ -81,11 +81,63 @@ def test_first_user_is_admin_second_is_not(core):
     assert b.admin is False
 
 
-def test_admin_email_env(core, monkeypatch):
+def test_admin_email_env_is_not_granted_to_a_password_registration(core, monkeypatch):
+    # Anyone can type the configured address into the sign-up form: that proves nothing.
     monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
     _account(core.auth, "first@lan.test")
     ops, _ = _account(core.auth, "ops@lan.test")
+    assert ops.admin is False
+    assert core.auth.get_by_email("ops@lan.test").admin is False
+
+
+def test_admin_email_env_is_granted_to_a_verified_google_sign_in(core, monkeypatch):
+    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "Ops@lan.test ")
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    _account(core.auth, "first@lan.test")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "other@lan.test", "name": "Other", "sub": "sub-other",
+    }
+    other, _ = core.auth.login_google("id-token")
+    assert other.admin is False
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "ops@lan.test", "name": "Ops", "sub": "sub-ops",
+    }
+    ops, _ = core.auth.login_google("id-token")
     assert ops.admin is True
+    assert core.auth.get_by_email("ops@lan.test").admin is True
+
+
+def test_admin_email_env_squatter_never_becomes_admin(core, monkeypatch):
+    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    _account(core.auth, "first@lan.test")
+    squatter, squatter_token = _account(core.auth, "ops@lan.test", "squatter-pw1", "Mallory")
+    assert squatter.admin is False
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "ops@lan.test", "name": "Ops", "sub": "sub-ops",
+    }
+    # The real owner arrives through Google: the account becomes admin only once the
+    # squatter's password and sessions are gone.
+    ops, token = core.auth.login_google("id-token")
+    assert ops.id == squatter.id and ops.admin is True
+    assert core.auth.user_from_token(token).admin is True
+    assert core.auth.user_from_token(squatter_token) is None
+    with pytest.raises(AuthError):
+        core.auth.login("ops@lan.test", "squatter-pw1")
+
+
+def test_http_register_with_the_admin_email_is_not_admin(env, monkeypatch):
+    client, core, *_ = env
+    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
+    first = client.post("/auth/register", json={
+        "email": "first@lan.test", "password": "password1", "name": "First"}).json()
+    assert first["user"]["admin"] is True       # the bootstrap rule is unchanged
+    r = client.post("/auth/register", json={
+        "email": "ops@lan.test", "password": "password1", "name": "Ops"})
+    assert r.status_code == 200
+    assert r.json()["user"]["admin"] is False
+    users = client.get("/admin/users", headers={"Authorization": f"Bearer {r.json()['token']}"})
+    assert users.status_code == 403
 
 
 def test_register_rejects_bad_email_short_password_duplicate(core):
