@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS model_files (
   name TEXT PRIMARY KEY,               -- GGUF uploaded to the coordinator, pushed to heads
   size INTEGER, sha256 TEXT, uploaded_at REAL
 );
+CREATE TABLE IF NOT EXISTS node_uploads (
+  node_id TEXT, name TEXT, sha256 TEXT,  -- the upload a head confirmed it holds (download_model checks the hash)
+  PRIMARY KEY (node_id, name)
+);
 CREATE TABLE IF NOT EXISTS nodes (
   id TEXT PRIMARY KEY, name TEXT, token_hash TEXT,
   os TEXT, chip TEXT, total_mem_bytes INTEGER,

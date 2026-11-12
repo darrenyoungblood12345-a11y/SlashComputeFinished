@@ -100,7 +100,7 @@ def holders(conn, s: InferenceSettings, model_id: str, now: Optional[float] = No
     now = now or time.time()
     out = []
     for r in conn.execute("SELECT * FROM nodes WHERE can_head=1").fetchall():
-        files = set(json.loads(r["gguf_files_json"] or "[]"))
+        files = nodes.head_files(conn, r)
         approved = bool(r["approved_head"]) or not s.REQUIRE_HEAD_APPROVAL
         if model_id in files and approved and r["available"] and nodes.is_online(r, s, now):
             out.append(r)

@@ -27,8 +27,19 @@ def reserved_bytes(conn: sqlite3.Connection, exclude_pipeline: Optional[str] = N
     return {r["node_id"]: int(r["used"] or 0) for r in rows}
 
 
-def candidate(row, s: InferenceSettings, model_id: str, reserved: int, now: float) -> NodeCandidate:
-    files = set(json.loads(row["gguf_files_json"] or "[]"))
+def head_files(conn: sqlite3.Connection, row) -> set[str]:
+    """The models this node may head: the files it reports, less every uploaded model whose current copy it
+    has not confirmed it holds. A report carries names only, and a file of that name on its disk may be
+    another model: an upload replaced since under the same name, or its own."""
+    stale = conn.execute(
+        "SELECT f.name FROM model_files f LEFT JOIN node_uploads u ON u.name = f.name AND u.node_id = ? "
+        "WHERE u.sha256 IS NOT f.sha256", (row["id"],)).fetchall()
+    return set(json.loads(row["gguf_files_json"] or "[]")) - {r["name"] for r in stale}
+
+
+def candidate(conn: sqlite3.Connection, row, s: InferenceSettings, model_id: str, reserved: int,
+              now: float) -> NodeCandidate:
+    files = head_files(conn, row)
     allowed = json.loads(row["allowed_models_json"]) if row["allowed_models_json"] else None
     return NodeCandidate(
         node_id=row["id"], name=row["name"], committed_bytes=int(row["committed_bytes"] or 0),
@@ -46,7 +57,7 @@ def candidates(conn: sqlite3.Connection, s: InferenceSettings, model_id: str,
                now: Optional[float] = None) -> list[NodeCandidate]:
     now = now or time.time()
     reserved = reserved_bytes(conn)
-    return [candidate(r, s, model_id, reserved.get(r["id"], 0), now)
+    return [candidate(conn, r, s, model_id, reserved.get(r["id"], 0), now)
             for r in conn.execute("SELECT * FROM nodes ORDER BY id").fetchall()]
 
 

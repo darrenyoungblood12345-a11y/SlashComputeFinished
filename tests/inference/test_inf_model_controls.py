@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from inf_gguf_fixtures import tiny_gguf
-from inf_harness import FakeNode, chat, fast_settings, start_harness, upload, wait_for
+from inf_harness import FakeNode, chat, fast_settings, heads_of, start_harness, upload, wait_for
 from slashcompute.inference.coordinator import nodes
 from slashcompute.inference.coordinator.layers import synthetic_layout
 from slashcompute.inference.coordinator.pipelines import serve
@@ -314,7 +314,7 @@ async def test_stop_serving_survives_node_reports_uploads_and_a_restart(tmp_path
     try:
         head = await h.add_node(FakeNode("head", 16, may_be_head=True), 0, gguf_files=[])
         assert (await upload(h, TINY, tiny_gguf())).status_code == 200
-        await wait_for(lambda: TINY in reported_files(h, "head"))
+        await wait_for(lambda: heads_of(h, TINY) == ["head"])
         assert (await chat(h, TINY)).status_code == 200
         assert (await post(h, "/models/serving", {"model": TINY, "on": False})).json()["serving"] is False
         await head.register()                                          # the Mac re-registers with its files
@@ -332,6 +332,7 @@ async def test_stop_serving_survives_node_reports_uploads_and_a_restart(tmp_path
         assert model_status(h, TINY) == "disabled" and await listed(h) == []
         assert (await chat(h, TINY)).status_code == 404
         assert (await post(h, "/models/serving", {"model": TINY, "on": True})).json()["serving"] is True
+        await wait_for(lambda: heads_of(h, TINY) == ["head"])     # a new node id: it confirms its copy first
         assert (await chat(h, TINY)).status_code == 200
     finally:
         await h.stop()
@@ -346,6 +347,7 @@ async def test_remove_clears_every_copy(cluster, trash):
     assert (await upload(h, TINY, tiny_gguf())).status_code == 200            # pushed to A's downloads
     await wait_for(lambda: TINY in reported_files(h, "A"))
     await holding(h, "B", 1, trash_removed=True)                              # in B's own models folder
+    await wait_for(lambda: heads_of(h, TINY) == ["A", "B"])                   # both confirmed the upload's bytes
     assert (await chat(h, TINY)).status_code == 200
     r = await post(h, "/models/remove", {"model": TINY})
     assert r.status_code == 200
@@ -626,7 +628,7 @@ async def test_a_stuck_upload_comes_back_with_its_model(cluster, monkeypatch):
     assert (await post(h, "/models/serving", {"model": TINY, "on": True})).json()["serving"] is True   # Add back
     m = await model(h, TINY)
     assert m["status"] == "ready" and m["uploaded"] and m["upload_error"] is None
-    await wait_for(lambda: TINY in reported_files(h, "late"))                  # sent to the heads again
+    await wait_for(lambda: heads_of(h, TINY) == ["late"])                      # sent to the heads again
     assert (await chat(h, TINY)).status_code == 200
     locked.append(True)
     assert (await post(h, "/models/remove", {"model": TINY})).json()["upload_error"] == "Operation not permitted"

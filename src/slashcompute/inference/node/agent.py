@@ -727,18 +727,33 @@ class Agent:
         except OSError as e:   # then this pool can't delete it later, only Trash or keep it: safe
             log.warning("could not record the downloaded models: %s", e)
 
-    def _existing(self, filename: str, size: Optional[int], sha256: Optional[str]) -> Optional[Path]:
+    def _existing(self, filename: str, size: Optional[int], sha256: Optional[str],
+                  sent: dict[str, dict]) -> Optional[Path]:
+        """This Mac's copy when it is the file asked for (None: fetch it). Only the copy the engine loads
+        counts: the first folder that has the name (``model_path``). When that is another model, a download
+        is used only if it replaces it, and it may replace only what the asking pool sent here (``sent``,
+        as in ``still_ours``): an upload it has since replaced under the same name. Any other file of that
+        name is this Mac's or another pool's, so the request is refused instead of fetching gigabytes the
+        engine would never load."""
         for d in self.cfg.model_dirs:
             f = Path(d).expanduser() / filename
+            if not f.exists():
+                continue
             if f.is_file() and (size is None or f.stat().st_size == size) and (not sha256 or file_sha256(f) == sha256):
                 return f
+            if _same_dir(f.parent, Path(self.cfg.download_dir).expanduser()) and \
+                    filename in still_ours(self.cfg.download_dir, {k: v for k, v in sent.items() if k == filename}):
+                return None
+            raise ValueError(f"another {filename} is already on this Mac (not one this pool sent): "
+                             "move or rename it to get the pool's copy")
         return None
 
     async def download_model(self, p: dict) -> dict:
         """Fetch an uploaded GGUF from the coordinator (or ``url``), verify it, then report it."""
         name = Path(p["filename"]).name
         size, sha = p.get("size"), p.get("sha256")
-        found = await asyncio.to_thread(self._existing, name, size, sha)
+        found = await asyncio.to_thread(self._existing, name, size, sha,
+                                        dict(self.downloaded.get(self.cfg.coordinator_url, {})))
         if found is None:
             dest_dir = Path(self.cfg.download_dir).expanduser()
             dest_dir.mkdir(parents=True, exist_ok=True)
