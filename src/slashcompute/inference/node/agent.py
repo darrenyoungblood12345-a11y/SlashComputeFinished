@@ -317,6 +317,10 @@ class Agent:
     # ------------------------------------------------------------ lifecycle
 
     async def register(self) -> None:
+        if self.transport == "direct":
+            # a node starts out in direct mode, so the coordinator's "direct" below is no change and
+            # would never start the probe; and the port it binds (0 = any) has to be in this body
+            await self._start_probe()
         body = {
             "name": self.cfg.name, "os": self.info.get("os"), "chip": self.info.get("chip"),
             "total_mem_bytes": self.info.get("total_mem_bytes"), "tailscale_ip": self.ip,
@@ -395,13 +399,19 @@ class Agent:
         if hasattr(self.engine, "bind_ip"):
             # relay: the RPC server never listens beyond this machine
             self.engine.bind_ip = "127.0.0.1" if transport == "relay" else (self.ip or "127.0.0.1")
-        if transport == "direct" and self.probe is None and self.probe_fn and self.ip:
-            self.probe = await self.probe_fn(self.ip, self.probe_port)
-            with contextlib.suppress(AttributeError, IndexError):
-                self.probe_port = self.probe.sockets[0].getsockname()[1]
+        if transport == "direct":
+            await self._start_probe()
         elif transport == "relay" and self.probe is not None:
             self.probe.close()
             self.probe = None
+
+    async def _start_probe(self) -> None:
+        """Direct mode: listen for the peers' latency probes. ``probe_port`` becomes the port it bound, so
+        a later listener (back from relay mode) takes the port the coordinator was told."""
+        if self.probe is None and self.probe_fn and self.ip:
+            self.probe = await self.probe_fn(self.ip, self.probe_port)
+            with contextlib.suppress(AttributeError, IndexError):
+                self.probe_port = self.probe.sockets[0].getsockname()[1]
 
     async def heartbeat(self) -> None:
         available, reason = self.availability()
