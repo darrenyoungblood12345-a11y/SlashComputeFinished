@@ -382,6 +382,29 @@ def test_grant_lifecycle(core):
     assert len(pub) == 1 and pub[0].id == g.id
 
 
+def test_grant_view_counts_its_distinct_backers(core):
+    admin, _ = _account(core.auth, "admin@lan.test", name="Admin")
+    member, _ = _account(core.auth, "m@lan.test", name="Member")
+    other, _ = _account(core.auth, "o@lan.test", name="Other")
+    ada, _ = _account(core.auth, "ada@lan.test", name="Ada")
+    bea, _ = _account(core.auth, "bea@lan.test", name="Bea")
+    for donor in (ada, bea):
+        core.credits.contribute(donor.id, 100.0, 0)
+    core.credits.contribute(member.id, 100.0, 100)            # fills the community pot
+    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 100.0)
+    elsewhere = core.grants.create(other, "Another need", "A short paragraph about that one.", 100.0)
+    for grant in (g, elsewhere):
+        core.grants.review(admin, grant.id, True)
+    assert core.grants.view(g)["backers"] == 0
+    core.grants.donate(ada, g.id, 10.0)
+    core.grants.donate(ada, g.id, 5.0)                        # the same person twice is one backer
+    core.grants.donate(bea, g.id, 1.0)
+    core.grants.donate(admin, g.id, 10.0, from_pot=True)      # the pot is not a person
+    core.grants.donate(bea, elsewhere.id, 2.0)                # another grant's backers are its own
+    assert core.grants.view(core.grants.get(g.id))["backers"] == 2
+    assert core.grants.view(core.grants.get(elsewhere.id))["backers"] == 1
+
+
 def test_pot_allocate_admin_only(core):
     admin, _ = _account(core.auth, "admin@lan.test")
     member, _ = _account(core.auth, "m@lan.test")

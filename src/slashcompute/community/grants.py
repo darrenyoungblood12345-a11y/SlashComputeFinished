@@ -6,11 +6,12 @@ import math
 import secrets
 from typing import Optional
 
+from sqlalchemy import func
 from sqlmodel import select, update
 
 from slashcompute.community.credits import Credits
 from slashcompute.community.fields import text
-from slashcompute.coordinator.db import Database, Grant, GrantComment, User, UserFlag, now
+from slashcompute.coordinator.db import CreditTxn, Database, Grant, GrantComment, User, UserFlag, now
 
 # Far beyond any real ask; keeps goals finite so progress math and JSON stay sane.
 MAX_GOAL_FLOPS = 1e30
@@ -159,13 +160,22 @@ class Grants:
             for r in rows
         ]
 
+    def backers(self, grant_id: str) -> int:
+        """How many different people gave to this grant (an allocation from the pot is nobody's gift)."""
+        with self.db.session() as s:
+            return int(s.exec(
+                select(func.count(func.distinct(CreditTxn.user_id))).where(
+                    CreditTxn.grant_id == grant_id, CreditTxn.kind == "donate",
+                )
+            ).one() or 0)
+
     def view(self, g: Grant, names: Optional[dict[str, str]] = None) -> dict:
         names = names or {}
         return {
             "id": g.id, "author_id": g.author_id,
             "author": names.get(g.author_id, g.author_id[:8]),
             "title": g.title, "body": g.body, "goal_flops": g.goal_flops,
-            "received_flops": g.received_flops, "status": g.status,
+            "received_flops": g.received_flops, "backers": self.backers(g.id), "status": g.status,
             "created_at": g.created_at, "progress": (
                 g.received_flops / g.goal_flops if g.goal_flops else 0.0
             ),
