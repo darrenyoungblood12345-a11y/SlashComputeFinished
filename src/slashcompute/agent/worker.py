@@ -31,6 +31,11 @@ UPLOAD_RETRY_DELAYS_S = (2.0, 4.0, 8.0, 16.0)
 OnMessage = Callable[[object], Awaitable[None]]
 
 
+def bundle_path(job_dir: Path, step: int) -> Path:
+    """Where a stage saves what a replay of ``step`` needs (see ``StageSession.save_bundle``)."""
+    return job_dir / f"bundle_{step}.safetensors"
+
+
 class StageSession:
     """In-process stage so the daemon can drain / save verify bundles."""
 
@@ -83,19 +88,30 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     server = None
     prev = nxt = None
     # Downstream listens; upstream dials (see transport.peer).
-    if asg.stage_idx > 0:
-        server = await LinkServer(ctx.data_bind, ctx.data_port, hello,
-                                  send_timeout=asg.peer_timeout_s,
-                                  resume_window=asg.peer_timeout_s).start()
-        log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
-    if asg.next_peer is not None:
-        log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
-        nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
-                            timeout=PEER_HANDSHAKE_TIMEOUT_S,
-                            send_timeout=asg.peer_timeout_s, resume_window=asg.peer_timeout_s)
-    if server is not None:
-        prev = await server.accept(timeout=None)
-        log.info("upstream connected from %s", getattr(prev, "peername", "?"))
+    try:
+        if asg.stage_idx > 0:
+            server = await LinkServer(ctx.data_bind, ctx.data_port, hello,
+                                      send_timeout=asg.peer_timeout_s,
+                                      resume_window=asg.peer_timeout_s).start()
+            log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
+        if asg.next_peer is not None:
+            log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
+            nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
+                                timeout=PEER_HANDSHAKE_TIMEOUT_S,
+                                send_timeout=asg.peer_timeout_s, resume_window=asg.peer_timeout_s)
+        if server is not None:
+            prev = await server.accept(timeout=None)
+            log.info("upstream connected from %s", getattr(prev, "peername", "?"))
+    except BaseException:
+        # The caller only gets these once the handshake returns, so a cancel or a failure in
+        # the middle of it must let go of them here: a listener left bound keeps this agent's
+        # data port, and no later stage in this process (--no-sandbox) could listen on it.
+        # The listener first: closing it frees the port before anything below can wait.
+        if server is not None:
+            await server.close()
+        if nxt is not None:
+            await nxt.close()
+        raise
     return prev, nxt, server
 
 
@@ -214,15 +230,38 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
 # --------------------------------------------------------------------------- subprocess CLI
 
 
-async def _drain_on_stdin(session: StageSession, reader: asyncio.StreamReader) -> None:
-    """The daemon asks a sandboxed worker to drain with a ``{"type":"drain"}`` line on stdin."""
+def _export_bundle(ctx: WorkerContext, msg: dict) -> dict:
+    """Save what this stage holds for a sampled step, for the daemon to upload; the answer
+    echoes the request with ``ok``. Only this stage's own job and epoch and a plain step
+    number are served, and the file goes to this stage's job directory (the one place the
+    sandbox lets it write that the daemon reads), never to a path taken from the request."""
+    asg = ctx.assignment
+    job_id, epoch, step = msg.get("job_id"), msg.get("epoch"), msg.get("step")
+    ok = False
+    if job_id == asg.job_id and type(epoch) is int and epoch == asg.epoch and type(step) is int:
+        try:
+            ok = bool(ctx.session.save_bundle(step, bundle_path(ctx.job_dir, step)))
+        except Exception:  # answer anyway: the daemon is waiting, and the stage must go on
+            log.exception("could not save the bundle of step %d", step)
+    return {"type": "bundle", "job_id": job_id, "epoch": epoch, "step": step, "ok": ok}
+
+
+async def _serve_stdin(ctx: WorkerContext, reader: asyncio.StreamReader,
+                       answer: Callable[[dict], None]) -> None:
+    """What the daemon asks of a sandboxed worker, one JSON line each on stdin:
+    ``{"type":"drain"}``, and ``{"type":"bundle","job_id":…,"epoch":…,"step":…}`` for a
+    sampled step, which is answered on stdout (see ``_export_bundle``)."""
     while line := await reader.readline():
         try:
             msg = json.loads(line)
         except ValueError:
             continue
-        if isinstance(msg, dict) and msg.get("type") == "drain":
-            session.request_drain()
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("type") == "drain":
+            ctx.session.request_drain()
+        elif msg.get("type") == "bundle":
+            answer(_export_bundle(ctx, msg))
 
 
 def _stdin_is_pipe() -> bool:
@@ -259,20 +298,24 @@ def _stdio_app() -> None:
     async def emit(msg) -> None:
         print(dump(msg), flush=True)
 
+    def answer(reply: dict) -> None:
+        print(json.dumps(reply), flush=True)
+
     async def main() -> None:
-        drains = None
+        requests = None
         if _stdin_is_pipe():
             reader = asyncio.StreamReader()
             await asyncio.get_running_loop().connect_read_pipe(
                 lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-            drains = asyncio.create_task(_drain_on_stdin(ctx.session, reader))
+            requests = asyncio.create_task(_serve_stdin(ctx, reader, answer))
         else:
-            log.warning("stdin is not a pipe; this worker cannot be drained")
+            log.warning("stdin is not a pipe; this worker cannot be drained or asked for "
+                        "sampled steps")
         try:
             await run_stage(ctx, emit)
         finally:
-            if drains is not None:
-                drains.cancel()
+            if requests is not None:
+                requests.cancel()
 
     asyncio.run(main())
 

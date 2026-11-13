@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from slashcompute.common.jsonbool import body_bool
 from slashcompute.inference import PREFIX
 from slashcompute.inference import flops as fl
-from slashcompute.inference.accounting import Accounting, AccountingError, NullAccounting
+from slashcompute.inference.accounting import ACCOUNT_PREFIX, Accounting, AccountingError, NullAccounting
 from slashcompute.inference.config import GIB, InferenceSettings
 from slashcompute.inference.coordinator import nodes, registry, status
 from slashcompute.inference.coordinator.bus import CommandBus, CommandFailed, JobStreams
@@ -171,6 +171,11 @@ class InferenceService:
         self.latency_kick = asyncio.Event()
         self.bus.closing = asyncio.Event()  # bound to this run's event loop
         self.mgr.recover()
+        try:
+            self.accounting.recover()
+        except Exception:  # noqa: BLE001 - a bookkeeping failure must not keep the pool from starting
+            log.exception("refunding the reservations of a previous run failed")
+        self.check_uploads(None)
         if self.s.BACKGROUND_TASKS:
             for loop in (self.monitor_loop, self.tick_loop, self.latency_loop):
                 self.spawn(loop())
@@ -314,8 +319,11 @@ class InferenceService:
             raise HTTPException(404, "model uploads are not enabled on this coordinator")
         return Path(self.s.MODELS_DIR).expanduser()
 
-    def push_models(self, node_id: Optional[str] = None) -> int:
-        """Send ``download_model`` for every uploaded GGUF to each online head-capable node lacking it."""
+    def push_models(self, node_id: Optional[str] = None, held_only: bool = False) -> int:
+        """Send ``download_model`` for every uploaded GGUF to each online head-capable node that has not
+        confirmed it holds the current copy. A file of that name on its disk does not count: the node
+        checks its hash against the upload's and fetches the upload when it is another model.
+        ``held_only``: only the files a node reports (a check of what it has, not a delivery)."""
         if not self.s.MODELS_DIR:
             return 0
         files = self.conn.execute(DISTRIBUTED).fetchall()
@@ -324,10 +332,11 @@ class InferenceService:
         for n in rows:
             if (node_id and n["id"] != node_id) or not nodes.is_online(n, self.s):
                 continue
-            have = set(json.loads(n["gguf_files_json"] or "[]"))
+            have = nodes.head_files(self.conn, n)
+            reported = set(json.loads(n["gguf_files_json"] or "[]"))
             for f in files:
                 key = (n["id"], f["name"])
-                if f["name"] in have or key in self.pushing:
+                if f["name"] in have or key in self.pushing or (held_only and f["name"] not in reported):
                     continue
                 self.pushing.add(key)
                 self.spawn(self._push(n["id"], n["name"], f["name"], f["sha256"], f["size"]))
@@ -340,10 +349,29 @@ class InferenceService:
             await self.bus.send(node_id, "download_model", {
                 "filename": filename, "path": f"/models/files/{filename}", "sha256": sha256, "size": size,
             }, timeout=DOWNLOAD_TIMEOUT_S)
+            # it answers only once its copy has this hash: from now on it may head the model
+            self.conn.execute("INSERT OR REPLACE INTO node_uploads (node_id, name, sha256) VALUES (?,?,?)",
+                              (node_id, filename, sha256))
         except CommandFailed as e:
             log.warning("%s could not fetch %s: %s", name, filename, e)
         finally:
             self.pushing.discard((node_id, filename))
+        current = self.conn.execute("SELECT sha256 FROM model_files WHERE name=?", (filename,)).fetchone()
+        if current is not None and current["sha256"] != sha256:
+            self.push_models(node_id)   # uploaded again meanwhile: what this was sending is already replaced
+
+    def check_uploads(self, node_id: Optional[str], files: Optional[list[dict]] = None) -> None:
+        """Have heads confirm the uploads they report but never confirmed: a Mac back with an older copy,
+        one whose own file has that name, a pool from before these records. ``files``: what the node just
+        reported; an upload no longer among them is not confirmed any more (a file of that name that
+        shows up later may be another model)."""
+        if files is not None:
+            names = {f["name"] for f in files}
+            gone = [r["name"] for r in self.conn.execute("SELECT name FROM node_uploads WHERE node_id=?", (node_id,))
+                    if r["name"] not in names]
+            self.conn.executemany("DELETE FROM node_uploads WHERE node_id=? AND name=?",
+                                  [(node_id, n) for n in gone])
+        self.push_models(node_id, held_only=True)
 
     def removing(self, name: str) -> bool:
         return any(e["removing"] for e in self.removals.get(name, {}).values())
@@ -353,8 +381,11 @@ class InferenceService:
             raise HTTPException(409, f"{name} is still being removed from the pool's Macs; try again in a moment")
 
     async def receive_upload(self, request: Request, name: str) -> dict:
-        if not _SAFE_NAME.match(name or ""):
-            raise HTTPException(400, "file name must look like model-name.gguf (letters, digits, . _ -)")
+        # plain_gguf is what a node's scan and Remove accept: a name they would skip (a dotfile) must not
+        # get onto disk here, where nothing could list, serve or remove it again
+        if not _SAFE_NAME.match(name or "") or not registry.plain_gguf(name):
+            raise HTTPException(400, "file name must look like model-name.gguf (letters, digits, . _ -) "
+                                     "and must not start with a dot")
         root = self.models_dir()
         self._refuse_while_removing(name)   # a Mac still deleting it would delete the new copy too
         dest = root / name
@@ -392,6 +423,11 @@ class InferenceService:
             registry.store_layout(self.conn, name, layout, "upload", mflops, size_bytes=size, sha256=digest, **keep)
         self.removals.pop(name, None)
         self.upload_errors.pop(name, None)
+        if row is not None and row["sha256"] != digest:
+            # another model took this name (or one known only from a Mac's report, whose bytes nobody
+            # compared): no head counts as holding it until it confirms the new copy, and the pipelines
+            # that loaded the old one must not answer for it
+            await self.mgr.unload(name, "replaced by a new upload")
         pushed = self.push_models()
         log.info("uploaded %s (%.2f GB); pushing to %d head(s)", name, size / 1e9, pushed)
         return {"name": name, "size": size, "sha256": digest, "layers": layout.n_layers, "pushed": pushed}
@@ -616,6 +652,7 @@ def make_router(svc: InferenceService) -> APIRouter:
         svc.online.add(node_id)
         svc.forgotten.discard(node_id)   # it just reported its files
         svc.kick_latency()
+        svc.check_uploads(node_id, body.get("gguf_files", []))
         if fields["can_head"]:
             svc.push_models(node_id)
         log.info("inference node %s (%s) registered: %s, commits %.0f GiB", body["name"], node_id, body.get("chip"),
@@ -679,6 +716,7 @@ def make_router(svc: InferenceService) -> APIRouter:
                      (json.dumps(sorted({f["name"] for f in files})), row["id"]))
         svc.forgotten.discard(row["id"])
         svc.accept_headers(row["id"], files)
+        svc.check_uploads(row["id"], files)
         return {"ok": True}
 
     @r.post("/nodes/latency")
@@ -829,7 +867,7 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         engine_body = {k: v for k, v in body.items()
                        if k not in ("stream", "stream_options", "model", "max_completion_tokens", "n_predict")}
         engine_body["max_tokens"] = max_tokens
-        account_id = "inf-" + uuid.uuid4().hex[:12]
+        account_id = ACCOUNT_PREFIX + uuid.uuid4().hex[:12]
         reserved = False
         if user_id:
             # a true upper bound (the charge is capped at it); settle() refunds the rest

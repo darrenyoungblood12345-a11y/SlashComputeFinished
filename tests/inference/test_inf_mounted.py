@@ -282,6 +282,42 @@ async def test_max_tokens_must_be_a_positive_integer(pool, bad):
             assert r.status_code == 400 and "max_tokens" in r.text, (field, r.text)
 
 
+async def test_a_restart_refunds_the_reservations_a_crash_left_open(tmp_path):
+    """settle() lives in the chat handler: a coordinator killed mid-reply never runs it, and the
+    chatter's hold stayed deducted for good. The next start has to give the unused part back."""
+    cfg = EngineConfig(home=tmp_path / "home", scheduler_tick_s=0.05, verify_rate=0.0)
+    settings = fast_settings(DB_PATH=str(tmp_path / "inference.db"))
+
+    async def boot():
+        return await start_harness(settings, tmp=str(tmp_path / "nodes"),
+                                   app_factory=lambda: create_app(cfg, inference=settings))
+
+    h = await boot()
+    try:
+        chatter, _ = account(h, "chatter@lan.test", balance=1e16)
+        credits, svc = core(h).credits, h.app.state.inference
+        # what the chat handler does before a reply, with part of it already charged...
+        svc.accounting.reserve(chatter.id, "inf-crashed00001", 4e15)
+        assert credits.consume_job("inf-crashed00001", 1e15) == 1e15
+        assert credits.balance(chatter.id) == pytest.approx(6e15)
+        assert credits.reserved_in_flight(chatter.id) == pytest.approx(3e15)
+        # ...and then the process dies: nothing settles, the databases keep what they had
+    finally:
+        await h.stop()
+
+    for _ in range(2):      # the second restart finds nothing to give back
+        h = await boot()
+        try:
+            credits = core(h).credits
+            assert credits.reserved_in_flight(chatter.id) == 0
+            assert credits.balance(chatter.id) == pytest.approx(9e15)       # only the work done is paid for
+            assert credits.lifetime_spent(chatter.id) == pytest.approx(1e15)
+            released = [t for t in credits.list_txns(chatter.id)["items"] if t["kind"] == "release"]
+            assert [(t["job_id"], t["amount"]) for t in released] == [("inf-crashed00001", 3e15)]
+        finally:
+            await h.stop()
+
+
 class RecordingEngine(FakeEngine):
     bodies: list = []
 

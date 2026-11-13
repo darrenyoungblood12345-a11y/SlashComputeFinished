@@ -363,6 +363,9 @@ class PipelineManager:
         with tx(self.conn):
             n = self.conn.execute(f"UPDATE pipelines SET state='stopped', stopped_at=?, broken_reason=? "
                                   f"WHERE state IN ({live})", (time.time(), reason, *nodes.LIVE_STATES)).rowcount
+            # their requests died with that run too: nothing will ever finish these jobs
+            self.conn.execute("UPDATE jobs SET state='failed', error=?, retryable=1, finished_at=? "
+                              "WHERE state IN ('queued', 'running')", (reason, time.time()))
         if n:
             log.info("stopped %d pipeline(s) left live by a previous run (%s)", n, reason)
         for r in rows:

@@ -317,6 +317,10 @@ class Agent:
     # ------------------------------------------------------------ lifecycle
 
     async def register(self) -> None:
+        if self.transport == "direct":
+            # a node starts out in direct mode, so the coordinator's "direct" below is no change and
+            # would never start the probe; and the port it binds (0 = any) has to be in this body
+            await self._start_probe()
         body = {
             "name": self.cfg.name, "os": self.info.get("os"), "chip": self.info.get("chip"),
             "total_mem_bytes": self.info.get("total_mem_bytes"), "tailscale_ip": self.ip,
@@ -395,13 +399,19 @@ class Agent:
         if hasattr(self.engine, "bind_ip"):
             # relay: the RPC server never listens beyond this machine
             self.engine.bind_ip = "127.0.0.1" if transport == "relay" else (self.ip or "127.0.0.1")
-        if transport == "direct" and self.probe is None and self.probe_fn and self.ip:
-            self.probe = await self.probe_fn(self.ip, self.probe_port)
-            with contextlib.suppress(AttributeError, IndexError):
-                self.probe_port = self.probe.sockets[0].getsockname()[1]
+        if transport == "direct":
+            await self._start_probe()
         elif transport == "relay" and self.probe is not None:
             self.probe.close()
             self.probe = None
+
+    async def _start_probe(self) -> None:
+        """Direct mode: listen for the peers' latency probes. ``probe_port`` becomes the port it bound, so
+        a later listener (back from relay mode) takes the port the coordinator was told."""
+        if self.probe is None and self.probe_fn and self.ip:
+            self.probe = await self.probe_fn(self.ip, self.probe_port)
+            with contextlib.suppress(AttributeError, IndexError):
+                self.probe_port = self.probe.sockets[0].getsockname()[1]
 
     async def heartbeat(self) -> None:
         available, reason = self.availability()
@@ -727,18 +737,33 @@ class Agent:
         except OSError as e:   # then this pool can't delete it later, only Trash or keep it: safe
             log.warning("could not record the downloaded models: %s", e)
 
-    def _existing(self, filename: str, size: Optional[int], sha256: Optional[str]) -> Optional[Path]:
+    def _existing(self, filename: str, size: Optional[int], sha256: Optional[str],
+                  sent: dict[str, dict]) -> Optional[Path]:
+        """This Mac's copy when it is the file asked for (None: fetch it). Only the copy the engine loads
+        counts: the first folder that has the name (``model_path``). When that is another model, a download
+        is used only if it replaces it, and it may replace only what the asking pool sent here (``sent``,
+        as in ``still_ours``): an upload it has since replaced under the same name. Any other file of that
+        name is this Mac's or another pool's, so the request is refused instead of fetching gigabytes the
+        engine would never load."""
         for d in self.cfg.model_dirs:
             f = Path(d).expanduser() / filename
+            if not f.exists():
+                continue
             if f.is_file() and (size is None or f.stat().st_size == size) and (not sha256 or file_sha256(f) == sha256):
                 return f
+            if _same_dir(f.parent, Path(self.cfg.download_dir).expanduser()) and \
+                    filename in still_ours(self.cfg.download_dir, {k: v for k, v in sent.items() if k == filename}):
+                return None
+            raise ValueError(f"another {filename} is already on this Mac (not one this pool sent): "
+                             "move or rename it to get the pool's copy")
         return None
 
     async def download_model(self, p: dict) -> dict:
         """Fetch an uploaded GGUF from the coordinator (or ``url``), verify it, then report it."""
         name = Path(p["filename"]).name
         size, sha = p.get("size"), p.get("sha256")
-        found = await asyncio.to_thread(self._existing, name, size, sha)
+        found = await asyncio.to_thread(self._existing, name, size, sha,
+                                        dict(self.downloaded.get(self.cfg.coordinator_url, {})))
         if found is None:
             dest_dir = Path(self.cfg.download_dir).expanduser()
             dest_dir.mkdir(parents=True, exist_ok=True)

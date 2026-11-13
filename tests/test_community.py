@@ -19,10 +19,12 @@ from slashcompute.community.credits import POT_ID, CreditError
 from slashcompute.community.grants import GrantError
 from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
-from slashcompute.coordinator.db import User
+from slashcompute.coordinator.db import CreditTxn, User
 from slashcompute.coordinator.inference_accounting import CoreAccounting
+from slashcompute.coordinator.partitioner import StagePlan
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
+from slashcompute.pipeline.model_profile import profile_model
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +67,13 @@ def _spec(tiny_model, tiny_dataset, **kw):
     return LoraFinetuneSpec(**(base | kw))
 
 
+def _one_stage_epoch(job):
+    """Epoch 1 as the scheduler starts it on one Mac: the whole model as stage 0. Steps are
+    billed against the stage the coordinator planned, so a step test needs one."""
+    job.profile = profile_model(job.spec.model)
+    return EpochState(epoch=1, plans=[StagePlan(0, "n1", 0, job.profile.num_layers, 0)])
+
+
 def _account(auth, email="ada@lan.test", password="password1", name="Ada"):
     user = auth.register(email, password, name)
     user, token = auth.login(email, password)
@@ -81,11 +90,63 @@ def test_first_user_is_admin_second_is_not(core):
     assert b.admin is False
 
 
-def test_admin_email_env(core, monkeypatch):
+def test_admin_email_env_is_not_granted_to_a_password_registration(core, monkeypatch):
+    # Anyone can type the configured address into the sign-up form: that proves nothing.
     monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
     _account(core.auth, "first@lan.test")
     ops, _ = _account(core.auth, "ops@lan.test")
+    assert ops.admin is False
+    assert core.auth.get_by_email("ops@lan.test").admin is False
+
+
+def test_admin_email_env_is_granted_to_a_verified_google_sign_in(core, monkeypatch):
+    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "Ops@lan.test ")
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    _account(core.auth, "first@lan.test")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "other@lan.test", "name": "Other", "sub": "sub-other",
+    }
+    other, _ = core.auth.login_google("id-token")
+    assert other.admin is False
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "ops@lan.test", "name": "Ops", "sub": "sub-ops",
+    }
+    ops, _ = core.auth.login_google("id-token")
     assert ops.admin is True
+    assert core.auth.get_by_email("ops@lan.test").admin is True
+
+
+def test_admin_email_env_squatter_never_becomes_admin(core, monkeypatch):
+    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    _account(core.auth, "first@lan.test")
+    squatter, squatter_token = _account(core.auth, "ops@lan.test", "squatter-pw1", "Mallory")
+    assert squatter.admin is False
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "ops@lan.test", "name": "Ops", "sub": "sub-ops",
+    }
+    # The real owner arrives through Google: the account becomes admin only once the
+    # squatter's password and sessions are gone.
+    ops, token = core.auth.login_google("id-token")
+    assert ops.id == squatter.id and ops.admin is True
+    assert core.auth.user_from_token(token).admin is True
+    assert core.auth.user_from_token(squatter_token) is None
+    with pytest.raises(AuthError):
+        core.auth.login("ops@lan.test", "squatter-pw1")
+
+
+def test_http_register_with_the_admin_email_is_not_admin(env, monkeypatch):
+    client, core, *_ = env
+    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
+    first = client.post("/auth/register", json={
+        "email": "first@lan.test", "password": "password1", "name": "First"}).json()
+    assert first["user"]["admin"] is True       # the bootstrap rule is unchanged
+    r = client.post("/auth/register", json={
+        "email": "ops@lan.test", "password": "password1", "name": "Ops"})
+    assert r.status_code == 200
+    assert r.json()["user"]["admin"] is False
+    users = client.get("/admin/users", headers={"Authorization": f"Bearer {r.json()['token']}"})
+    assert users.status_code == 403
 
 
 def test_register_rejects_bad_email_short_password_duplicate(core):
@@ -127,6 +188,26 @@ def test_terms_and_grant_split(core):
         core.auth.update_profile(user, name="  ")
 
 
+def test_summary_reports_what_was_given_and_kept_at_the_split_of_the_time(core):
+    user, _ = _account(core.auth)
+    other, _ = _account(core.auth, "o@lan.test")
+    core.credits.contribute(user.id, 100.0, user.grant_split)     # earned while keeping everything
+    core.credits.contribute(other.id, 40.0, 50)                   # someone else's share is theirs alone
+    s = core.credits.summary(user.id)
+    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (100.0, 0.0, 100.0)
+    # A new split is for what comes next: nothing already posted moves.
+    user = core.auth.update_profile(user, grant_split=100)
+    s = core.credits.summary(user.id)
+    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (100.0, 0.0, 100.0)
+    core.credits.contribute(user.id, 50.0, user.grant_split)
+    core.credits.contribute(user.id, 20.0, 25)
+    s = core.credits.summary(user.id)
+    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (170.0, 55.0, 115.0)
+    assert s["balance"] == 115.0 and s["pot"] == 20.0 + 55.0
+    o = core.credits.summary(other.id)
+    assert (o["lifetime_to_grants"], o["lifetime_kept"]) == (20.0, 20.0)
+
+
 def test_google_disabled_without_client_id(core):
     assert google_client_id() == ""
     with pytest.raises(AuthError) as e:
@@ -146,6 +227,56 @@ def test_google_login_creates_user(core, monkeypatch):
         core.auth.login("g@lan.test", "password1")
     again, _ = core.auth.login_google("id-token")
     assert again.id == user.id
+
+
+def test_google_login_revokes_a_preclaimed_password_account(core, monkeypatch):
+    # Someone registers the victim's address with their own password before the victim arrives.
+    _, attacker_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
+    }
+    user, token = core.auth.login_google("id-token")
+    assert user.google_sub == "sub-victim"
+    assert core.auth.user_from_token(token).id == user.id
+    # Google verified the mailbox; the password and sessions from before it are gone.
+    assert core.auth.user_from_token(attacker_token) is None
+    with pytest.raises(AuthError) as e:
+        core.auth.login("victim@lan.test", "attacker-pw1")
+    assert e.value.status == 401
+    # Signing in again keeps the owner's own sessions.
+    again, token2 = core.auth.login_google("id-token")
+    assert again.id == user.id
+    assert core.auth.user_from_token(token) is not None
+    assert core.auth.user_from_token(token2) is not None
+
+
+def test_google_login_revokes_the_password_of_an_already_linked_account(core, monkeypatch):
+    # Accounts linked before the reclaim existed still carry the password they were made with.
+    user, old_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
+    user.google_sub = "sub-victim"
+    core.db.save(user)
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
+    }
+    core.auth.login_google("id-token")
+    assert core.auth.user_from_token(old_token) is None
+    with pytest.raises(AuthError):
+        core.auth.login("victim@lan.test", "attacker-pw1")
+
+
+def test_concurrent_google_takeover_keeps_every_new_session(core, monkeypatch):
+    _, attacker_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
+    }
+    results, errors = _race(8, lambda i: core.auth.login_google("id-token"))
+    assert errors == []
+    assert core.auth.user_from_token(attacker_token) is None
+    # Only the first sign-in revokes: a later one must not log the others out again.
+    assert all(core.auth.user_from_token(tok) is not None for _, tok in results)
 
 
 def test_logout_drops_session(core):
@@ -225,6 +356,31 @@ def test_leaderboard_ranks_generated(core):
     assert board[0]["lifetime_earned"] == 50.0
 
 
+def test_settle_open_jobs_refunds_only_the_accounts_under_its_prefix(core):
+    user, _ = _account(core.auth)
+    core.credits.post(user.id, "earn", 1000.0)
+    core.credits.reserve_job(user.id, "inf-crashed", 400.0)      # a chat cut off by a crash
+    core.credits.consume_job("inf-crashed", 150.0)
+    core.credits.reserve_job(user.id, "inf-settled", 100.0)      # one that finished normally
+    core.credits.consume_job("inf-settled", 30.0)
+    core.credits.settle_job("inf-settled")
+    core.credits.reserve_job(user.id, "a1b2c3d4e5f6", 200.0)     # a training job, still running
+    core.credits.reserve_job(user.id, "inf_x", 50.0)             # "_" is not a wildcard
+    assert core.credits.balance(user.id) == pytest.approx(1000 - 400 - 30 - 200 - 50)
+
+    assert core.credits.settle_open_jobs("inf-") == 1
+    assert core.credits.balance(user.id) == pytest.approx(1000 - 150 - 30 - 200 - 50)
+    assert core.credits.reserved_in_flight(user.id) == pytest.approx(250.0)   # the other two holds
+    acct = core.credits.job_account("inf-crashed")
+    assert acct.reserved_flops == acct.spent_flops == 150.0
+    # nothing left open: running it again releases nothing twice
+    assert core.credits.settle_open_jobs("inf-") == 0
+    assert core.credits.balance(user.id) == pytest.approx(1000 - 150 - 30 - 200 - 50)
+    with core.db.session() as s:
+        releases = s.exec(select(CreditTxn).where(CreditTxn.kind == "release")).all()
+    assert sorted((r.job_id, r.amount) for r in releases) == [("inf-crashed", 250.0), ("inf-settled", 70.0)]
+
+
 # --------------------------------------------------------------------------- grants
 
 
@@ -253,6 +409,29 @@ def test_grant_lifecycle(core):
     assert core.credits.balance(member.id) == 40.0
     pub = core.grants.list(viewer=None)
     assert len(pub) == 1 and pub[0].id == g.id
+
+
+def test_grant_view_counts_its_distinct_backers(core):
+    admin, _ = _account(core.auth, "admin@lan.test", name="Admin")
+    member, _ = _account(core.auth, "m@lan.test", name="Member")
+    other, _ = _account(core.auth, "o@lan.test", name="Other")
+    ada, _ = _account(core.auth, "ada@lan.test", name="Ada")
+    bea, _ = _account(core.auth, "bea@lan.test", name="Bea")
+    for donor in (ada, bea):
+        core.credits.contribute(donor.id, 100.0, 0)
+    core.credits.contribute(member.id, 100.0, 100)            # fills the community pot
+    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 100.0)
+    elsewhere = core.grants.create(other, "Another need", "A short paragraph about that one.", 100.0)
+    for grant in (g, elsewhere):
+        core.grants.review(admin, grant.id, True)
+    assert core.grants.view(g)["backers"] == 0
+    core.grants.donate(ada, g.id, 10.0)
+    core.grants.donate(ada, g.id, 5.0)                        # the same person twice is one backer
+    core.grants.donate(bea, g.id, 1.0)
+    core.grants.donate(admin, g.id, 10.0, from_pot=True)      # the pot is not a person
+    core.grants.donate(bea, elsewhere.id, 2.0)                # another grant's backers are its own
+    assert core.grants.view(core.grants.get(g.id))["backers"] == 2
+    assert core.grants.view(core.grants.get(elsewhere.id))["backers"] == 1
 
 
 def test_pot_allocate_admin_only(core):
@@ -582,7 +761,7 @@ def test_steps_earn_and_spend_one_to_one(core):
     core.credits.contribute(user.id, 1e12, 0)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 5e9)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):
@@ -607,7 +786,7 @@ def test_anonymous_job_does_not_mint_credits(core):
     user, token = _account(core.auth)
     core.auth.accept_terms(user)
     job = core.submit(_spec(tiny_model, tiny_dataset))
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
 
     async def send(_):
         return None
@@ -631,7 +810,7 @@ def test_budget_exhaust_cancels_job(core):
     core.credits.contribute(user.id, 1e12, 0)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1e9)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):
@@ -658,7 +837,7 @@ def test_grant_split_on_step(core):
     core.credits.contribute(user.id, 1e12, 0)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1e10)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):
@@ -683,7 +862,7 @@ def test_last_step_mints_only_charged_flops(core):
     core.credits.contribute(user.id, 1e12, 0)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1.5e9)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):
@@ -743,7 +922,7 @@ def test_training_share_without_eligible_host_goes_to_pot(core, banned):
     host, host_tok, chatter = _host_and_chatter(core)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(chatter.id, job.id, 5e9)
-    job.current = EpochState(epoch=1, plans=[])
+    job.current = _one_stage_epoch(job)
     job.row.status = "running"
 
     async def send(_):

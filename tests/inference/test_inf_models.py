@@ -8,7 +8,8 @@ import httpx
 import pytest
 
 from inf_gguf_fixtures import tiny_gguf
-from inf_harness import FakeNode, chat, fast_settings, start_harness, upload, wait_for
+from inf_harness import FakeNode, chat, fast_settings, heads_of, start_harness, upload, wait_for
+from slashcompute.inference.coordinator import registry
 from slashcompute.inference.node.agent import scan_models
 
 
@@ -70,7 +71,14 @@ async def test_upload_is_validated(cluster):
     assert (await upload(h, "notes.txt", b"hello")).status_code == 400
     r = await upload(h, "junk.gguf", b"definitely not a gguf file")
     assert r.status_code == 422
+    # a hidden name: no Mac lists dotfiles and Remove refuses them, so it would sit on disk unusable
+    for hidden in (".model.gguf", "..gguf", "._model.gguf"):
+        r = await upload(h, hidden, tiny_gguf())
+        assert r.status_code == 400 and "must not start with a dot" in r.json()["detail"], (hidden, r.text)
+    assert (await upload(h, "model.gguf\n", tiny_gguf())).status_code == 400
     assert not any(Path(h.settings.MODELS_DIR).iterdir())       # nothing left behind
+    assert h.conn.execute("SELECT COUNT(*) FROM models").fetchone()[0] == 0
+    assert h.conn.execute("SELECT COUNT(*) FROM model_files").fetchone()[0] == 0
 
 
 async def test_upload_is_pushed_to_heads_and_becomes_servable(cluster):
@@ -86,7 +94,8 @@ async def test_upload_is_pushed_to_heads_and_becomes_servable(cluster):
     got = Path(h.agents["head"].cfg.download_dir) / "tiny.gguf"
     await wait_for(lambda: got.exists())
     assert got.read_bytes() == data
-    await wait_for(lambda: "tiny.gguf" in reported_files(h, "head"))
+    await wait_for(lambda: heads_of(h, "tiny.gguf") == ["head"])
+    assert "tiny.gguf" in reported_files(h, "head")
     assert not (Path(h.agents["worker"].cfg.download_dir) / "tiny.gguf").exists()
     assert await models(h) == ["tiny.gguf"]
     r = await chat(h, "tiny.gguf")
@@ -105,13 +114,126 @@ async def test_a_head_with_the_same_file_skips_the_download_and_late_heads_get_i
     # a head that joins after the upload is sent the file when it registers
     await h.add_node(FakeNode("late", 16, may_be_head=True), 1, gguf_files=[])
 
-    await wait_for(lambda: "tiny.gguf" in reported_files(h, "copy") and "tiny.gguf" in reported_files(h, "late"))
+    await wait_for(lambda: heads_of(h, "tiny.gguf") == ["copy", "late"])
+    assert "tiny.gguf" in reported_files(h, "copy") and "tiny.gguf" in reported_files(h, "late")
     assert not (Path(h.agents["copy"].cfg.download_dir) / "tiny.gguf").exists()
     assert (Path(h.agents["late"].cfg.download_dir) / "tiny.gguf").read_bytes() == data
     async with httpx.AsyncClient(base_url=h.node_url) as c:
         st = (await c.get("/status")).json()
     (m,) = [m for m in st["models"] if m["id"] == "tiny.gguf"]
     assert m["uploaded"] and m["servable"] and sorted(m["heads"]) == ["copy", "late"]
+
+
+def pipeline_states(h) -> list[str]:
+    return [r["state"] for r in h.conn.execute("SELECT state FROM pipelines ORDER BY created_at")]
+
+
+def hold_downloads(agent) -> asyncio.Event:
+    """This Mac's downloads wait until the returned event is set."""
+    gate, real = asyncio.Event(), agent.download_model
+
+    async def held(p):
+        await gate.wait()
+        return await real(p)
+
+    agent.download_model = held
+    return gate
+
+
+def other_model(data: bytes) -> bytes:
+    """Another model with the same header and size: only its bytes (its sha256) tell the two apart."""
+    return data[:-1] + b"\x01"
+
+
+async def test_a_different_model_uploaded_under_the_same_name_replaces_the_heads_copy(cluster):
+    """The head was skipped because it already reported a file of that name: it went on loading the old
+    model while the pool listed and charged for the new one."""
+    h = cluster
+    head = await h.add_node(FakeNode("head", 16, may_be_head=True), 0, gguf_files=[])
+    old = tiny_gguf()
+    new = other_model(old)
+    assert (await upload(h, "tiny.gguf", old)).status_code == 200
+    got = Path(head.cfg.download_dir) / "tiny.gguf"
+    await wait_for(lambda: heads_of(h, "tiny.gguf") == ["head"])
+    assert (await chat(h, "tiny.gguf")).status_code == 200            # a pipeline holds the old model
+    assert pipeline_states(h) == ["active"]
+
+    r = await upload(h, "tiny.gguf", old)                             # the same file again: nothing to do
+    assert r.status_code == 200 and r.json()["pushed"] == 0
+    assert heads_of(h, "tiny.gguf") == ["head"] and pipeline_states(h) == ["active"]
+
+    gate = hold_downloads(head)
+    r = await upload(h, "tiny.gguf", new)
+    assert r.status_code == 200 and r.json()["pushed"] == 1, r.text   # sent although the name is there
+    # the head still has only the old bytes: it must not serve them as the new model
+    assert heads_of(h, "tiny.gguf") == [] and await models(h) == []
+    assert "tiny.gguf" in reported_files(h, "head") and got.read_bytes() == old
+    await wait_for(lambda: pipeline_states(h) == ["stopped"])         # and the pipeline on the old model is gone
+    gate.set()
+    await wait_for(lambda: heads_of(h, "tiny.gguf") == ["head"])
+    assert got.read_bytes() == new
+    assert await models(h) == ["tiny.gguf"]
+    assert (await chat(h, "tiny.gguf")).status_code == 200
+    assert pipeline_states(h) == ["stopped", "active"]                # loaded again, from the new file
+
+
+@pytest.mark.parametrize("folder", ["models", "downloads"])
+async def test_a_mac_whose_own_file_has_that_name_does_not_head_another_upload(cluster, tmp_path, folder):
+    """Its engine loads the copy in its own models folder: a download next to it would never be used. And a
+    file in the app's folder that this pool did not send (another pool's, the Mac's own upload when it
+    hosts) is not this pool's to write over."""
+    h = cluster
+    own = tmp_path / "nodes" / "keeper" / folder
+    own.mkdir(parents=True)
+    mine = tiny_gguf()
+    (own / "tiny.gguf").write_bytes(mine)
+    keeper = await h.add_node(FakeNode("keeper", 16, may_be_head=True), 0, gguf_files=scan_models([str(own)]))
+    assert heads_of(h, "tiny.gguf") == ["keeper"]                     # its own model, known from its report
+    await h.add_node(FakeNode("fresh", 16, may_be_head=True), 1, gguf_files=[])
+
+    r = await upload(h, "tiny.gguf", other_model(mine))
+    assert r.status_code == 200 and r.json()["pushed"] == 2, r.text
+    await wait_for(lambda: heads_of(h, "tiny.gguf") == ["fresh"] and not h.svc.pushing)
+    assert heads_of(h, "tiny.gguf") == ["fresh"]                      # keeper refused: it never heads the upload
+    assert (own / "tiny.gguf").read_bytes() == mine                   # its own file is left alone
+    assert sorted(p.name for p in Path(keeper.cfg.models_dir).parent.rglob("*.gguf*")) == ["tiny.gguf"]
+    assert "tiny.gguf" in reported_files(h, "keeper")                 # and is still shown as on that Mac
+
+
+async def test_a_mac_back_from_offline_with_a_replaced_upload_fetches_the_new_one(cluster):
+    h = cluster
+    mac = await h.add_node(FakeNode("mac", 16, may_be_head=True), 0, gguf_files=[])
+    old = tiny_gguf()
+    assert (await upload(h, "tiny.gguf", old)).status_code == 200
+    await wait_for(lambda: heads_of(h, "tiny.gguf") == ["mac"])
+    await mac.cancel_tasks()                                          # the Mac sleeps
+    await wait_for(lambda: not registry.holders(h.conn, h.settings, "tiny.gguf"))
+    r = await upload(h, "tiny.gguf", other_model(old))
+    assert r.status_code == 200 and r.json()["pushed"] == 0           # nobody online to send it to
+    for loop in (mac.command_loop, mac.heartbeat_loop, mac.models_loop):   # it wakes, with the old file
+        mac._spawn(loop())
+    await wait_for(lambda: heads_of(h, "tiny.gguf") == ["mac"])
+    assert (Path(mac.cfg.download_dir) / "tiny.gguf").read_bytes() == other_model(old)
+
+
+async def test_heads_confirm_the_uploads_they_hold_after_a_restart_without_a_record(tmp_path):
+    """A pool upgraded from before the per-head record: the heads are asked once and serve again."""
+    settings = fast_settings(DB_PATH=str(tmp_path / "inference.sqlite3"), MODELS_DIR=str(tmp_path / "coord-models"),
+                             OFFLINE_AFTER_SECONDS=5)
+    h = await start_harness(settings, tmp=str(tmp_path / "nodes"))
+    try:
+        await h.add_node(FakeNode("head", 16, may_be_head=True), 0, gguf_files=[])
+        assert (await upload(h, "tiny.gguf", tiny_gguf())).status_code == 200
+        await wait_for(lambda: heads_of(h, "tiny.gguf") == ["head"])
+        port = int(h.url.rsplit(":", 1)[1])
+        h.server.should_exit = True                                   # the pool restarts; the Mac keeps running
+        await h._task
+        h.conn.execute("DELETE FROM node_uploads")
+        await h.start(port)
+        await wait_for(lambda: heads_of(h, "tiny.gguf") == ["head"])
+        assert (await chat(h, "tiny.gguf")).status_code == 200
+    finally:
+        await h.stop()
 
 
 async def test_files_are_only_served_to_nodes(cluster):

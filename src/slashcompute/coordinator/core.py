@@ -36,10 +36,13 @@ from slashcompute.coordinator.db import Checkpoint, Database, Job, Node, now
 from slashcompute.coordinator.ledger import Ledger
 from slashcompute.coordinator.recovery import Recovery
 from slashcompute.coordinator.registry import Assignment, CloseFn, NodeState, Registry, SendFn
-from slashcompute.coordinator.scheduler import ACTIVE, TERMINAL, WAITING, JobRuntime, Scheduler
+from slashcompute.coordinator.scheduler import (
+    ACTIVE, TERMINAL, WAITING, EpochState, JobRuntime, Scheduler,
+)
 from slashcompute.coordinator.verification import VerificationManager
 from slashcompute.common.config import allowed_model
 from slashcompute.jobs import LoraFinetuneSpec, parse_spec
+from slashcompute.metering.flops import max_stage_step_flops
 from slashcompute.pipeline.data import check_dataset
 
 log = logging.getLogger(__name__)
@@ -422,11 +425,28 @@ class Coordinator:
         return cur is not None and cur.epoch == epoch and any(
             p.stage_idx == stage_idx and p.node_id == node_id for p in cur.plans)
 
+    def _max_step_flops(self, job: JobRuntime, cur: EpochState, stage_idx: int) -> float:
+        """The most one step of this stage can cost, from what the coordinator itself knows:
+        the model's shape, the layers it planned for the stage and the job's batch limits.
+        Zero for a stage it cannot size, so a step is never billed on the stage's word alone."""
+        plan = next((p for p in cur.plans if p.stage_idx == stage_idx), None)
+        if plan is None or job.profile is None:
+            return 0.0
+        return max_stage_step_flops(job.profile, plan.layer_start, plan.layer_end,
+                                    job.spec.batch_size, job.spec.max_seq_len)
+
     async def _on_step(self, node_id: str, msg: StepMetrics) -> None:
         job = self.jobs.get(msg.job_id)
         cur = job.current if job else None
         if cur is None or cur.epoch != msg.epoch or cur.closed:
             return  # a stage still running in an aborted epoch is not billed
+        if not cur.resume_step < msg.step <= job.spec.steps:
+            # With each step billed once (below), this caps what a stage can bill in an epoch
+            # at the steps the epoch has left; any other step number would be free money.
+            log.warning("dropping step %d from job %s stage %d: epoch %d runs steps %d..%d",
+                        msg.step, job.id, msg.stage_idx, cur.epoch, cur.resume_step + 1,
+                        job.spec.steps)
+            return
         if (msg.stage_idx, msg.step) in cur.steps_seen:
             log.warning("dropping repeated step %d from job %s stage %d", msg.step, job.id,
                         msg.stage_idx)
@@ -434,25 +454,35 @@ class Coordinator:
         cur.steps_seen.add((msg.stage_idx, msg.step))
         cur.last_progress = time.monotonic()
         self.ledger.record_step(node_id, msg)
-        flops = float(msg.usage.flops)
+        # The reported FLOPs are the stage's own figure, so they are billed only up to what
+        # the step can cost. A claim that is not a positive number (NaN included) bills nothing.
+        claimed, ceiling = float(msg.usage.flops), self._max_step_flops(job, cur, msg.stage_idx)
+        flops = min(claimed, ceiling) if claimed > 0 else 0.0
+        if claimed > ceiling:
+            log.warning("job %s stage %d step %d: node %s reported %.3e FLOPs, but the step can "
+                        "cost at most %.3e; billing that", job.id, msg.stage_idx, msg.step,
+                        node_id[:8], claimed, ceiling)
         job.last_step_flops = flops
         acct = self.credits.job_account(job.id)
         take = self.credits.consume_job(job.id, flops) if acct is not None else 0.0
         node = self.registry.get(node_id)
         owner_id = (node.user_id if node and node.user_id else self.credits.owner_of(node_id))
         self.credits.credit_host(owner_id, take, node_id=node_id, job_id=msg.job_id)
-        if acct is not None and self.credits.job_exhausted(job.id):
-            await self.cancel_job(job)
-            job.row.error = "FLOP budget spent"
-            self.db.save(job.row)
-            return
-        if msg.loss is not None:
+        spent = acct is not None and self.credits.job_exhausted(job.id)
+        if msg.loss is not None and not spent:
             job.row.progress_step = msg.step
             job.row.last_loss = msg.loss
             self.db.save(job.row)
             if msg.step % 10 == 0 or msg.step == job.spec.steps:
                 log.info("job %s step %d/%d loss %.4f", job.id, msg.step, job.spec.steps, msg.loss)
+        # Before the budget check: the step that spends the last of the budget is paid like any
+        # other, so it is checked like any other, and its bundle is asked for while the stage
+        # still runs (a cancelled stage no longer holds it).
         await self.verification.on_step(job, node_id, msg)
+        if spent and job.row.status not in TERMINAL:  # the await above may have ended it
+            await self.cancel_job(job)
+            job.row.error = "FLOP budget spent"
+            self.db.save(job.row)
 
     # ------------------------------------------------------------ waitlist
 

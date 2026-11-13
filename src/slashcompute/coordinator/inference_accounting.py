@@ -10,7 +10,7 @@ from fastapi import Request
 from slashcompute.community.credits import CreditError, InsufficientCredits
 from slashcompute.community.http import _token
 from slashcompute.coordinator.core import Coordinator
-from slashcompute.inference.accounting import AccountingError
+from slashcompute.inference.accounting import ACCOUNT_PREFIX, AccountingError
 
 log = logging.getLogger(__name__)
 
@@ -95,3 +95,9 @@ class CoreAccounting:
 
     def settle(self, account_id: str) -> None:
         self.core.credits.settle_job(account_id)
+
+    def recover(self) -> None:
+        # No request of this run has reserved yet, so every chat account still open is an orphan.
+        n = self.core.credits.settle_open_jobs(ACCOUNT_PREFIX)
+        if n:
+            log.info("refunded %d chat reservation(s) a previous run left unsettled", n)

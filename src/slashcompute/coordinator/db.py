@@ -230,6 +230,11 @@ class Database:
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_txns_welcome "
                 "ON credit_txns (user_id) WHERE kind = 'welcome'"
             )
+            # Each grant card counts its donors: without this, one scan of every credit row per card.
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_credit_txns_grant "
+                "ON credit_txns (grant_id) WHERE grant_id IS NOT NULL"
+            )
             conn.commit()
 
     def session(self) -> Session:

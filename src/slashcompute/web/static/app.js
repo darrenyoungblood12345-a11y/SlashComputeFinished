@@ -248,15 +248,22 @@ function credits() {
     : ((state.user && state.user.grant_split) ?? s.grant_split)) || 0;
   if (state.credits) {
     const earned = Math.max(0, Number(state.credits.lifetime_earned) || 0);
+    const balance = Math.max(0, Number(state.credits.balance) || 0);
+    // The split is applied as credits are earned, so what was given and kept is what the pool
+    // posted at the time. The split is only the setting for what comes next: multiplying lifetime
+    // earnings by it rewrote history each time the slider moved.
+    if (state.credits.lifetime_to_grants != null) {
+      const toGrants = Math.max(0, Number(state.credits.lifetime_to_grants) || 0);
+      const kept = Math.max(0, Number(state.credits.lifetime_kept ?? earned - toGrants) || 0);
+      return { earned, toGrants, kept, split, balance, posted: true };
+    }
+    // A pool from before it reported those totals: an estimate, shown as one.
     const toGrants = earned * split / 100;
-    return {
-      earned, toGrants, kept: earned - toGrants, split,
-      balance: Math.max(0, Number(state.credits.balance) || 0),
-    };
+    return { earned, toGrants, kept: earned - toGrants, split, balance, posted: false };
   }
   const earned = Math.max(0, Number(me().flops) || 0);
   const toGrants = earned * split / 100;
-  return { earned, toGrants, kept: earned - toGrants, split, balance: 0 };
+  return { earned, toGrants, kept: earned - toGrants, split, balance: 0, posted: false };
 }
 
 function grantBalance() {
@@ -568,12 +575,12 @@ function renderContributions() {
     : "Nothing yet. Start contributing to earn.");
   sparkline($("#c-spark"), state.rates);
   setText("#c-earned", fmtFlops(c.earned));
-  setText("#c-earned-sub", signedIn()
-    ? `On this account · you keep ${withUnit(c.kept)}`
+  setText("#c-earned-sub", c.posted ? `On this account · you kept ${withUnit(c.kept)}`
+    : signedIn() ? `On this account · you keep ≈ ${withUnit(c.kept)}`
     : `Estimated · you keep ${withUnit(c.kept)}`);
   setText("#c-grants", fmtFlops(c.toGrants));
-  setText("#c-grants-sub", signedIn()
-    ? `${c.split}% of lifetime earnings`
+  setText("#c-grants-sub", c.posted
+    ? `Given so far · ${c.split}% of new earnings`
     : `Estimated · ${c.split}% of what you earn`);
   setText("#c-rank", m.rank ? `#${m.rank}` : "—");
   setText("#c-rank-sub", m.rank ? `of ${plural(m.of, "Mac")} in the pool` : "Not ranked yet");
@@ -633,10 +640,10 @@ function renderContributions() {
   rangeFill(split);
   setText("#split-grants", `${split.value}%`);
   setText("#split-keep", `${100 - split.value}%`);
-  setText("#split-grants-amt", `≈ ${withUnit(c.toGrants)}`);
-  setText("#split-keep-amt", `≈ ${withUnit(c.kept)}`);
+  setText("#split-grants-amt", c.posted ? `${withUnit(c.toGrants)} so far` : `≈ ${withUnit(c.toGrants)}`);
+  setText("#split-keep-amt", c.posted ? `${withUnit(c.kept)} so far` : `≈ ${withUnit(c.kept)}`);
   setText("#split-hint", signedIn()
-    ? "Credits are 1:1 with FLOPs. This split is saved on your account."
+    ? "Credits are 1:1 with FLOPs. This split is saved on your account and applies to what you earn from now on."
     : "Credits are 1:1 with FLOPs. Sign in so this split is saved on your account.");
 
   const node = m.node;

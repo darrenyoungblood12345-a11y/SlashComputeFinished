@@ -357,6 +357,135 @@ async def test_bad_dataset_reports_a_fatal_stage_error(tmp_path, tiny_model):
     assert "unrecognised dataset row keys" in sent[0].detail
 
 
+# ------------------------------------------------------------ peer handshake cleanup
+
+
+def _free_port():
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _peer_ctx(tmp_path, port, next_port=None):
+    """A downstream stage (it listens on ``port``), dialing ``next_port`` when it is a middle one."""
+    from slashcompute.agent.worker import WorkerContext
+    from slashcompute.common.protocol import PeerAddr
+
+    nxt = PeerAddr(node_id="next", host="127.0.0.1", port=next_port) if next_port else None
+    asg = _assignment(stage_idx=1).model_copy(update={"next_peer": nxt, "peer_timeout_s": 5.0})
+    return WorkerContext(assignment=asg, http=None, job_dir=tmp_path / "job", data_bind="127.0.0.1",
+                         data_port=port, gpu_percent=100, node_id="n")
+
+
+async def _bind_again(port):
+    """What the agent's next stage does with its data port; EADDRINUSE while a listener leaks."""
+    server = await LinkServer("127.0.0.1", port, {"job_id": "next", "epoch": 1}).start()
+    await server.close()
+
+
+async def test_cancelled_peer_handshake_frees_the_data_port(tmp_path):
+    """A stage cancelled while it waited for its neighbours kept its listener (run_stage only
+    gets the links once the handshake returns), so on a --no-sandbox agent no later stage
+    could bind the data port until the process restarted."""
+    from slashcompute.agent.worker import _peer_links
+
+    port = _free_port()
+    for i in range(120):                       # a cancel landing anywhere from start() to accept()
+        task = asyncio.create_task(_peer_links(_peer_ctx(tmp_path, port)))
+        for _ in range(i % 12):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _bind_again(port)
+
+
+async def test_cancelled_peer_handshake_closes_the_link_it_already_dialed(tmp_path):
+    from slashcompute.agent.worker import _peer_links
+    from slashcompute.transport import LinkClosed, LinkTimeout
+
+    port = _free_port()
+    for i in range(24):
+        hello = {"job_id": "j", "epoch": 1}
+        # A short resume window: a connection dropped mid-hello ends the link once it passes.
+        downstream = await LinkServer("127.0.0.1", 0, hello, resume_window=0.2).start()
+        task = asyncio.create_task(_peer_links(_peer_ctx(tmp_path, port, downstream.port)))
+        dialed = None
+        try:
+            dialed = await downstream.accept(timeout=10)
+            if i % 2:                                      # odd: the dial has returned, the stage
+                await asyncio.sleep(0.02)                  # waits for its upstream; even: mid-hello
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _bind_again(port)
+            with pytest.raises(LinkClosed) as closed:      # not left holding a dead connection
+                await dialed.recv(5)
+            assert not isinstance(closed.value, LinkTimeout)
+        finally:
+            task.cancel()
+            if dialed is not None:                         # or downstream.close() waits for it
+                await dialed.close()
+            await downstream.close()
+
+
+async def test_failed_peer_handshake_frees_the_data_port(tmp_path, monkeypatch):
+    from slashcompute.agent import worker
+
+    monkeypatch.setattr(worker, "PEER_HANDSHAKE_TIMEOUT_S", 0.05)
+    port = _free_port()
+    for _ in range(12):
+        nobody = _free_port()                  # the next stage never comes up: the dial gives up
+        with pytest.raises(OSError):
+            await worker._peer_links(_peer_ctx(tmp_path, port, nobody))
+        await _bind_again(port)
+
+
+async def test_stage_cancelled_during_the_handshake_lets_the_next_stage_listen(tmp_path, tiny_model):
+    """The same through run_stage, twice on one port: what an in-process agent does when the
+    coordinator cancels an epoch that is still connecting and assigns the next one."""
+    from slashcompute.agent.worker import WorkerContext, run_stage
+    from slashcompute.common.protocol import StageAssignment, StageFinished
+    from slashcompute.jobs import LoraFinetuneSpec
+
+    port = _free_port()
+    spec = LoraFinetuneSpec(model=str(tiny_model), dataset_path="unused.jsonl", steps=2, batch_size=2,
+                            microbatches=1, lora_rank=4)
+
+    async def listening():
+        try:
+            _, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            return False
+        writer.close()
+        return True
+
+    for epoch in (1, 2):
+        asg = StageAssignment(job_id="j", epoch=epoch, stage_idx=1, num_stages=2, layer_start=3,
+                              layer_end=6, num_layers=6, spec=spec, checkpoint_every=10,
+                              verify_ring_size=2)
+        ctx = WorkerContext(assignment=asg, http=None, job_dir=tmp_path / f"job-{epoch}",
+                            data_bind="127.0.0.1", data_port=port, gpu_percent=100, node_id="n")
+        sent = []
+
+        async def emit(msg):
+            sent.append(msg)
+
+        task = asyncio.create_task(run_stage(ctx, emit))
+        for _ in range(600):                   # loading the tiny model comes first
+            if task.done() or await listening():
+                break
+            await asyncio.sleep(0.05)
+        assert not task.done(), sent           # epoch 2 failed here with "address already in use"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [type(m) for m in sent] == [StageFinished] and sent[0].reason == "cancelled"
+    await _bind_again(port)
+
+
 # A sandboxed worker whose stage runs until drained: the real stdio CLI around a fake stage.
 
 
@@ -692,6 +821,236 @@ async def test_worker_that_dies_silently_is_reported(tmp_path, monkeypatch):
     [finished] = [m for m in sent if isinstance(m, StageFinished)]
     assert finished.reason == "error" and "exited with code 3" in finished.detail
     assert daemon._stage is None and daemon.status == "idle"
+
+
+# ------------------------------------------------------------ sampled steps of a sandboxed worker
+
+# The real stdio CLI around a stage that holds one sampled step (3) until it is killed.
+_BUNDLE_WORKER = """
+import asyncio
+from slashcompute.agent import worker
+from slashcompute.common.protocol import StageReady
+
+
+class Ring:
+    def save_bundle(self, step, path):
+        if step != 3:
+            return False
+        path.write_bytes(b"bundle-3")
+        return True
+
+
+async def run_stage(ctx, emit):
+    asg = ctx.assignment
+    ctx.session.compute = Ring()
+    await emit(StageReady(job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx))
+    await asyncio.Event().wait()
+
+worker.run_stage = run_stage
+worker._stdio_app()
+"""
+
+
+def _bundle_daemon(tmp_path, monkeypatch, wrap=None, home=None):
+    """A daemon whose sandboxed worker is ``_BUNDLE_WORKER`` (``wrap`` builds its command
+    line), with the coordinator's blob store replaced by the returned ``uploads`` dict."""
+    import os
+    import sys
+
+    import slashcompute
+
+    src = str(Path(slashcompute.__file__).resolve().parents[1])
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])))
+    daemon, sent = _sandboxed_daemon(home or tmp_path, monkeypatch)
+    if wrap is not False:
+        monkeypatch.setattr(
+            "slashcompute.agent.daemon.wrap_command",
+            wrap or (lambda cmd, *_: [sys.executable, "-c", _BUNDLE_WORKER, *cmd[3:]]))
+    uploads = {}
+    daemon.opt.http.put_bytes = lambda path, data, params=None: uploads.__setitem__(path, data)
+    return daemon, sent, uploads
+
+
+def _fetch(verify_id, step=3, job_id="j", epoch=1):
+    from slashcompute.common.protocol import VerifyFetch
+
+    return VerifyFetch(verify_id=verify_id, job_id=job_id, epoch=epoch, stage_idx=0, step=step)
+
+
+def _bundle_replies(sent):
+    from slashcompute.common.protocol import VerifyBundleReady
+
+    return {m.verify_id: m for m in sent if isinstance(m, VerifyBundleReady)}
+
+
+async def test_sampled_step_is_fetched_from_a_sandboxed_worker(tmp_path, monkeypatch):
+    """Only an in-process stage could hand over a sampled step: for the default, sandboxed
+    worker the daemon answered "bundle no longer held" while the worker still held it, so
+    sandboxed work was never replayed."""
+    daemon, sent, uploads = _bundle_daemon(tmp_path, monkeypatch)
+    stage = await _started(daemon, _assignment())
+    try:
+        await _until(lambda: stage.ready, 30)
+        await daemon._handle(_fetch("v1"))
+        await _until(lambda: "v1" in _bundle_replies(sent), 30)
+        reply = _bundle_replies(sent)["v1"]
+        assert reply.error is None and (reply.job_id, reply.stage_idx, reply.step) == ("j", 0, 3)
+        assert Path(reply.path) == daemon.opt.paths.job_dir("j", 1) / "bundle_3.safetensors"
+        assert uploads == {"/verify/v1/bundle": b"bundle-3"}
+
+        await daemon._handle(_fetch("v2", step=9))             # a step the worker doesn't hold
+        await daemon._handle(_fetch("v3", epoch=2))            # another epoch's ring
+        await daemon._handle(_fetch("v4", job_id="other"))
+        await _until(lambda: len(_bundle_replies(sent)) == 4, 30)
+        replies = _bundle_replies(sent)
+        assert {replies[v].error for v in ("v2", "v3", "v4")} == {"bundle no longer held"}
+        assert all(replies[v].path is None for v in ("v2", "v3", "v4"))
+        assert set(uploads) == {"/verify/v1/bundle"} and stage.proc.returncode is None
+    finally:
+        await daemon._cancel_stage()
+
+
+async def test_fetch_from_a_busy_worker_does_not_hold_up_the_message_loop(tmp_path, monkeypatch):
+    """A worker deep in a compute call answers late (this one never does): the daemon must
+    go on reading messages, and still answer the fetch once the worker is gone."""
+    from slashcompute.agent import daemon as daemon_mod
+    from slashcompute.common.protocol import CancelStage
+
+    monkeypatch.setattr(daemon_mod, "BUNDLE_STOP_GRACE_S", 0.2)
+    daemon, sent, uploads = _bundle_daemon(tmp_path, monkeypatch, wrap=False)   # sleeps, reads nothing
+    stage = await _started(daemon, _assignment())
+    try:
+        await asyncio.wait_for(daemon._handle(_fetch("v1")), 2)
+        assert not _bundle_replies(sent)                       # waiting on the worker, off the loop
+        await asyncio.wait_for(daemon._handle(CancelStage(job_id="j", epoch=1)), 10)
+        assert stage.proc.returncode is not None
+        await _until(lambda: _bundle_replies(sent), 5)         # not left to the answer timeout
+        assert _bundle_replies(sent)["v1"].error == "bundle no longer held" and not uploads
+    finally:
+        await daemon._cancel_stage()
+
+
+async def test_fetch_just_before_a_cancel_still_gets_the_bundle(tmp_path, monkeypatch):
+    """The coordinator asks for the step that spent a job's budget and cancels the job in the
+    same breath; the worker must get to answer before it is stopped."""
+    from slashcompute.common.protocol import CancelStage, StageFinished
+
+    daemon, sent, uploads = _bundle_daemon(tmp_path, monkeypatch)
+    stage = await _started(daemon, _assignment())
+    await _until(lambda: stage.ready, 30)
+    await daemon._handle(_fetch("v1"))
+    await daemon._handle(CancelStage(job_id="j", epoch=1))
+    await _until(lambda: _bundle_replies(sent), 30)
+    assert _bundle_replies(sent)["v1"].error is None
+    assert uploads == {"/verify/v1/bundle": b"bundle-3"}
+    assert stage.proc.returncode is not None and daemon._stage is None
+    assert [m.reason for m in sent if isinstance(m, StageFinished)] == ["cancelled"]
+
+
+async def test_sampled_step_is_fetched_through_the_real_sandbox(tmp_path, monkeypatch):
+    """Under sandbox-exec the worker may only write where the profile allows; the bundle goes
+    to its job directory, which the profile names (the agent home here is outside every temp
+    directory the profile also allows)."""
+    import shutil
+    import sys
+    import tempfile
+
+    from slashcompute.agent import sandbox
+
+    if shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not available")
+    home = Path(tempfile.mkdtemp(prefix=".sbx-home-", dir=Path(__file__).resolve().parent))
+    daemon, sent, uploads = _bundle_daemon(
+        tmp_path, monkeypatch, home=home,
+        wrap=lambda cmd, *a: sandbox.wrap_command([sys.executable, "-c", _BUNDLE_WORKER, *cmd[3:]], *a))
+    try:
+        stage = await _started(daemon, _assignment())
+        await _until(lambda: stage.ready or stage.proc.returncode is not None, 120)
+        assert stage.ready, "the sandboxed worker did not start"
+        await daemon._handle(_fetch("v1"))
+        await _until(lambda: _bundle_replies(sent), 60)
+        assert _bundle_replies(sent)["v1"].error is None
+        assert uploads == {"/verify/v1/bundle": b"bundle-3"}
+        assert (daemon.opt.paths.job_dir("j", 1) / "bundle_3.safetensors").read_bytes() == b"bundle-3"
+    finally:
+        await daemon._cancel_stage()
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def _worker_ctx(tmp_path, held=(3,)):
+    """A sandboxed worker's side of the pipe: its context, and the steps it was asked to save."""
+    from slashcompute.agent.worker import StageSession, WorkerContext
+
+    saved = []
+
+    class Ring:
+        def save_bundle(self, step, path):
+            saved.append((step, path))
+            if step not in held:
+                return False
+            path.write_bytes(b"x")
+            return True
+
+    session = StageSession()
+    session.compute = Ring()
+    ctx = WorkerContext(assignment=_assignment(job_id="j", epoch=4), http=None, job_dir=tmp_path / "job",
+                        data_bind="127.0.0.1", data_port=0, gpu_percent=100, node_id="n",
+                        session=session)
+    return ctx, saved
+
+
+def test_worker_exports_only_its_own_stage_and_only_into_its_job_dir(tmp_path):
+    from slashcompute.agent.worker import _export_bundle
+
+    ctx, saved = _worker_ctx(tmp_path)
+    ask = {"type": "bundle", "job_id": "j", "epoch": 4, "step": 3}
+    assert _export_bundle(ctx, ask) == {**ask, "ok": True}
+    assert saved == [(3, tmp_path / "job" / "bundle_3.safetensors")]
+    assert _export_bundle(ctx, {**ask, "step": 5}) == {**ask, "step": 5, "ok": False}   # not held
+
+    del saved[:]
+    stray = tmp_path / "elsewhere.safetensors"
+    for bad in ({**ask, "job_id": "other"}, {**ask, "epoch": 3}, {**ask, "epoch": "4"},
+                {**ask, "epoch": 4.0}, {**ask, "step": "3"}, {**ask, "step": True},
+                {**ask, "step": 3.0}, {**ask, "step": None}, {"type": "bundle"},
+                {**ask, "step": "../../elsewhere"}, {**ask, "path": str(stray), "step": [3]}):
+        reply = _export_bundle(ctx, bad)
+        assert reply["ok"] is False and reply["type"] == "bundle", bad
+    assert not saved and not stray.exists()
+    assert sorted(p.name for p in (tmp_path / "job").iterdir()) == ["bundle_3.safetensors"]
+
+
+def test_worker_answers_a_failed_export_instead_of_dying(tmp_path):
+    from slashcompute.agent.worker import _export_bundle
+
+    ctx, _ = _worker_ctx(tmp_path)
+    ctx.session.compute.save_bundle = lambda step, path: 1 / 0
+    assert _export_bundle(ctx, {"type": "bundle", "job_id": "j", "epoch": 4, "step": 3})["ok"] is False
+    ctx.session.compute = None                                  # the stage has not built its ring yet
+    assert _export_bundle(ctx, {"type": "bundle", "job_id": "j", "epoch": 4, "step": 3})["ok"] is False
+
+
+async def test_only_the_answer_to_a_pending_request_counts(tmp_path):
+    """The worker's stdout is the less trusted end: an answer for another job, epoch or step,
+    or one nobody asked for, resolves nothing (and is not forwarded to the coordinator)."""
+    import json
+
+    from slashcompute.agent.daemon import _Stage, _bundle_answer
+
+    stage = _Stage(_assignment(job_id="j", epoch=4))
+    waiter = stage.bundles[3] = asyncio.get_running_loop().create_future()
+    ok = {"type": "bundle", "job_id": "j", "epoch": 4, "step": 3, "ok": True}
+    for other in ({**ok, "job_id": "x"}, {**ok, "epoch": 5}, {**ok, "epoch": True}, {**ok, "step": 4},
+                  {**ok, "step": "3"}, {**ok, "step": 3.0}, {"type": "bundle"}):
+        assert _bundle_answer(stage, json.dumps(other)) is True     # recognised, and dropped
+        assert not waiter.done()
+    for not_ours in ("not json", "[1]", json.dumps({"type": "stage_ready"}), json.dumps({**ok, "type": "x"})):
+        assert _bundle_answer(stage, not_ours) is False
+    assert _bundle_answer(stage, json.dumps({**ok, "ok": "yes"})) is True
+    assert waiter.result() is False                                 # only a literal true is a yes
+    waiter = stage.bundles[3] = asyncio.get_running_loop().create_future()
+    assert _bundle_answer(stage, json.dumps(ok)) is True and waiter.result() is True
+    assert _bundle_answer(stage, json.dumps(ok)) is True            # a repeat: nothing left to wake
 
 
 async def test_second_shutdown_is_a_no_op_and_blocks_new_stages(tmp_path, monkeypatch):

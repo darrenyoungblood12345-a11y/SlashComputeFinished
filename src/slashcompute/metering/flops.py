@@ -34,6 +34,15 @@ def stage_step_flops(profile: ModelProfile, layer_start: int, layer_end: int, to
     return fwd * (2.0 if is_last else 3.0)
 
 
+def max_stage_step_flops(profile: ModelProfile, layer_start: int, layer_end: int, batch_size: int,
+                         max_seq_len: int) -> float:
+    """The most one training step can cost a stage: every row of the batch as long as the job
+    allows. A stage reports ``stage_step_flops`` for the padded length its batch really had,
+    which is never longer, so an honest report cannot exceed this."""
+    return stage_step_flops(profile, layer_start, layer_end, batch_size * max_seq_len, max_seq_len,
+                            is_last=layer_end == profile.num_layers)
+
+
 def replay_flops(profile: ModelProfile, layer_start: int, layer_end: int, tokens: int,
                  seq_len: int, is_last: bool) -> float:
     """A verification replay runs one forward pass."""

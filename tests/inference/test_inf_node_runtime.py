@@ -455,3 +455,71 @@ async def test_stop_also_ends_a_task_spawned_while_it_stops(tmp_path):
         assert late and late[0].done() and not agent._tasks
     finally:
         await agent.client.aclose()
+
+
+# ------------------------------------------------------------ latency probe (direct transport)
+
+
+def registering(tmp_path, transports: list[str], bodies: list[dict]) -> Agent:
+    """A node with a real probe listener and a coordinator that answers each registration and heartbeat
+    with the next of ``transports`` (the last one from then on), recording what the node registers with."""
+    from slashcompute.inference.node import latency
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        transport = transports.pop(0) if len(transports) > 1 else transports[0]
+        if request.url.path.endswith('/nodes/register'):
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={'node_id': 'n-1', 'token': 't', 'transport': transport})
+        return httpx.Response(200, json={'ok': True, 'transport': transport})
+
+    cfg = NodeConfig(coordinator_url='http://coordinator/inference', **isolated_paths(str(tmp_path)),
+                     commitment=Commitment(memory_gb=16, may_be_head=True))
+    client = httpx.AsyncClient(base_url='http://coordinator/inference', transport=httpx.MockTransport(handle))
+    return Agent(cfg, FakeEngine('n-1', FakeCluster()), info={}, build='fake', ip='127.0.0.1', gguf_files=[],
+                 latency_fn=None, client=client, busy_fn=lambda: False, probe_fn=latency.serve_probe)
+
+
+def listening(port: int) -> bool:
+    import socket
+
+    with socket.socket() as s:
+        s.settimeout(1)
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+
+async def test_a_direct_mode_node_starts_its_probe_and_registers_the_port_it_bound(tmp_path):
+    """A node starts out in direct mode, so the coordinator's "direct" was no change and the probe was
+    never started: no port was advertised and latency rounds left the node out."""
+    bodies = []
+    agent = registering(tmp_path, ['direct'], bodies)
+    try:
+        assert agent.cfg.probe_port == 0                       # the default: any free port
+        await agent.register()
+        assert agent.transport == 'direct' and agent.probe is not None
+        port = agent.probe.sockets[0].getsockname()[1]
+        assert port and bodies[0]['probe_port'] == port        # the coordinator is told the port peers can reach
+        assert listening(port)
+        await agent.register()                                 # registering again (a 401) keeps the listener
+        assert bodies[1]['probe_port'] == port and agent.probe.sockets[0].getsockname()[1] == port
+    finally:
+        await agent.stop()
+        await agent.client.aclose()
+    assert not listening(port)
+
+
+async def test_a_relay_pool_gets_no_probe_listener_until_it_switches_to_direct(tmp_path):
+    bodies = []
+    agent = registering(tmp_path, ['relay', 'relay', 'direct'], bodies)
+    try:
+        await agent.register()
+        port = bodies[0]['probe_port']
+        assert agent.transport == 'relay' and agent.probe is None and port
+        assert not listening(port)                             # relay: nothing listens beyond this machine
+        await agent.heartbeat()
+        assert agent.probe is None
+        await agent.heartbeat()                                # the pool switched to direct
+        assert agent.transport == 'direct' and agent.probe is not None
+        assert agent.probe.sockets[0].getsockname()[1] == port and listening(port)   # the port it registered
+    finally:
+        await agent.stop()
+        await agent.client.aclose()

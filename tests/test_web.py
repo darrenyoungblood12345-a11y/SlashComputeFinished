@@ -867,6 +867,35 @@ def test_live_grants_are_not_mixed_with_samples(tmp_path):
     assert not any("Irish-language" in g["title"] for g in board["grants"])
 
 
+def test_live_grant_cards_show_their_backers(tmp_path, monkeypatch):
+    """Against the real coordinator, not a stand-in: its grant rows never carried the backer count the
+    card reads, so every live grant showed "0 backers" whatever it had received."""
+    monkeypatch.setattr("slashcompute.community.auth.ITERATIONS", 1)
+    coord_app = create_app(EngineConfig(home=tmp_path / "coord", scheduler_tick_s=0.05))
+    with TestClient(coord_app) as coord:
+        core = coord_app.state.core
+        people = {}
+        for name in ("admin", "author", "ada", "bea"):
+            core.auth.register(f"{name}@lan.test", "password1", name)
+            people[name] = core.auth.accept_terms(core.auth.login(f"{name}@lan.test", "password1")[0])
+        for donor in ("ada", "bea"):
+            core.credits.contribute(people[donor].id, 100.0, 0)
+        g = core.grants.create(people["author"], "Need compute", "A short paragraph about the need.", 100.0)
+        core.grants.review(people["admin"], g.id, True)
+        app, launcher, _ = _shell(tmp_path / "shell", http=stateless_http(transport=coord._transport))
+        launcher.save_settings(LauncherSettings(mode="join", url="http://testserver"))
+        with TestClient(app, base_url=SHELL) as c:
+            (card,) = c.get("/api/grants?sort=top").json()["grants"]
+            assert card["id"] == g.id and card["backers"] == 0
+            core.grants.donate(people["ada"], g.id, 10.0)
+            core.grants.donate(people["ada"], g.id, 5.0)
+            core.grants.donate(people["bea"], g.id, 1.0)
+            board = c.get("/api/grants?sort=top").json()
+            assert board["sample"] is False
+            (card,) = board["grants"]
+            assert card["raised"] == 16.0 and card["backers"] == 2
+
+
 # Runs app.js under Node with a stub DOM; fetch answers from the `routes` the
 # test swaps in, so a poll can see the coordinator come and go.
 
@@ -965,6 +994,61 @@ def test_grants_tab_follows_coordinator_on_poll(tmp_path):
     assert (seen[2]["pill"], seen[2]["open"]) == ("Live", "1")
     assert seen[3]["open"] == "1"
     assert seen[4]["open"] == "2"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_given_and_kept_totals_come_from_the_ledger_not_from_the_current_split(tmp_path):
+    """The split is applied when credits are earned. The tiles multiplied lifetime earnings by today's
+    split, so moving it to 100% claimed everything ever earned had gone to grants."""
+    probe = """renderContributions();
+        ({ earned: $("#c-earned").textContent, earnedSub: $("#c-earned-sub").textContent,
+           grants: $("#c-grants").textContent, grantsSub: $("#c-grants-sub").textContent,
+           pct: [$("#split-grants").textContent, $("#split-keep").textContent],
+           amounts: [$("#split-grants-amt").textContent, $("#split-keep-amt").textContent],
+           hint: $("#split-hint").textContent, all: withUnit(100e12), part: withUnit(40e12), rest: withUnit(60e12) })"""
+    phases = [
+        {"routes": {}},
+        # everything was earned at a 0% split; the account's split is 100% now
+        {"routes": {}, "probe": probe, "run": """
+            state.user = { id: "u1", grant_split: 100 };
+            state.settings = { grant_split: 100 };
+            state.credits = { balance: 100e12, lifetime_earned: 100e12, lifetime_to_grants: 0,
+                              lifetime_kept: 100e12 };"""},
+        # dragging the slider previews the setting, not another history
+        {"routes": {}, "probe": probe, "run": """
+            state.dragging.add("split"); $("#split").value = 40;      // the thumb, as the input event leaves it
+            state.settings.grant_split = 40;"""},
+        # a pool from before it reported these totals: an estimate, and labelled as one
+        {"routes": {}, "probe": probe, "run": """
+            state.dragging.clear();
+            state.user.grant_split = 40;
+            state.credits = { balance: 100e12, lifetime_earned: 100e12 };"""},
+        # signed out: the same estimate from this Mac's own work
+        {"routes": {}, "probe": probe, "run": """
+            state.user = null; state.credits = null;
+            state.ov = { me: { flops: 100e12 } };"""},
+    ]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    moved, dragging, older, signed_out = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    everything, part, rest = moved["all"], moved["part"], moved["rest"]
+
+    assert moved["grants"] == "0" and moved["earnedSub"] == f"On this account · you kept {everything}"
+    assert moved["grantsSub"] == "Given so far · 100% of new earnings"     # the setting, apart from the total
+    assert moved["pct"] == ["100%", "0%"]
+    assert moved["amounts"] == ["0 FLOPs so far", f"{everything} so far"]
+    assert "from now on" in moved["hint"]
+
+    assert dragging["pct"] == ["40%", "60%"] and dragging["grantsSub"] == "Given so far · 40% of new earnings"
+    assert (dragging["grants"], dragging["earnedSub"], dragging["amounts"]) == \
+        (moved["grants"], moved["earnedSub"], moved["amounts"])
+
+    assert older["grantsSub"] == "Estimated · 40% of what you earn"
+    assert older["amounts"] == [f"≈ {part}", f"≈ {rest}"]
+    assert older["earnedSub"] == f"On this account · you keep ≈ {rest}"
+    assert signed_out["grantsSub"] == "Estimated · 40% of what you earn"
+    assert signed_out["earnedSub"] == f"Estimated · you keep {rest}" and signed_out["amounts"] == older["amounts"]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")

@@ -178,6 +178,12 @@ async def upload(h: Harness, name: str, data: bytes) -> httpx.Response:
         return await c.post("/models/upload", params={"name": name}, content=data)
 
 
+def heads_of(h: Harness, model: str) -> list[str]:
+    """The Macs the pool would load this model on right now. For an uploaded model a head counts once it
+    has confirmed its copy (a moment after it reports the file), so wait for this before a chat."""
+    return sorted(r["name"] for r in registry.holders(h.conn, h.settings, model))
+
+
 async def wait_for(cond, timeout: float = 5.0) -> None:
     for _ in range(int(timeout / 0.05)):
         if cond():

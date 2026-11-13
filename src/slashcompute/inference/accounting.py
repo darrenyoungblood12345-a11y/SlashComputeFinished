@@ -7,6 +7,11 @@ from typing import Optional, Protocol
 from fastapi import Request
 
 
+# Every chat reserves under its own account id with this prefix, so the holds a crash left
+# behind can be told apart from training jobs at the next start.
+ACCOUNT_PREFIX = "inf-"
+
+
 class AccountingError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
@@ -42,6 +47,11 @@ class Accounting(Protocol):
         """Refund whatever the request did not use."""
         ...
 
+    def recover(self) -> None:
+        """At startup: refund the unused part of every reservation a previous run never settled
+        (it was killed mid-reply, and only the request's own handler would have called settle)."""
+        ...
+
 
 class NullAccounting:
     """No credits: records totals in memory (standalone app and tests)."""
@@ -72,4 +82,7 @@ class NullAccounting:
                              "wall_s": wall_s})
 
     def settle(self, account_id: str) -> None:
+        return None
+
+    def recover(self) -> None:
         return None

@@ -43,6 +43,7 @@ TERMINAL = ("completed", "failed", "cancelled")
 class EpochState:
     epoch: int
     plans: list[StagePlan]
+    resume_step: int = 0  # the checkpoint it started from: its stages run the steps after it
     started: float = field(default_factory=time.monotonic)
     last_progress: float = field(default_factory=time.monotonic)  # last StageReady / StepMetrics
     ready: set[int] = field(default_factory=set)
@@ -181,7 +182,7 @@ class Scheduler:
             log.exception("job %s: could not start epoch %d", job.id, epoch)
             return False
 
-        cur = job.current = EpochState(epoch=epoch, plans=plans)
+        cur = job.current = EpochState(epoch=epoch, plans=plans, resume_step=resume)
         for p in plans:
             core.registry.get(p.node_id).assignment = Assignment(job.id, epoch, p.stage_idx)
         log.info("job %s epoch %d: %d stage(s) %s resume_step=%d", job.id, epoch, len(plans),
