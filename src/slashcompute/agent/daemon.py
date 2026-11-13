@@ -24,9 +24,9 @@ import socket
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Coroutine, Optional
+from typing import Awaitable, Callable, Coroutine, Optional
 
 import httpx
 import websockets
@@ -37,7 +37,7 @@ from slashcompute.agent.http import CoordHTTP
 from slashcompute.agent.paths import AgentPaths, claim_data_port, resolve_data_host
 from slashcompute.agent.sandbox import sandbox_enabled, wrap_command
 from slashcompute.agent.verify import run_canary, run_replay
-from slashcompute.agent.worker import StageSession, WorkerContext, run_stage
+from slashcompute.agent.worker import StageSession, WorkerContext, bundle_path, run_stage
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.discovery import discover
 from slashcompute.common.protocol import (
@@ -51,6 +51,11 @@ log = logging.getLogger(__name__)
 RECONNECT_MAX_S = 15.0
 FETCH_STOP_GRACE_S = 2.0        # a stopped download gets this long to exit before SIGKILL
 FETCH_LOG_EVERY_S = 30.0
+# A sandboxed worker answers a bundle request between two compute calls (they run on its event
+# loop), so the answer can take as long as one of them. After this long the step is reported
+# as not held.
+BUNDLE_ANSWER_TIMEOUT_S = 60.0
+BUNDLE_STOP_GRACE_S = 2.0       # a worker being stopped gets this long to answer what was asked
 
 
 def _rejection(e: Exception) -> str:
@@ -165,12 +170,33 @@ class _Stage:
     fetch_total: Optional[int] = None
     ready: bool = False                          # StageReady went out
     reported: bool = False                       # its StageFinished went out: never send another
+    # step -> the sandboxed worker's answer to a bundle request that is still out
+    bundles: dict[int, asyncio.Future] = field(default_factory=dict)
 
     def matches(self, job_id: str, epoch: int) -> bool:
         return self.asg.job_id == job_id and self.asg.epoch == epoch
 
     def runs(self, asg: StageAssignment) -> bool:
         return self.matches(asg.job_id, asg.epoch) and self.asg.stage_idx == asg.stage_idx
+
+
+def _bundle_answer(stage: _Stage, raw: str) -> bool:
+    """Take a worker's stdout line if it is an answer to a bundle request (``worker.
+    _export_bundle``); such a line is never forwarded. It wakes the request it answers only
+    if it names this stage's job and epoch and a step that was asked for: the worker is the
+    sandboxed side, so nothing else it prints may stand in for an answer."""
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(msg, dict) or msg.get("type") != "bundle":
+        return False
+    epoch, step = msg.get("epoch"), msg.get("step")
+    if type(epoch) is int and type(step) is int and stage.matches(msg.get("job_id"), epoch):
+        waiter = stage.bundles.pop(step, None)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(msg.get("ok") is True)
+    return True
 
 
 class Daemon:
@@ -613,7 +639,8 @@ class Daemon:
                 try:
                     msg = parse_agent_message(raw)
                 except ValidationError:
-                    log.warning("worker stdout: %s", raw[:200])
+                    if not _bundle_answer(stage, raw):
+                        log.warning("worker stdout: %s", raw[:200])
                     continue
                 if isinstance(msg, StageReady):
                     stage.ready = True
@@ -628,6 +655,10 @@ class Daemon:
         finally:
             if proc.returncode is None:
                 await proc.wait()
+            for waiter in stage.bundles.values():
+                if not waiter.done():
+                    waiter.set_result(False)     # the worker is gone, and its ring with it
+            stage.bundles.clear()
             if not finished and self._stage is stage and not stage.reported:
                 # The worker died without reporting (crash, OOM kill): say so now rather
                 # than leave the coordinator waiting for a stall timeout.
@@ -684,6 +715,10 @@ class Daemon:
             await stage.session.cancel()
         proc = stage.proc
         if proc is not None and getattr(proc, "returncode", 0) is None:
+            if stage.bundles:
+                # A sampled step asked for just before this stop (the coordinator does both at
+                # once for the step that spends a job's budget): let the worker answer first.
+                await asyncio.wait(list(stage.bundles.values()), timeout=BUNDLE_STOP_GRACE_S)
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
             try:
@@ -704,13 +739,56 @@ class Daemon:
             ))
 
     async def _on_fetch(self, msg: VerifyFetch) -> None:
-        dest = self.opt.paths.job_dir(msg.job_id, msg.epoch) / f"bundle_{msg.step}.safetensors"
+        dest = bundle_path(self.opt.paths.job_dir(msg.job_id, msg.epoch), msg.step)
         stage = self._stage
         # Only the stage that ran the step holds its bundle; another job's ring must not answer.
-        session = stage.session if stage is not None and stage.matches(msg.job_id, msg.epoch) else None
+        held = stage if stage is not None and stage.matches(msg.job_id, msg.epoch) else None
+        if held is not None and held.proc is not None:
+            # A sandboxed worker holds the ring. It is asked now, so the request is on its
+            # pipe before whatever follows this message (a CancelStage, say) is handled, but
+            # its answer is awaited in a task: it may be a compute call away, and this loop
+            # must keep reading.
+            answer = self._ask_worker_for_bundle(held, msg.step)
+
+            async def saved() -> bool:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(answer), BUNDLE_ANSWER_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    return False
+
+            self._spawn(self._send_bundle(msg, dest, saved))
+            return
+        session = held.session if held is not None else None
+
+        async def save() -> bool:
+            return bool(session and session.save_bundle(msg.step, dest))
+
+        await self._send_bundle(msg, dest, save)
+
+    def _ask_worker_for_bundle(self, stage: _Stage, step: int) -> asyncio.Future:
+        """Ask ``stage``'s sandboxed worker to save what it holds for ``step`` into the job
+        directory. The returned future gets the worker's answer from the stdout pump: True
+        once the file is there, False if the worker doesn't hold the step or exits first."""
+        answer = stage.bundles.get(step)
+        if answer is not None:
+            return answer                        # already asked: one answer serves both
+        answer = asyncio.get_running_loop().create_future()
+        proc, asg = stage.proc, stage.asg
+        if proc.returncode is not None or proc.stdin is None or stage.pump is None or stage.pump.done():
+            answer.set_result(False)             # nobody is left to answer
+            return answer
+        stage.bundles[step] = answer
+        request = {"type": "bundle", "job_id": asg.job_id, "epoch": asg.epoch, "step": step}
+        proc.stdin.write(json.dumps(request).encode() + b"\n")
+        return answer
+
+    async def _send_bundle(self, msg: VerifyFetch, dest: Path,
+                           save: Callable[[], Awaitable[bool]]) -> None:
+        """Upload the bundle ``save`` puts at ``dest`` and tell the coordinator, also when
+        there is none."""
         error = None
         try:
-            if session and session.save_bundle(msg.step, dest):
+            if await save():
                 await asyncio.to_thread(self._upload, f"/verify/{msg.verify_id}/bundle", dest)
             else:
                 error = "bundle no longer held"
