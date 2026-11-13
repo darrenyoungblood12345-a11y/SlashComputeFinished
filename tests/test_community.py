@@ -179,6 +179,26 @@ def test_terms_and_grant_split(core):
         core.auth.update_profile(user, name="  ")
 
 
+def test_summary_reports_what_was_given_and_kept_at_the_split_of_the_time(core):
+    user, _ = _account(core.auth)
+    other, _ = _account(core.auth, "o@lan.test")
+    core.credits.contribute(user.id, 100.0, user.grant_split)     # earned while keeping everything
+    core.credits.contribute(other.id, 40.0, 50)                   # someone else's share is theirs alone
+    s = core.credits.summary(user.id)
+    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (100.0, 0.0, 100.0)
+    # A new split is for what comes next: nothing already posted moves.
+    user = core.auth.update_profile(user, grant_split=100)
+    s = core.credits.summary(user.id)
+    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (100.0, 0.0, 100.0)
+    core.credits.contribute(user.id, 50.0, user.grant_split)
+    core.credits.contribute(user.id, 20.0, 25)
+    s = core.credits.summary(user.id)
+    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (170.0, 55.0, 115.0)
+    assert s["balance"] == 115.0 and s["pot"] == 20.0 + 55.0
+    o = core.credits.summary(other.id)
+    assert (o["lifetime_to_grants"], o["lifetime_kept"]) == (20.0, 20.0)
+
+
 def test_google_disabled_without_client_id(core):
     assert google_client_id() == ""
     with pytest.raises(AuthError) as e:

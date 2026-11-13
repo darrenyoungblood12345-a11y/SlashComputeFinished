@@ -20,6 +20,11 @@ BALANCE_KINDS = ("earn", "reserve", "release", "donate", "receive", "allocate",
                  "welcome")
 
 
+def _tithe_note(user_id: str) -> str:
+    """Marks the pot's share of what ``user_id`` earned: the only record of whose earnings it came from."""
+    return f"tithe from {user_id}"
+
+
 class CreditError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
@@ -63,6 +68,18 @@ class Credits:
             ).one()
         return float(total or 0.0)
 
+    def lifetime_to_grants(self, user_id: str) -> float:
+        """What this user's earnings really sent to the community pot: the shares posted as they were
+        earned, each at the split of its time. Never lifetime earnings times today's split."""
+        with self.db.session() as s:
+            total = s.exec(
+                select(func.coalesce(func.sum(CreditTxn.amount), 0.0)).where(
+                    CreditTxn.user_id == POT_ID, CreditTxn.kind == "earn",
+                    CreditTxn.note == _tithe_note(user_id),
+                )
+            ).one()
+        return float(total or 0.0)
+
     def lifetime_spent(self, user_id: str) -> float:
         with self.db.session() as s:
             total = s.exec(
@@ -78,10 +95,14 @@ class Credits:
         return float(sum(max(0.0, a.reserved_flops - a.spent_flops) for a in rows))
 
     def summary(self, user_id: str) -> dict:
+        earned, to_grants = self.lifetime_earned(user_id), self.lifetime_to_grants(user_id)
         return {
             "user_id": user_id,
             "balance": self.balance(user_id),
-            "lifetime_earned": self.lifetime_earned(user_id),
+            "lifetime_earned": earned,
+            # every earning is posted as the pot's share plus the rest, so these two add up to it
+            "lifetime_to_grants": to_grants,
+            "lifetime_kept": earned - to_grants,
             "lifetime_spent": self.lifetime_spent(user_id),
             "pot": self.balance(POT_ID),
             "reserved_in_flight": self.reserved_in_flight(user_id),
@@ -168,7 +189,7 @@ class Credits:
             self.post(user_id, "earn", personal, node_id=node_id, job_id=job_id)
         if pot:
             self.post(POT_ID, "earn", pot, node_id=node_id, job_id=job_id,
-                      note=f"tithe from {user_id}")
+                      note=_tithe_note(user_id))
 
     def credit_host(self, owner_id: Optional[str], flops: float, *,
                     node_id: Optional[str] = None, job_id: Optional[str] = None) -> None:
