@@ -492,6 +492,17 @@ def create_shell(launcher: Optional[Launcher] = None,
     def shown(s: LauncherSettings) -> dict:
         return public_settings(s, launch.session_for(s))
 
+    def instance() -> dict:
+        """What the UI's hints name: this build's ports and data folder (a build that runs beside
+        another /compute has its own), the folder written the way a user would type it."""
+        home = Path(launch.home)
+        try:
+            shown_home = f"~/{home.relative_to(Path.home())}"
+        except ValueError:
+            shown_home = str(home)
+        return {"coordinator_port": launch.cfg.coordinator_port, "data_port": launch.cfg.data_port,
+                "home": shown_home}
+
     def session_edit(body: dict) -> Optional[SettingsEdit]:
         """A body's session_token is a sign-in ("" a sign-out): bound, once the body's other changes
         are in, to the pool the settings then point at. None when the body carries no session."""
@@ -514,7 +525,7 @@ def create_shell(launcher: Optional[Launcher] = None,
     @app.get("/api/status")
     def status():
         snap = launch.snapshot()
-        return {**asdict(snap), **shown(launch.load_settings()),
+        return {**asdict(snap), **shown(launch.load_settings()), **instance(),
                 "coordinator_url": launch.coordinator_url(launch.load_settings()),
                 "finishes": list(FINISHES)}
 
@@ -571,7 +582,7 @@ def create_shell(launcher: Optional[Launcher] = None,
         # snapshot() just polled /health: its answer says whether the lists are worth asking for.
         pool = await fetch_pool(url) if snap.coordinator_up else PoolData()
         app.state.pool, app.state.pool_url = pool, url
-        status = {**asdict(snap), **shown(s), "coordinator_url": coordinator_url,
+        status = {**asdict(snap), **shown(s), **instance(), "coordinator_url": coordinator_url,
                   "models": MODELS, "public_url": launch.cfg.public_url or ""}
         return overview(status, pool, my_id, s.grant_split)
 

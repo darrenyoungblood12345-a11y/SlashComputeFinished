@@ -1,6 +1,8 @@
 import json
+import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -1628,3 +1630,90 @@ def test_llm_pipeline_card_shows_the_serving_pipeline_and_keeps_unload_across_sp
     assert shown["steady"] is True
     assert "disabled" in shown["draining"] and "Unloading…" in shown["draining"] and "data-act" not in shown["draining"]
     assert 'data-pipeline="p-new"' in shown["older"]
+
+
+# A build that runs beside another /compute on the same Mac (scripts/macos/build_dmg.sh) takes its
+# data folder, ports and Bonjour service from the environment. Unset, nothing changes.
+
+
+def test_status_and_overview_carry_this_builds_ports_and_data_folder(tmp_path, monkeypatch):
+    app, launcher, _ = _shell(tmp_path)
+    with TestClient(app, base_url=SHELL) as c:
+        for st in (c.get("/api/status").json(), c.get("/api/overview").json()["status"]):
+            assert (st["coordinator_port"], st["data_port"]) == (8765, 9700)
+            assert st["home"] == str(tmp_path)
+
+    monkeypatch.setenv("SLASHCOMPUTE_COORDINATOR_PORT", "8775")
+    monkeypatch.setenv("SLASHCOMPUTE_DATA_PORT", "9710")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    app, launcher, _ = _shell(tmp_path / ".slashcompute-classic",
+                              discover_fn=lambda timeout=5.0: "10.0.0.9")
+    with TestClient(app, base_url=SHELL) as c:
+        for st in (c.get("/api/status").json(), c.get("/api/overview").json()["status"]):
+            assert (st["coordinator_port"], st["data_port"]) == (8775, 9710)
+            assert st["home"] == "~/.slashcompute-classic"   # shown the way a user would type it
+    # an address found without a port gets this build's port, not the usual one
+    assert launcher.find_on_lan() == "http://10.0.0.9:8775"
+
+
+def test_agent_start_uses_the_configured_data_port(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from slashcompute.agent import main as agent_main
+
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def options(**kw):
+        seen.update(kw)
+        raise Stop
+
+    monkeypatch.setattr(agent_main, "AgentOptions", options)
+    CliRunner().invoke(agent_main.app, ["start", "--home", str(tmp_path)])
+    assert seen["data_port"] == 9700
+    monkeypatch.setenv("SLASHCOMPUTE_DATA_PORT", "9710")
+    CliRunner().invoke(agent_main.app, ["start", "--home", str(tmp_path)])
+    assert seen["data_port"] == 9710
+    CliRunner().invoke(agent_main.app, ["start", "--data-port", "9800", "--home", str(tmp_path)])
+    assert seen["data_port"] == 9800   # an explicit --data-port still wins
+
+
+def test_bonjour_service_from_the_environment():
+    # read in a fresh interpreter: the service type is fixed when the module is first imported
+    def service(**env):
+        code = "from slashcompute.common.discovery import MDNS_SERVICE_TYPE as s; print(s)"
+        return subprocess.run([sys.executable, "-c", code], env={**os.environ, **env},
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    assert service(SLASHCOMPUTE_MDNS_SERVICE="") == "_slashcompute._tcp.local."
+    assert (service(SLASHCOMPUTE_MDNS_SERVICE="_slashcompute-classic._tcp.local.")
+            == "_slashcompute-classic._tcp.local.")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_ui_hints_name_this_builds_ports_and_data_folder(tmp_path):
+    app, launcher, _ = _shell(tmp_path, http=RoutedHTTP(POOL))
+    launcher.save_settings(LauncherSettings(mode="host"))
+    with TestClient(app, base_url=SHELL) as c:
+        usual = c.get("/api/overview").json()
+    classic = {**usual, "status": {**usual["status"], "coordinator_port": 8775, "data_port": 9710,
+                                   "home": "~/.slashcompute-classic"}}
+    older = {**usual, "status": {k: v for k, v in usual["status"].items()
+                                 if k not in ("coordinator_port", "data_port", "home")}}
+    probe = ('[document.querySelector("#p-hint").textContent, document.querySelector("#url").placeholder,'
+             ' keptWhere({kept_folder: "app", name: "Air"})].join(" | ")')
+    phases = [{"routes": {"/api/overview": older}},
+              {"routes": {"/api/overview": older}, "run": "showTab('pool')", "probe": probe},
+              {"routes": {"/api/overview": classic}, "run": "poll()", "probe": probe}]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    seen = json.loads(out.stdout.strip().splitlines()[-1])
+    # a shell that sends no ports or folder: the usual ones are shown
+    assert "TCP 8765 on this Mac and 9700 on each" in seen[1]["probe"]
+    assert "192.168.1.10:8765" in seen[1]["probe"] and "(~/.slashcompute/models)" in seen[1]["probe"]
+    assert "TCP 8775 on this Mac and 9710 on each" in seen[2]["probe"]
+    assert "192.168.1.10:8775" in seen[2]["probe"]
+    assert "(~/.slashcompute-classic/models)" in seen[2]["probe"]
