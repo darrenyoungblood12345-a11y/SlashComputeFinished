@@ -20,7 +20,9 @@ DEMO_MODEL_CANDIDATES = [
 
 ALLOWED_MODELS = (DEV_MODEL, *DEMO_MODEL_CANDIDATES)
 
-MDNS_SERVICE_TYPE = "_slashcompute._tcp.local."
+# A build that runs beside another /compute on one Mac advertises under its own service, so the
+# two never list or join each other's pools (set by the app bundle; see scripts/macos/build_dmg.sh).
+MDNS_SERVICE_TYPE = os.environ.get("SLASHCOMPUTE_MDNS_SERVICE") or "_slashcompute._tcp.local."
 
 log = logging.getLogger(__name__)
 
