@@ -803,7 +803,7 @@ class Launcher:
         found = self._discover(timeout)
         if not found:
             return None
-        url = normalize_url(found)
+        url = normalize_url(found, self.cfg.coordinator_port)
         return None if self.is_own_url(url) else url
 
     def is_own_url(self, url: str) -> bool:

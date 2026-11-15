@@ -235,6 +235,11 @@ function toast(text, tone = "ok") {
 // ------------------------------------------------------------ derived values
 
 const status = () => (state.ov && state.ov.status) || {};
+// A build that runs beside another /compute has its own ports and data folder: the shell says
+// which, and the hints below name them (an older shell says nothing, so the usual ones).
+const coordinatorPort = () => status().coordinator_port ?? 8765;
+const dataPort = () => status().data_port ?? 9700;
+const appHome = () => status().home || "~/.slashcompute";
 const pool = () => (state.ov && state.ov.pool) || { online: false, nodes: [], jobs: [], capacity: {} };
 const me = () => (state.ov && state.ov.me) || { flops: 0 };
 // The share the running agent actually uses; a slider move only saves the next one.
@@ -911,6 +916,7 @@ function renderPool() {
   setText("#p-ip", st.lan_ip || "—");
   // An address being typed is left alone until Connect, or until what is stored matches it.
   const url = $("#url");
+  url.placeholder = `192.168.1.10:${coordinatorPort()}`;
   const urlVal = s.url || "";
   if (state.dirty.url && url.value.trim() === urlVal) state.dirty.url = false;
   if (!state.dirty.url && url.value !== urlVal) url.value = urlVal;
@@ -968,10 +974,10 @@ function renderPool() {
     : `<p class="empty">No Macs connected yet. Start contributing here, or have others join.</p>`);
 
   setText("#p-hint", mode === "host"
-    ? "Firewall: allow incoming TCP 8765 on this Mac and 9700 on each contributing Mac."
+    ? `Firewall: allow incoming TCP ${coordinatorPort()} on this Mac and ${dataPort()} on each contributing Mac.`
     : mode === "public"
       ? "Each Take runs on one signed-in Mac. Nobody opens ports at home."
-      : "Firewall: allow incoming TCP 9700 on this Mac so pipeline peers can reach it.");
+      : `Firewall: allow incoming TCP ${dataPort()} on this Mac so pipeline peers can reach it.`);
 }
 
 // ------------------------------------------------------------ LLMs
@@ -1254,7 +1260,7 @@ function llmRow(m, manage) {
 // Where a Mac kept its copy of a removed model. An older node does not say which folder.
 function keptWhere(h) {
   if (h.kept_folder === "models") return `Kept in ${h.name}'s own models folder.`;
-  if (h.kept_folder === "app") return `Kept in ${h.name}'s app folder (~/.slashcompute/models): this pool has no record of sending that copy.`;
+  if (h.kept_folder === "app") return `Kept in ${h.name}'s app folder (${appHome()}/models): this pool has no record of sending that copy.`;
   return `Kept on ${h.name}.`;
 }
 
@@ -1602,7 +1608,7 @@ function serveLlm(btn, on, changes = {}) {
     state.settings = pickSettings(snap);
     if (isRestartNote(snap.last_error)) toast(snap.last_error);
     else if (snap.last_error) toast(snap.last_error, "bad");
-    else if (on && !snap.inference_running) toast("The LLM node did not start: see ~/.slashcompute/logs/inference.log.", "bad");
+    else if (on && !snap.inference_running) toast(`The LLM node did not start: see ${appHome()}/logs/inference.log.`, "bad");
     else toast(on ? "Serving. This Mac hosts LLM layers whenever a chat needs them."
       : "Stopped serving on this Mac.");
   });
