@@ -1688,8 +1688,8 @@ def test_bonjour_service_from_the_environment():
                               capture_output=True, text=True, check=True).stdout.strip()
 
     assert service(SLASHCOMPUTE_MDNS_SERVICE="") == "_slashcompute._tcp.local."
-    assert (service(SLASHCOMPUTE_MDNS_SERVICE="_slashcompute-classic._tcp.local.")
-            == "_slashcompute-classic._tcp.local.")
+    assert (service(SLASHCOMPUTE_MDNS_SERVICE="_compute-classic._tcp.local.")
+            == "_compute-classic._tcp.local.")
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")

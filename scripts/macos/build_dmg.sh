@@ -11,10 +11,11 @@
 # uses the same name, data folder, ports and Bonjour service) gets its own identity:
 #
 #   APP_NAME="compute classic" BUNDLE_ID=com.slashcompute.classic DATA_DIR=.slashcompute-classic \
-#   SHELL_PORT=8776 COORDINATOR_PORT=8775 DATA_PORT=9710 MDNS_SERVICE=_slashcompute-classic._tcp \
+#   SHELL_PORT=8776 COORDINATOR_PORT=8775 DATA_PORT=9710 MDNS_SERVICE=_compute-classic._tcp \
 #   DMG_FILE=dist/compute-classic-mac.dmg ./scripts/macos/build_dmg.sh
 #
 # Every Mac in a pool has to run the same build: these values are how they find each other.
+# The Bonjour name (between "_" and "._tcp") can be at most 15 characters.
 # The app is ad-hoc signed, not notarized: on first open use right-click → Open.
 set -euo pipefail
 
@@ -32,6 +33,14 @@ SHELL_PORT="${SHELL_PORT:-}"              # local UI port; empty = 8766
 COORDINATOR_PORT="${COORDINATOR_PORT:-}"  # empty = 8765
 DATA_PORT="${DATA_PORT:-}"                # empty = 9700
 MDNS_SERVICE="${MDNS_SERVICE:-_slashcompute._tcp}"
+# Bonjour allows a service name of at most 15 letters, digits and hyphens. The app's mDNS library
+# refuses to register any other, and the coordinator then runs without advertising: the app opens
+# and hosts, and no other Mac ever finds its pool. Such a build is refused here instead.
+MDNS_SERVICE_FORM='^_[A-Za-z0-9]([A-Za-z0-9-]{0,13}[A-Za-z0-9])?\._tcp$'
+[[ "$MDNS_SERVICE" =~ $MDNS_SERVICE_FORM ]] || {
+  echo "MDNS_SERVICE=$MDNS_SERVICE cannot be advertised: use _name._tcp, the name at most 15 letters, digits and hyphens." >&2
+  exit 1
+}
 # Stage outside the checkout: iCloud-synced folders (e.g. ~/Desktop) re-tag files with
 # Finder/provenance attributes that codesign rejects.
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/compute-dmg.XXXXXX")"
