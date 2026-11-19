@@ -2,7 +2,7 @@
 
 Pooling engine: pipeline-parallel LoRA fine-tunes across Apple Silicon Macs on a LAN. Contributors run a headless agent; one coordinator schedules stages, records usage, and checks work.
 
-Accounts, credits, and grants are later. This build is the Mac engine plus a local app.
+Accounts are Google accounts, with credits and grants kept per pool; see [docs/google-sign-in.md](docs/google-sign-in.md) for how sign-in works and how to set it up.
 
 ## Install
 
@@ -14,7 +14,7 @@ With `SLASHCOMPUTE_PUBLIC_POOL=1`, only a job's owner or an administrator can ca
 
 Public users submit training datasets through `POST /jobs/upload` (the app's Usage form). Submitting coordinator-local dataset paths through `POST /jobs` is restricted to administrators. Temporary uploads are removed after submission, and rejected reservations discard their dataset copies.
 
-Each account gets a one-time welcome credit of 1 PFLOP (1e15 FLOPs) when it first signs in (email or Google); set `SLASHCOMPUTE_WELCOME_FLOPS` on the coordinator to change it, or `0` to disable.
+Each account gets a one-time welcome credit of 1 PFLOP (1e15 FLOPs) when it first signs in with Google; set `SLASHCOMPUTE_WELCOME_FLOPS` on the coordinator to change it, or `0` to disable.
 
 Changing the pool address or signing in or out restarts the training agent after it drains (the app says "Restarting" until the new agent is up). A new GPU share or memory limit applies the next time you start contributing. Existing agents without saved argument metadata rejoin once after upgrading.
 
@@ -25,7 +25,7 @@ Changing the pool address or signing in or out restarts the training agent after
 2. The coordinator splits the model by layer, sized to each Mac's contributed memory.
 3. Each Mac downloads the model the first time. The job card shows the progress, and cancelling stops the download at once. A Mac whose job was cancelled gets new work only after its agent confirms it stopped.
 4. Neighbouring stages open a TCP link and run a GPipe LoRA step: activations forward, gradients back.
-5. Each step is metered (FLOPs, memory, time).
+5. Each step is metered (FLOPs, memory, time) and charged to the job. The Mac that ran it is paid once the epoch has ended and the steps sampled from it have been replayed by another Mac; a replay that fails returns that Mac's share of the epoch to the job.
 6. `stop` drains after the current step; a crash resumes from the last complete checkpoint.
 
 Something stuck or unclear? See [docs/troubleshooting.md](docs/troubleshooting.md).
