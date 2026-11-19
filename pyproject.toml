@@ -20,6 +20,7 @@ dependencies = [
     "psutil>=6.0",
     "python-multipart>=0.0.9",
     "pywebview>=5.0",
+    "pyjwt[crypto]>=2.8",
 ]
 
 [project.scripts]

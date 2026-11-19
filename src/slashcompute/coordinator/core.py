@@ -453,7 +453,6 @@ class Coordinator:
             return
         cur.steps_seen.add((msg.stage_idx, msg.step))
         cur.last_progress = time.monotonic()
-        self.ledger.record_step(node_id, msg)
         # The reported FLOPs are the stage's own figure, so they are billed only up to what
         # the step can cost. A claim that is not a positive number (NaN included) bills nothing.
         claimed, ceiling = float(msg.usage.flops), self._max_step_flops(job, cur, msg.stage_idx)
@@ -464,10 +463,13 @@ class Coordinator:
                         node_id[:8], claimed, ceiling)
         job.last_step_flops = flops
         acct = self.credits.job_account(job.id)
-        take = self.credits.consume_job(job.id, flops) if acct is not None else 0.0
         node = self.registry.get(node_id)
         owner_id = (node.user_id if node and node.user_id else self.credits.owner_of(node_id))
-        self.credits.credit_host(owner_id, take, node_id=node_id, job_id=msg.job_id)
+        # Charged to the job now, paid to the node later: the figure is still only its own word
+        # until the epoch's sampled steps have been replayed (VerificationManager.settle_holds).
+        take = (self.credits.hold_step(job.id, cur.epoch, node_id, owner_id, flops)
+                if acct is not None else 0.0)
+        self.ledger.record_step(node_id, msg, billed_flops=take)
         spent = acct is not None and self.credits.job_exhausted(job.id)
         if msg.loss is not None and not spent:
             job.row.progress_step = msg.step

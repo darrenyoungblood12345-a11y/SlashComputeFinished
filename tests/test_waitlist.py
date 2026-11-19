@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 
 import pytest
+
+from accounts import sign_in
 from fastapi.testclient import TestClient
 
 from slashcompute.common import protocol as P
@@ -82,7 +84,7 @@ def test_two_queued_no_pool_positions_without_eta(core):
 
 def test_reserved_ahead_divides_by_pool_tflops(core):
     a, b = _pair(core)
-    user = core.auth.register("ada@lan.test", "password1", "Ada")
+    user, _ = sign_in(core.auth)
     core.credits.contribute(user.id, 1e15, 0)
     core.credits.reserve_job(user.id, a.id, 2e12)
     _online(core, tflops=2.0)
@@ -114,7 +116,7 @@ def test_anonymous_ahead_without_step_omits_eta(core):
 
 def test_running_job_is_ahead_of_queued(core):
     a, b = _pair(core)
-    user = core.auth.register("ada@lan.test", "password1", "Ada")
+    user, _ = sign_in(core.auth)
     core.credits.contribute(user.id, 1e15, 0)
     core.credits.reserve_job(user.id, a.id, 4e12)
     a.row.status = "running"

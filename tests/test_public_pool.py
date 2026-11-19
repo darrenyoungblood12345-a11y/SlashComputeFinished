@@ -7,6 +7,8 @@ import json
 import time
 
 import pytest
+
+from accounts import http_sign_in
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -46,11 +48,7 @@ def _hdr(token):
 
 
 def _account(client, email="ada@lan.test"):
-    token = client.post("/auth/register", json={
-        "email": email, "password": "password1", "name": "Ada",
-    }).json()["token"]
-    client.post("/auth/accept-terms", headers=_hdr(token))
-    return token
+    return http_sign_in(client, email, accept_terms=True)
 
 
 def test_public_anon_submit_rejected(env):
@@ -92,9 +90,7 @@ def test_public_register_requires_session(env):
 
 def test_public_register_requires_terms(env):
     client, *_ = env
-    token = client.post("/auth/register", json={
-        "email": "bob@lan.test", "password": "password1", "name": "Bob",
-    }).json()["token"]
+    token = http_sign_in(client, "bob@lan.test", "Bob")
     with pytest.raises(WebSocketDisconnect) as e:
         with client.websocket_connect("/ws/agent") as ws:
             ws.send_text(P.dump(P.Register(
@@ -353,7 +349,9 @@ def test_assigned_node_cannot_bill_more_than_its_stage_can_cost(victim_job):
     job = client.get(f"/jobs/{asg.job_id}").json()
     assert job["spent_flops"] == _stage_cost(asg) < 1e10
     assert job["status"] not in ("cancelled", "failed") and job["error"] is None
-    assert core.credits.lifetime_earned(host_id) == _stage_cost(asg)
+    # held for the node at that price, and not paid before the epoch's checks are in
+    assert core.credits.pending_earnings(host_id) == _stage_cost(asg)
+    assert core.credits.lifetime_earned(host_id) == 0.0
 
 
 @pytest.mark.parametrize("claim", [float("nan"), float("inf"), -1e15])

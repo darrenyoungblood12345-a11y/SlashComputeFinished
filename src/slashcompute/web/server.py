@@ -10,10 +10,11 @@ import math
 import os
 import time
 import traceback
+import webbrowser
 from dataclasses import asdict, fields, replace
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlsplit
 
 import anyio
@@ -25,7 +26,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
-from slashcompute.common.config import DEMO_MODEL_CANDIDATES, DEV_MODEL
+from slashcompute.common.config import (
+    DEMO_MODEL_CANDIDATES, DEV_MODEL, google_client_id, google_client_secret,
+)
 from slashcompute.common.jsonbool import body_bool
 from slashcompute.launcher.controller import (
     FINISHES, INFERENCE_SETTINGS, OUTDATED_COORDINATOR, Launcher, LauncherError, LauncherSettings,
@@ -33,16 +36,17 @@ from slashcompute.launcher.controller import (
 )
 from slashcompute.launcher.dashboard import POOL_LISTS, PoolData, fresh_pool, overview
 from slashcompute.web import sample_grants
+from slashcompute.web.google_sign_in import SignInError, SignIns, exchange_code, result_page
 
 STATIC = Path(__file__).resolve().parent / "static"
 SHELL_HOST = os.environ.get("SLASHCOMPUTE_SHELL_HOST", "127.0.0.1")
 SHELL_PORT = int(os.environ.get("SLASHCOMPUTE_SHELL_PORT", "8766"))
 # Bump when the shell changes: a running older shell is then replaced instead of reused.
-SHELL_GENERATION = 10
+SHELL_GENERATION = 11
 MODELS = [DEV_MODEL, *DEMO_MODEL_CANDIDATES]
 SESSION_COOKIE = "slashcompute_session"
 # Coordinator routes whose 200 carries a freshly issued session token, and the one that says whose it is.
-SIGN_IN_ROUTES = frozenset({"auth/login", "auth/register", "auth/google"})
+SIGN_IN_ROUTES = frozenset({"auth/google"})
 ME_ROUTE = "auth/me"
 NO_COORDINATOR = "No coordinator URL. Host or enter one, then Start."
 _PROXY_BLOCK = {"verify"}
@@ -301,8 +305,10 @@ def _stateless_async_client() -> httpx.AsyncClient:
 
 
 def create_shell(launcher: Optional[Launcher] = None,
-                 stream_client: Optional[httpx.AsyncClient] = None) -> FastAPI:
+                 stream_client: Optional[httpx.AsyncClient] = None,
+                 open_browser: Callable[[str], bool] = webbrowser.open) -> FastAPI:
     launch = launcher or Launcher()
+    sign_ins = SignIns()
     streams = stream_client or _stateless_async_client()
 
     @contextlib.asynccontextmanager
@@ -437,6 +443,74 @@ def create_shell(launcher: Optional[Launcher] = None,
         if supports_inference(await asyncio.to_thread(launch.poll_health, base)) is False:
             raise HTTPException(409, OUTDATED_COORDINATOR)
         return base
+
+    @app.post("/api/auth/google/start")
+    async def google_start():
+        """Begin a sign-in at the pool this app points at, and open Google's page for it in the
+        user's own browser (Google refuses to show it inside the app's window)."""
+        client_id = google_client_id()
+        if not client_id:
+            raise HTTPException(501, "Google sign-in is not set up in this build of the app.")
+        base = await coord_base(await settings())
+        try:
+            r = await asyncio.to_thread(launch._http.post, f"{base}/auth/google/challenge", timeout=10.0)
+        except (httpx.RequestError, ConnectionError, OSError) as e:
+            raise HTTPException(502, f"Coordinator unreachable at {base}: {e}") from e
+        data = _json_dict(r) or {}
+        if r.status_code != 200 or not isinstance(data.get("nonce"), str):
+            if r.status_code in (404, 405):
+                raise HTTPException(502, "This pool runs an older version without Google sign-in.")
+            raise HTTPException(r.status_code if r.status_code >= 400 else 502, _coord_detail(r))
+        if data.get("client_id") != client_id:
+            # The token would be issued to this app and the pool would refuse it.
+            raise HTTPException(409, "This pool takes sign-ins from a different build of the app.")
+        url = sign_ins.begin(base, data["nonce"], client_id, SHELL_PORT)
+        if not await asyncio.to_thread(open_browser, url):
+            sign_ins.finish(False, "Could not open your browser.")
+            raise HTTPException(500, "Could not open your browser to sign in.")
+        return {"ok": True}
+
+    @app.get("/api/auth/google/status")
+    def google_status():
+        """How the sign-in last started here is going: idle, waiting (in the browser), done or failed."""
+        return sign_ins.outcome()
+
+    @app.get("/api/auth/google/callback")
+    async def google_callback(state: str = "", code: str = "", error: str = ""):
+        """Where Google sends the browser back. Only a sign-in this shell started (``state``) is
+        honoured, and only once."""
+        def page(ok: bool, message: str, status: int = 200) -> HTMLResponse:
+            return HTMLResponse(result_page(ok, message), status_code=status,
+                                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+        pending = sign_ins.take(state)
+        if pending is None:
+            return page(False, "This sign-in link has expired or was already used. Go back to "
+                               "/compute and press Sign in with Google again.", 400)
+
+        def failed(message: str, status: int = 400) -> HTMLResponse:
+            sign_ins.finish(False, message)
+            return page(False, f"{message} Go back to /compute and try again.", status)
+
+        if error or not code:
+            return failed("Google did not sign you in"
+                          + (f" ({error})." if error else "."))
+        try:
+            id_token = await asyncio.to_thread(exchange_code, launch._http, code, pending,
+                                               google_client_secret(), SHELL_PORT)
+            r = await asyncio.to_thread(launch._http.post, f"{pending.pool}/auth/google",
+                                        json={"id_token": id_token}, timeout=30.0)
+        except SignInError as e:
+            return failed(str(e), 502)
+        except (httpx.RequestError, ConnectionError, OSError) as e:
+            return failed(f"The pool at {pending.pool} could not be reached: {e}.", 502)
+        token = _issued_token(r)
+        if not token:
+            return failed(f"The pool refused the sign-in: {_coord_detail(r)}",
+                          r.status_code if r.status_code >= 400 else 502)
+        await asyncio.to_thread(remember_session, pending.pool, token)
+        sign_ins.finish(True)
+        return page(True, "You can close this tab and go back to /compute.")
 
     @app.post("/api/chat")
     async def chat(request: Request):

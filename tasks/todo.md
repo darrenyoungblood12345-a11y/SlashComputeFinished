@@ -1,3 +1,36 @@
+# Hermes scan bugs (payout before verification, password account preclaim) and Google-only accounts
+
+Base: SlashComputeFinished main at 9994123 (the commit Hermes scanned). Branch: claude/hermes-bugs-google-auth-bef01f.
+Plan: `/Users/darren/.claude/plans/first-of-all-lets-iterative-thacker.md`. Baseline: 736 passed.
+
+- [x] `fabricated-training-flop-payout-0003`: a step is charged to the job but held for the node
+      (`EarningHold`); paid when the epoch has ended with no replay of it open; a failed replay returns the
+      node's whole hold to the job, ends the epoch and excludes the node; a kept-back sampled step is not
+      paid and the second in an epoch counts as failed; a step billed above what its replayed rows cost fails
+- [x] Replays that nobody will finish no longer stay open for ever (fetch timeout, queue timeout after the
+      stage ended, a coordinator restart); a public pool never lets an account replay its own work
+- [x] `google-password-account-preclaim-0002`: no passwords at all. Accounts are Google accounts; an old
+      password account is taken over by the first verified Google sign-in with its email; the upgrade ends
+      every session a password opened and blanks the hashes
+- [x] No change writes back a row read earlier (`Database.update`, column-only): a stale profile save
+      cannot undo a ban or a takeover; `_issue` re-reads the ban
+- [x] ID tokens checked locally against Google's keys (PyJWT), bound to the pool by a single-use nonce
+- [x] App: Sign in with Google through the system browser (loopback redirect to the shell, PKCE, state);
+      shell generation 11; the form and its register/login routes are gone
+- [x] Tests moved to a stubbed Google (`tests/accounts.py`); new: test_earning_holds, test_accounts,
+      test_google_sign_in
+- [x] docs/google-sign-in.md, troubleshooting, README
+- [ ] Create the Google Cloud OAuth client (Desktop app) and put its id/secret in `common/config.py`
+- [ ] First real sign-in in the app (needs the client above); confirm the loopback redirect with a path
+- [ ] Rebuild + reinstall the app and check a training job's earnings go pending then paid
+- [ ] PR to SlashComputeFinished
+
+## Results
+
+Full suite: 764 passed, 0 failed (736 at base; the password-era tests are gone or folded into the new files).
+Not verified: a sign-in against real Google (no OAuth client exists yet), and nothing was checked in
+the installed app.
+
 # Jobs stuck on "starting", and the LLM Send button that can't be clicked
 
 Base: SlashComputeFinished main at f43b677 (byte-identical to the installed /Applications/compute.app).

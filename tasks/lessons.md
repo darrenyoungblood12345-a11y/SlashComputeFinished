@@ -46,3 +46,15 @@
   hand stayed advertised, so the planner kept picking that head and every load failed.
 - On a host Mac the coordinator's upload folder is the node's download folder. Anything that deletes there
   must know who owns the file (a record of what each pool sent); never delete by name alone.
+- Before fixing bugs a scanner reported, check which repo and commit it scanned (`git ls-remote`): the
+  worktree was 138 commits behind SlashComputeFinished main, with both bugs already half-fixed upstream.
+- `Database.save()` is `session.merge` of the whole row. Never use it on a row read for a request that
+  another request can change meanwhile (users above all): it writes back every column as it was read.
+  Use `Database.update(model, key, **columns)`.
+- Money that depends on a check must not move before the check can happen: hold it, then release or
+  return it. A flag nothing reads (`disputed`) is not a consequence.
+- When a check can end in "the other side did not answer", decide what that costs: an error that is free
+  is the cheapest way to never be checked.
+- Google blocks its sign-in page in embedded web views (WKWebView): a desktop app must use the system
+  browser with a loopback redirect. All pools share one client ID, so bind each ID token to its pool with
+  a nonce the pool issues.

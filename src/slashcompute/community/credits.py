@@ -13,7 +13,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from slashcompute.common.config import WELCOME_FLOPS
-from slashcompute.coordinator.db import CreditTxn, Database, JobAccount, NodeOwner, User, now
+from slashcompute.coordinator.db import (
+    CreditTxn, Database, EarningHold, JobAccount, NodeOwner, User, now,
+)
 
 POT_ID = "__pot__"
 BALANCE_KINDS = ("earn", "reserve", "release", "donate", "receive", "allocate",
@@ -106,6 +108,8 @@ class Credits:
             "lifetime_spent": self.lifetime_spent(user_id),
             "pot": self.balance(POT_ID),
             "reserved_in_flight": self.reserved_in_flight(user_id),
+            # charged to jobs for this user's nodes, not yet paid: see hold_step
+            "pending_earnings": self.pending_earnings(user_id),
         }
 
     def list_txns(self, user_id: str, *, limit: int = 50,
@@ -177,32 +181,144 @@ class Credits:
         row = self.db.get(NodeOwner, node_id)
         return row.user_id if row else None
 
+    def _earning_rows(self, user_id: str, flops: float, grant_split: int, *,
+                      node_id: Optional[str], job_id: Optional[str]) -> list[CreditTxn]:
+        split = max(0, min(100, int(grant_split))) / 100.0
+        pot = flops * split
+        personal = flops - pot
+        rows = [CreditTxn(user_id=user_id, kind="generated", amount=flops, node_id=node_id,
+                          job_id=job_id)]
+        if personal:
+            rows.append(CreditTxn(user_id=user_id, kind="earn", amount=personal, node_id=node_id,
+                                  job_id=job_id))
+        if pot:
+            rows.append(CreditTxn(user_id=POT_ID, kind="earn", amount=pot, node_id=node_id,
+                                  job_id=job_id, note=_tithe_note(user_id)))
+        return rows
+
+    def _host_rows(self, owner: Optional[User], flops: float, *, node_id: Optional[str],
+                   job_id: Optional[str]) -> list[CreditTxn]:
+        """The rows that pay ``flops`` for a node's work. A share nobody may earn (unbound node,
+        missing or banned owner) goes to the community pot so charged FLOPs never vanish."""
+        if owner is None or owner.banned:
+            return [CreditTxn(user_id=POT_ID, kind="earn", amount=flops, node_id=node_id,
+                              job_id=job_id, note="unclaimed host share")]
+        return self._earning_rows(owner.id, flops, owner.grant_split, node_id=node_id,
+                                  job_id=job_id)
+
     def contribute(self, user_id: str, flops: float, grant_split: int, *,
                    node_id: Optional[str] = None, job_id: Optional[str] = None) -> None:
         if flops <= 0:
             return
-        split = max(0, min(100, int(grant_split))) / 100.0
-        pot = flops * split
-        personal = flops - pot
-        self.post(user_id, "generated", flops, node_id=node_id, job_id=job_id)
-        if personal:
-            self.post(user_id, "earn", personal, node_id=node_id, job_id=job_id)
-        if pot:
-            self.post(POT_ID, "earn", pot, node_id=node_id, job_id=job_id,
-                      note=_tithe_note(user_id))
+        self.db.add(*self._earning_rows(user_id, flops, grant_split, node_id=node_id,
+                                        job_id=job_id))
 
     def credit_host(self, owner_id: Optional[str], flops: float, *,
                     node_id: Optional[str] = None, job_id: Optional[str] = None) -> None:
-        """Pay out FLOPs a job was charged for a node's work. A share nobody may earn (unbound
-        node, missing or banned owner) goes to the community pot so charged FLOPs never vanish."""
+        """Pay out FLOPs a job was charged for a node's work, at once. Training does not use
+        this: its steps are held until they could have been checked (see hold_step)."""
         if flops <= 0:
             return
         owner = self.db.get(User, owner_id) if owner_id else None
-        if owner is None or owner.banned:
-            self.post(POT_ID, "earn", flops, node_id=node_id, job_id=job_id,
-                      note="unclaimed host share")
-            return
-        self.contribute(owner.id, flops, owner.grant_split, node_id=node_id, job_id=job_id)
+        self.db.add(*self._host_rows(owner, flops, node_id=node_id, job_id=job_id))
+
+    # ------------------------------------------------------------ held training earnings
+
+    def hold_step(self, job_id: str, epoch: int, node_id: str, owner_id: Optional[str],
+                  flops: float) -> float:
+        """Charge a job's reserve for one training step and keep the amount back for the node
+        that ran it, instead of paying it. Returns the FLOPs charged.
+
+        What a node reports proves nothing until a sampled step of it has been replayed, so
+        nothing is spendable before release_hold. A node whose hold for this epoch is already
+        settled (forfeited, or the epoch was closed and paid) charges nothing more."""
+        if flops <= 0:
+            return 0.0
+        with self._spend_lock, self.db.session() as s:
+            acct = s.get(JobAccount, job_id)
+            if acct is None:
+                return 0.0
+            hold = s.exec(select(EarningHold).where(
+                EarningHold.job_id == job_id, EarningHold.epoch == epoch,
+                EarningHold.node_id == node_id)).first()
+            if hold is not None and hold.status != "held":
+                return 0.0
+            take = min(flops, acct.reserved_flops - acct.spent_flops)
+            if take <= 0:
+                return 0.0
+            if hold is None:
+                hold = EarningHold(job_id=job_id, epoch=epoch, node_id=node_id, owner_id=owner_id)
+            hold.flops += take
+            acct.spent_flops += take
+            s.add(acct)
+            s.add(hold)
+            s.add(CreditTxn(user_id=acct.user_id, kind="consumed", amount=take, job_id=job_id))
+            s.commit()
+        return take
+
+    def open_holds(self) -> list[EarningHold]:
+        with self.db.session() as s:
+            return list(s.exec(select(EarningHold).where(EarningHold.status == "held")).all())
+
+    def pending_earnings(self, user_id: str) -> float:
+        with self.db.session() as s:
+            total = s.exec(
+                select(func.coalesce(func.sum(EarningHold.flops), 0.0)).where(
+                    EarningHold.owner_id == user_id, EarningHold.status == "held",
+                )
+            ).one()
+        return float(total or 0.0)
+
+    def release_hold(self, hold_id: int) -> float:
+        """Pay a hold to its owner: the grant split and the banned-owner rule are those of now.
+        Returns the FLOPs paid; a hold that is no longer held pays nothing."""
+        with self._spend_lock, self.db.session() as s:
+            hold = s.get(EarningHold, hold_id)
+            if hold is None or hold.status != "held":
+                return 0.0
+            hold.status, hold.resolved_at = "released", now()
+            s.add(hold)
+            if hold.flops > 0:
+                owner = s.get(User, hold.owner_id) if hold.owner_id else None
+                for row in self._host_rows(owner, hold.flops, node_id=hold.node_id,
+                                           job_id=hold.job_id):
+                    s.add(row)
+            s.commit()
+            return hold.flops
+
+    def forfeit_hold(self, job_id: str, epoch: int, node_id: str,
+                     flops: Optional[float] = None) -> float:
+        """Take back what a node was held for this epoch (all of it, or ``flops`` of it) and
+        return it to the job's reserve. Returns the FLOPs taken back.
+
+        Taking all of it closes the hold, so later steps of that node in the epoch charge nothing.
+        The job's account is only un-spent here: a caller whose job has already ended settles it
+        again to hand the amount to the requester."""
+        with self._spend_lock, self.db.session() as s:
+            hold = s.exec(select(EarningHold).where(
+                EarningHold.job_id == job_id, EarningHold.epoch == epoch,
+                EarningHold.node_id == node_id)).first()
+            if hold is None:
+                if flops is not None:
+                    return 0.0
+                # Nothing charged yet: still close the epoch to this node.
+                hold = EarningHold(job_id=job_id, epoch=epoch, node_id=node_id)
+            if hold.status != "held":
+                return 0.0
+            amount = hold.flops if flops is None else max(0.0, min(float(flops), hold.flops))
+            hold.flops -= amount
+            hold.forfeited_flops += amount
+            if flops is None:
+                hold.status, hold.resolved_at = "forfeited", now()
+            s.add(hold)
+            acct = s.get(JobAccount, job_id)
+            if amount and acct is not None:
+                acct.spent_flops = max(0.0, acct.spent_flops - amount)
+                s.add(acct)
+                s.add(CreditTxn(user_id=acct.user_id, kind="consumed", amount=-amount,
+                                job_id=job_id, node_id=node_id, note="unverified work refunded"))
+            s.commit()
+            return amount
 
     def grant_welcome(self, user_id: str, flops: float = WELCOME_FLOPS) -> float:
         """One-time sign-in credit. Returns FLOPs granted (0 if already given)."""

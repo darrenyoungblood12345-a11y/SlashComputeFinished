@@ -189,6 +189,25 @@ The address you joined last is kept in `~/.slashcompute/launcher.json` (`"url"`)
 it. An LLM node pointed at an old pool logs `coordinator not reachable yet (... 404 ...
 /inference/ping)` forever: that pool's app predates LLM inference.
 
+## Accounts and earnings
+
+Signing in is covered in [google-sign-in.md](google-sign-in.md), with a table of what each message
+means.
+
+**Earnings say "pending checks".** A training step is charged to its job at once but only held for
+the Mac that ran it. The hold is paid when the epoch has ended and every step sampled from it has
+been replayed by another Mac, or after `SLASHCOMPUTE_VERIFY_QUEUE_TIMEOUT_S` (300 s) if no other
+Mac became free to replay it. On a pool with a single Mac that wait is the whole delay.
+
+**A Mac earned nothing for an epoch.** `GET /verifications` on the coordinator shows why:
+
+| Status | Meaning | What happens to the money |
+|---|---|---|
+| `passed` | Another Mac recomputed the step and agreed | Paid with the rest of the epoch |
+| `failed` | The replay disagreed, the uploaded bundle was not what the Mac committed to at step time, or the step was billed above what its rows cost | The Mac's whole hold for that epoch goes back to the job, the epoch restarts without it, and it gets no work until it reconnects and passes a canary |
+| `refused` | The Mac did not hand over a sampled step while its stage was still running (an error, no upload within `SLASHCOMPUTE_VERIFY_FETCH_TIMEOUT_S`, or it left) | That step is not paid. `SLASHCOMPUTE_VERIFY_MAX_TARGET_ERRORS` (2) of these in one epoch count as `failed`; leaving does not count towards it |
+| `error` | Nobody's fault: no verifier, a verifier that broke, a stage that had already stopped, a coordinator restart | Nothing: paid with the rest of the epoch |
+
 ## Is the app running the code you think?
 
 The app carries its own copy of `/compute`. A fix in the repository reaches it only when the app

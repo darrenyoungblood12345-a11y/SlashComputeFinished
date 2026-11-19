@@ -3,6 +3,8 @@
 import asyncio
 
 import pytest
+
+from accounts import sign_in
 from fastapi.testclient import TestClient
 
 from slashcompute.common.config import EngineConfig
@@ -14,14 +16,12 @@ from slashcompute.pipeline.local import build_compute
 
 @pytest.fixture
 def pool(tmp_path, tiny_model, tiny_dataset, monkeypatch):
-    monkeypatch.setattr('slashcompute.community.auth.ITERATIONS', 1)
     app = create_app(EngineConfig(home=tmp_path / 'home', public_pool=True))
     core = app.state.core
     users, tokens = {}, {}
     for role in ('admin', 'owner', 'other', 'worker', 'verifier'):
-        user = core.auth.register(f'{role}@example.test', 'password1', role)
-        core.auth.accept_terms(user)
-        user, token = core.auth.login(user.email, 'password1')
+        user, token = sign_in(core.auth, f'{role}@example.test', role)
+        user = core.auth.accept_terms(user)
         core.credits.contribute(user.id, 1e12, 0)
         users[role], tokens[role] = user, token
     # No background scheduling: each test controls the current assignment explicitly.

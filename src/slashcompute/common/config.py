@@ -35,6 +35,22 @@ _MIN = {"checkpoint_every": 1}
 # One-time credit for every account on first sign-in: 1 PFLOP (credits are 1:1 FLOPs).
 WELCOME_FLOPS = 1e15
 
+# Sign-in is "Sign in with Google" through the system browser. These name this app's OAuth
+# client in Google Cloud (type "Desktop app"; see docs/google-sign-in.md). Google does not treat
+# a desktop client's secret as confidential: it ships inside the app. An app opened from Finder
+# has no environment to read, so a release sets them here; SLASHCOMPUTE_GOOGLE_CLIENT_ID and
+# SLASHCOMPUTE_GOOGLE_CLIENT_SECRET override them. Empty means sign-in is switched off.
+GOOGLE_CLIENT_ID = ""
+GOOGLE_CLIENT_SECRET = ""
+
+
+def google_client_id() -> str:
+    return (os.environ.get("SLASHCOMPUTE_GOOGLE_CLIENT_ID") or GOOGLE_CLIENT_ID).strip()
+
+
+def google_client_secret() -> str:
+    return (os.environ.get("SLASHCOMPUTE_GOOGLE_CLIENT_SECRET") or GOOGLE_CLIENT_SECRET).strip()
+
 
 def allowed_model(model: str) -> bool:
     """Catalog HF ids, or a local directory the coordinator already has."""
@@ -82,6 +98,14 @@ class EngineConfig:
     # GPU fp32 vs NumPy reference; zeros/random still fail (~1.0).
     canary_rel_tolerance: float = 0.5
     verify_ring_size: int = 8
+    # A node asked for a sampled step's bundle has this long to upload it.
+    verify_fetch_timeout_s: float = 120.0
+    # A node that keeps back this many sampled steps of one epoch while its stage is running
+    # is treated like one whose replay failed.
+    verify_max_target_errors: int = 2
+    # Once its epoch has ended, a replay waits this long for another Mac to become free to run
+    # it; after that it is dropped and the earnings it held up are paid.
+    verify_queue_timeout_s: float = 300.0
 
     # Fraction of each stage's weight bytes reserved for activations, grads and
     # optimizer state, plus a fixed headroom per stage.
