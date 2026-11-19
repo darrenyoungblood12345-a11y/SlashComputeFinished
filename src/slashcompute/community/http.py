@@ -57,29 +57,13 @@ def mount_community(app, core: Coordinator) -> None:
         cid = google_client_id()
         return {"google": bool(cid), "google_client_id": cid or None}
 
-    @r.post("/auth/register")
-    def register(body: dict, request: Request):
-        try:
-            user = core.auth.register(body.get("email", ""), body.get("password", ""),
-                                      body.get("name", ""))
-            user, token = core.auth.login(user.email, body.get("password", ""))
-        except AuthError as e:
-            _raise(e)
-        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
-        resp = {"user": core.auth.public_view(user), "token": token}
-        # cookie is set by the wrapper below via a side channel — return token for the app
-        request.state.session_token = token
-        return resp
-
-    @r.post("/auth/login")
-    def login(body: dict, request: Request):
-        try:
-            user, token = core.auth.login(body.get("email", ""), body.get("password", ""))
-        except AuthError as e:
-            _raise(e)
-        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
-        request.state.session_token = token
-        return {"user": core.auth.public_view(user), "token": token}
+    @r.post("/auth/google/challenge")
+    def google_challenge():
+        """Start a sign-in at this pool: the nonce the Google token must carry to be accepted here."""
+        cid = google_client_id()
+        if not cid:
+            raise HTTPException(501, "Google sign-in is not configured.")
+        return {"nonce": core.auth.google_challenge(), "client_id": cid}
 
     @r.post("/auth/google")
     def google(body: dict, request: Request):

@@ -9,6 +9,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+
+from accounts import fake_google, id_token, sign_in
 from fastapi.testclient import TestClient
 
 from slashcompute.common.config import EngineConfig
@@ -496,20 +498,20 @@ def test_proxy_forwards_set_cookie(tmp_path):
     app, launcher, _ = _shell(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.save_settings(LauncherSettings(mode="host"))
     with TestClient(app, base_url=SHELL) as c:
-        r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "password1"})
+        r = c.post("/api/coord/auth/google", json={"id_token": "ok"})
         assert r.status_code == 200
         assert "slashcompute_session=sess" in r.headers.get("set-cookie", "")
 
 
-def test_proxy_never_keeps_a_cookie_but_lends_the_stored_session(tmp_path, monkeypatch):
-    monkeypatch.setattr("slashcompute.community.auth.ITERATIONS", 1)
+def test_proxy_never_keeps_a_cookie_but_lends_the_stored_session(tmp_path):
     coord_app = create_app(EngineConfig(home=tmp_path / "coord", scheduler_tick_s=0.05))
     with TestClient(coord_app) as coord:
         app, launcher, _ = _shell(tmp_path / "shell", http=stateless_http(transport=coord._transport))
         launcher.save_settings(LauncherSettings(mode="join", url="http://testserver"))
         with TestClient(app, base_url=SHELL) as c:
-            r = c.post("/api/coord/auth/register", json={
-                "email": "ada@lan.test", "password": "password1", "name": "Ada"})
+            fake_google(coord_app.state.core.auth)
+            nonce = c.post("/api/coord/auth/google/challenge").json()["nonce"]
+            r = c.post("/api/coord/auth/google", json={"id_token": id_token("ada@lan.test", nonce, "Ada")})
             assert r.status_code == 200, r.text
             assert "slashcompute_session=" in r.headers.get("set-cookie", "")
             # The shell stored the token as it relayed the reply: a poll before the window has saved
@@ -623,9 +625,9 @@ class SessionHTTP:
     def post(self, url: str, content=None, headers=None, timeout: float = 1.0, **_):
         self.seen.append(dict(headers or {}))
         path = self._path(url)
-        if path in ("/auth/login", "/auth/register", "/auth/google"):
-            if json.loads(content or b"{}").get("password") == "wrong":
-                return _json_response({"detail": "Wrong password."}, 401)
+        if path == "/auth/google":
+            if json.loads(content or b"{}").get("id_token") == "wrong":
+                return _json_response({"detail": "Google sign-in failed."}, 401)
             self.live.add("fresh")
             return _json_response({"user": {"id": "u1", "email": "ada@lan.test"}, "token": "fresh"})
         return _json_response({"detail": "not found"}, 404)
@@ -684,9 +686,9 @@ def test_proxy_stores_the_session_a_sign_in_issues_as_it_relays_the_reply(tmp_pa
     app, launcher, _ = _shell(tmp_path, http=http)
     launcher.save_settings(LauncherSettings(mode="join", url="10.0.0.1"))
     with TestClient(app, base_url=SHELL) as c:
-        r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "wrong"})
+        r = c.post("/api/coord/auth/google", json={"id_token": "wrong"})
         assert r.status_code == 401 and launcher.load_settings().session_token == ""
-        r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "password1"})
+        r = c.post("/api/coord/auth/google", json={"id_token": "ok"})
         assert r.status_code == 200 and r.json()["token"] == "fresh"
         s = launcher.load_settings()
         assert (s.session_token, s.session_url) == ("fresh", "http://10.0.0.1:8765")
@@ -729,7 +731,7 @@ def test_a_sign_in_through_the_proxy_rebinds_the_running_agent_to_its_session(tm
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop", stop)
     with TestClient(app, base_url=SHELL) as c:
         assert c.get("/api/status").json()["agent_running"]
-        r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "password1"})
+        r = c.post("/api/coord/auth/google", json={"id_token": "ok"})
         assert r.status_code == 200 and r.json()["token"] == "fresh"
         assert c.get("/api/settings").json()["has_session"] is True
     assert launcher.load_settings().session_token == "fresh"
@@ -872,14 +874,12 @@ def test_live_grants_are_not_mixed_with_samples(tmp_path):
 def test_live_grant_cards_show_their_backers(tmp_path, monkeypatch):
     """Against the real coordinator, not a stand-in: its grant rows never carried the backer count the
     card reads, so every live grant showed "0 backers" whatever it had received."""
-    monkeypatch.setattr("slashcompute.community.auth.ITERATIONS", 1)
     coord_app = create_app(EngineConfig(home=tmp_path / "coord", scheduler_tick_s=0.05))
     with TestClient(coord_app) as coord:
         core = coord_app.state.core
         people = {}
         for name in ("admin", "author", "ada", "bea"):
-            core.auth.register(f"{name}@lan.test", "password1", name)
-            people[name] = core.auth.accept_terms(core.auth.login(f"{name}@lan.test", "password1")[0])
+            people[name] = core.auth.accept_terms(sign_in(core.auth, f"{name}@lan.test", name)[0])
         for donor in ("ada", "bea"):
             core.credits.contribute(people[donor].id, 100.0, 0)
         g = core.grants.create(people["author"], "Need compute", "A short paragraph about the need.", 100.0)
@@ -1129,21 +1129,62 @@ def test_contributing_pill_shows_the_running_share(tmp_path):
     assert unlisted == ["Contributing · 30%", "Contributing · 30%"]
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
-def test_sign_out_after_registering_shows_sign_in(tmp_path):
-    routes = {"/api/coord/auth/logout": {}, "/api/settings": {"session_token": ""}}
-    phases = [
-        {"routes": {}},
-        {"routes": routes, "run": """
-            state.user = { id: "u1", email: "ada@example.com", accepted_terms: true };
-            actions["auth-mode"]();
-            actions.logout(null);""",
-         "probe": """[state.authMode, $("#auth-submit").textContent, $("[data-act='auth-mode']").textContent]"""},
-    ]
+def _dom(tmp_path, phases):
     (tmp_path / "phases.json").write_text(json.dumps(phases))
     out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
                          capture_output=True, text=True, timeout=30, check=True)
-    assert json.loads(out.stdout.strip().splitlines()[-1])[1]["probe"] == ["login", "Sign in", "Create account"]
+    return [phase.get("probe") for phase in json.loads(out.stdout.strip().splitlines()[-1])]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_sign_in_button_sends_the_user_to_their_browser_and_says_how_it_went(tmp_path):
+    """Google refuses its sign-in page inside the app's window, so the button only asks the shell
+    to open the browser; the window then waits, and shows why if it did not work out."""
+    probes = _dom(tmp_path, [
+        {"routes": {}},
+        {"routes": {"/api/auth/google/start": {"ok": True}},
+         "run": """actions["google-sign-in"]($("#auth-google"));""",
+         "probe": """[state.signingIn > 0, $("#auth-msg").textContent,
+                      calls.some((c) => c.path === "/api/auth/google/start" && c.method === "POST")]"""},
+        {"routes": {"/api/auth/google/status": {"state": "waiting", "message": ""}},
+         "run": "watchSignIn();", "probe": "state.signingIn > 0"},
+        {"routes": {"/api/auth/google/status": {"state": "failed", "message": "Google did not sign you in."}},
+         "run": "watchSignIn();", "probe": """[state.signingIn, $("#auth-msg").textContent]"""},
+        {"routes": {}, "run": """
+            state.signingIn = Date.now();
+            state.user = { id: "u1", email: "ada@example.com", accepted_terms: true };
+            watchSignIn();""",
+         "probe": """[state.signingIn, $("#auth-msg").textContent]"""},
+    ])
+    assert probes[1] == [True, "Finish signing in in your browser, then come back here.", True]
+    assert probes[2] is True
+    assert probes[3] == [0, "Google did not sign you in."]
+    assert probes[4] == [0, ""]                     # the poll found the account: nothing left to say
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_a_sign_in_that_cannot_start_says_why(tmp_path):
+    probes = _dom(tmp_path, [
+        {"routes": {}},
+        {"routes": {}, "run": """actions["google-sign-in"]($("#auth-google"));""",
+         "probe": """[state.signingIn, $("#auth-msg").textContent]"""},
+    ])
+    assert probes[1] == [0, "nope"]                 # the shell's own words (the harness 404s with these)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_sign_out_shows_the_sign_in_button_again(tmp_path):
+    routes = {"/api/coord/auth/logout": {}, "/api/settings": {"session_token": ""}}
+    probes = _dom(tmp_path, [
+        {"routes": {}},
+        {"routes": routes, "run": """
+            state.user = { id: "u1", email: "ada@example.com", accepted_terms: true };
+            state.signingIn = Date.now();
+            actions.logout(null);""",
+         "probe": """(renderAuth(), [state.user, state.signingIn, $("#auth-gate").hidden,
+                      $("#auth-google").textContent])"""},
+    ])
+    assert probes[1] == [None, 0, False, "Sign in with Google"]
 
 
 def test_live_grants_flow(tmp_path):

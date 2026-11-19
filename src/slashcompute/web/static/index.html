@@ -28,16 +28,9 @@
 
       <div class="side-account" id="acct">
         <div id="auth-gate">
-          <button type="button" class="btn primary sm block" data-act="show-auth">Sign in</button>
-        </div>
-        <form id="auth-form" hidden>
-          <input type="email" id="auth-email" placeholder="Email" autocomplete="username">
-          <input type="password" id="auth-password" placeholder="Password" autocomplete="current-password">
-          <input type="text" id="auth-name" placeholder="Name" hidden autocomplete="nickname">
+          <button type="button" class="btn primary sm block" id="auth-google" data-act="google-sign-in">Sign in with Google</button>
           <p class="msg" id="auth-msg"></p>
-          <button type="submit" class="btn primary sm block" id="auth-submit">Sign in</button>
-          <button type="button" class="btn ghost sm block" data-act="auth-mode">Create account</button>
-        </form>
+        </div>
         <div id="auth-terms" hidden>
           <p class="terms-box" id="terms-text"></p>
           <button type="button" class="btn primary sm block" data-act="accept-terms">Accept terms</button>

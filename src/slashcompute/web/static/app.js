@@ -51,7 +51,7 @@ const state = {
   keys: {},
   user: null,
   credits: null,
-  authMode: "login",
+  signingIn: 0,       // when a sign-in was sent to the browser (0: none in flight)
   terms: "",
   llm: {
     net: null,          // /inference/status
@@ -381,6 +381,7 @@ async function pollOnce() {
     applySettings(ov.status, version);
     if (ov.status && ov.status.coordinator_up) {
       await loadAuth();
+      await watchSignIn();
       if (state.tab === "llm") await loadLlm();
     } else {
       dropPool();
@@ -516,40 +517,51 @@ function renderSidebar() {
 }
 
 function renderAuth() {
-  if (state.busy.has("auth")) return;   // a sign-in or sign-out owns the form meanwhile
+  if (state.busy.has("auth")) return;   // a sign-in or sign-out owns the box meanwhile
   const gate = $("#auth-gate");
-  const form = $("#auth-form");
   const terms = $("#auth-terms");
   const userBox = $("#auth-user");
-  const online = !!(status().coordinator_up);
-  $("#auth-submit").disabled = !online;
-  if (signedIn() && !state.user.accepted_terms) {
-    gate.hidden = true;
-    form.hidden = true;
-    terms.hidden = false;
-    userBox.hidden = true;
+  const termsDue = signedIn() && !state.user.accepted_terms;
+  gate.hidden = signedIn();
+  terms.hidden = !termsDue;
+  userBox.hidden = !signedIn() || termsDue;
+  if (termsDue) {
     if (state.terms) $("#terms-text").textContent = state.terms;
     return;
   }
   if (signedIn()) {
-    gate.hidden = true;
-    form.hidden = true;
-    terms.hidden = true;
-    userBox.hidden = false;
     setText("#auth-who", state.user.name || state.user.email);
     setText("#auth-sub", state.user.admin ? "Admin on this pool" : state.user.email);
     return;
   }
-  userBox.hidden = true;
-  terms.hidden = true;
-  if (!form.hidden) {
-    gate.hidden = true;
-    const register = state.authMode === "register";
-    $("#auth-submit").textContent = register ? "Create account" : "Sign in";
-    $("#auth-name").hidden = !register;
-    $("#auth-password").setAttribute("autocomplete", register ? "new-password" : "current-password");
-  } else {
-    gate.hidden = false;
+  const btn = $("#auth-google");
+  btn.disabled = !status().coordinator_up;
+  btn.textContent = state.signingIn ? "Open the sign-in page again" : "Sign in with Google";
+}
+
+// The sign-in itself happens in the user's browser (Google refuses to show it in this window).
+// While one is out there, each poll asks the shell how it went; loadAuth sees it once it worked.
+const SIGN_IN_WAIT_MS = 10 * 60 * 1000;
+
+async function watchSignIn() {
+  if (!state.signingIn) return;
+  if (signedIn()) {
+    state.signingIn = 0;
+    setMsg("#auth-msg", "", "");
+    toast("Signed in.");
+    loadGrants();
+    return;
+  }
+  let outcome = null;
+  try {
+    outcome = await api("/api/auth/google/status");
+  } catch { /* the next poll asks again */ }
+  if (outcome && outcome.state === "failed") {
+    state.signingIn = 0;
+    setMsg("#auth-msg", outcome.message || "Sign-in did not finish.", "bad");
+  } else if (Date.now() - state.signingIn > SIGN_IN_WAIT_MS) {
+    state.signingIn = 0;
+    setMsg("#auth-msg", "That sign-in ran out of time. Try again.", "bad");
   }
 }
 
@@ -1769,19 +1781,17 @@ const actions = {
     window.setTimeout(() => { btn.textContent = "Copy"; }, 1400);
   },
 
-  "show-auth": () => {
-    $("#auth-gate").hidden = true;
-    $("#auth-form").hidden = false;
-    $("#auth-email").focus();
-    renderAuth();
-  },
-
-  "auth-mode": () => {
-    state.authMode = state.authMode === "register" ? "login" : "register";
-    const btn = document.querySelector("[data-act='auth-mode']");
-    if (btn) btn.textContent = state.authMode === "register" ? "Have an account" : "Create account";
-    renderAuth();
-  },
+  "google-sign-in": (btn) => withBusy("auth", btn, "Opening your browser…", async () => {
+    try {
+      await post("/api/auth/google/start", {});
+    } catch (e) {
+      state.signingIn = 0;
+      setMsg("#auth-msg", e.message || "Could not start the sign-in.", "bad");
+      return;
+    }
+    state.signingIn = Date.now();
+    setMsg("#auth-msg", "Finish signing in in your browser, then come back here.", "");
+  }),
 
   "accept-terms": (btn) => withBusy("terms", btn, "Saving…", async () => {
     await post("/api/coord/auth/accept-terms", {});
@@ -1800,11 +1810,8 @@ const actions = {
     await saveSettings({ session_token: "" });
     state.user = null;
     state.credits = null;
-    $("#auth-password").value = "";
-    // Back to the sign-in form, even if this session started with a registration.
-    state.authMode = "login";
-    const mode = document.querySelector("[data-act='auth-mode']");
-    if (mode) mode.textContent = "Create account";
+    state.signingIn = 0;
+    setMsg("#auth-msg", "", "");
     // The grant board is per user (admin review queue, pledges): rebuild it
     // so nothing from the old session stays on screen.
     $("#g-request").hidden = true;
@@ -2024,34 +2031,6 @@ $("#grant-form").addEventListener("submit", (e) => {
     $("#g-title").value = "";
     $("#g-summary").value = "";
     $("#g-request").hidden = true;
-  });
-});
-
-$("#auth-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const email = $("#auth-email").value.trim();
-  const password = $("#auth-password").value;
-  const name = $("#auth-name").value.trim();
-  if (!email || !password) return setMsg("#auth-msg", "Email and password are required.", "bad");
-  if (state.authMode === "register" && !name) return setMsg("#auth-msg", "Give the account a name.", "bad");
-  return withBusy("auth", $("#auth-submit"), "Working…", async () => {
-    const path = state.authMode === "register" ? "/api/coord/auth/register" : "/api/coord/auth/login";
-    const body = { email, password };
-    if (state.authMode === "register") body.name = name;
-    // The shell stores the sign-in token as it relays the reply: nothing to save here.
-    const r = await post(path, body);
-    state.user = r.user || null;
-    await loadAuth();
-    if (state.user && !state.user.accepted_terms) {
-      try {
-        const t = await api("/api/coord/auth/terms");
-        state.terms = (t && t.text) || "";
-      } catch { state.terms = ""; }
-    }
-    setMsg("#auth-msg", "", "");
-    $("#auth-password").value = "";
-    toast(state.authMode === "register" ? "Account created." : "Signed in.");
-    loadGrants();
   });
 });
 

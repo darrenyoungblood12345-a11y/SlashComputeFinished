@@ -35,6 +35,22 @@ _MIN = {"checkpoint_every": 1}
 # One-time credit for every account on first sign-in: 1 PFLOP (credits are 1:1 FLOPs).
 WELCOME_FLOPS = 1e15
 
+# Sign-in is "Sign in with Google" through the system browser. These name this app's OAuth
+# client in Google Cloud (type "Desktop app"; see docs/google-sign-in.md). Google does not treat
+# a desktop client's secret as confidential: it ships inside the app. An app opened from Finder
+# has no environment to read, so a release sets them here; SLASHCOMPUTE_GOOGLE_CLIENT_ID and
+# SLASHCOMPUTE_GOOGLE_CLIENT_SECRET override them. Empty means sign-in is switched off.
+GOOGLE_CLIENT_ID = ""
+GOOGLE_CLIENT_SECRET = ""
+
+
+def google_client_id() -> str:
+    return (os.environ.get("SLASHCOMPUTE_GOOGLE_CLIENT_ID") or GOOGLE_CLIENT_ID).strip()
+
+
+def google_client_secret() -> str:
+    return (os.environ.get("SLASHCOMPUTE_GOOGLE_CLIENT_SECRET") or GOOGLE_CLIENT_SECRET).strip()
+
 
 def allowed_model(model: str) -> bool:
     """Catalog HF ids, or a local directory the coordinator already has."""

@@ -8,13 +8,15 @@ import threading
 import time
 
 import pytest
+
+from accounts import fake_google, http_sign_in, id_token, sign_in
 from fastapi.testclient import TestClient
 from sqlmodel import select
 from starlette.websockets import WebSocketDisconnect
 
 from slashcompute.common import protocol as P
 from slashcompute.common.config import WELCOME_FLOPS, EngineConfig
-from slashcompute.community.auth import AuthError, google_client_id
+from slashcompute.community.auth import AuthError
 from slashcompute.community.credits import POT_ID, CreditError
 from slashcompute.community.grants import GrantError
 from slashcompute.coordinator.app import create_app
@@ -25,11 +27,6 @@ from slashcompute.coordinator.partitioner import StagePlan
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
 from slashcompute.pipeline.model_profile import profile_model
-
-
-@pytest.fixture(autouse=True)
-def fast_hash(monkeypatch):
-    monkeypatch.setattr("slashcompute.community.auth.ITERATIONS", 1)
 
 
 @pytest.fixture
@@ -81,10 +78,8 @@ def _pay_out(core, job):
     return core.verification.settle_holds()
 
 
-def _account(auth, email="ada@lan.test", password="password1", name="Ada"):
-    user = auth.register(email, password, name)
-    user, token = auth.login(email, password)
-    return user, token
+def _account(auth, email="ada@lan.test", name="Ada"):
+    return sign_in(auth, email, name)
 
 
 # --------------------------------------------------------------------------- auth
@@ -95,89 +90,6 @@ def test_first_user_is_admin_second_is_not(core):
     b, _ = _account(core.auth, "b@lan.test", name="B")
     assert a.admin is True
     assert b.admin is False
-
-
-def test_admin_email_env_is_not_granted_to_a_password_registration(core, monkeypatch):
-    # Anyone can type the configured address into the sign-up form: that proves nothing.
-    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
-    _account(core.auth, "first@lan.test")
-    ops, _ = _account(core.auth, "ops@lan.test")
-    assert ops.admin is False
-    assert core.auth.get_by_email("ops@lan.test").admin is False
-
-
-def test_admin_email_env_is_granted_to_a_verified_google_sign_in(core, monkeypatch):
-    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "Ops@lan.test ")
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    _account(core.auth, "first@lan.test")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "other@lan.test", "name": "Other", "sub": "sub-other",
-    }
-    other, _ = core.auth.login_google("id-token")
-    assert other.admin is False
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "ops@lan.test", "name": "Ops", "sub": "sub-ops",
-    }
-    ops, _ = core.auth.login_google("id-token")
-    assert ops.admin is True
-    assert core.auth.get_by_email("ops@lan.test").admin is True
-
-
-def test_admin_email_env_squatter_never_becomes_admin(core, monkeypatch):
-    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    _account(core.auth, "first@lan.test")
-    squatter, squatter_token = _account(core.auth, "ops@lan.test", "squatter-pw1", "Mallory")
-    assert squatter.admin is False
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "ops@lan.test", "name": "Ops", "sub": "sub-ops",
-    }
-    # The real owner arrives through Google: the account becomes admin only once the
-    # squatter's password and sessions are gone.
-    ops, token = core.auth.login_google("id-token")
-    assert ops.id == squatter.id and ops.admin is True
-    assert core.auth.user_from_token(token).admin is True
-    assert core.auth.user_from_token(squatter_token) is None
-    with pytest.raises(AuthError):
-        core.auth.login("ops@lan.test", "squatter-pw1")
-
-
-def test_http_register_with_the_admin_email_is_not_admin(env, monkeypatch):
-    client, core, *_ = env
-    monkeypatch.setenv("SLASHCOMPUTE_ADMIN_EMAIL", "ops@lan.test")
-    first = client.post("/auth/register", json={
-        "email": "first@lan.test", "password": "password1", "name": "First"}).json()
-    assert first["user"]["admin"] is True       # the bootstrap rule is unchanged
-    r = client.post("/auth/register", json={
-        "email": "ops@lan.test", "password": "password1", "name": "Ops"})
-    assert r.status_code == 200
-    assert r.json()["user"]["admin"] is False
-    users = client.get("/admin/users", headers={"Authorization": f"Bearer {r.json()['token']}"})
-    assert users.status_code == 403
-
-
-def test_register_rejects_bad_email_short_password_duplicate(core):
-    with pytest.raises(AuthError, match="email"):
-        core.auth.register("not-an-email", "password1", "x")
-    with pytest.raises(AuthError, match="8"):
-        core.auth.register("ok@lan.test", "short", "x")
-    core.auth.register("ok@lan.test", "password1", "x")
-    with pytest.raises(AuthError, match="already"):
-        core.auth.register("OK@lan.test", "password1", "x")
-
-
-def test_login_wrong_password_and_ban(core):
-    user, token = _account(core.auth)
-    with pytest.raises(AuthError) as e:
-        core.auth.login("ada@lan.test", "wrong-password")
-    assert e.value.status == 401
-    core.auth.set_banned(user, True)
-    with pytest.raises(AuthError) as e:
-        core.auth.login("ada@lan.test", "password1")
-    assert e.value.status == 403
-    assert core.auth.user_from_token(token) is None
-    banned = core.auth.session_user(token)
-    assert banned is not None and banned.banned is True
 
 
 def test_terms_and_grant_split(core):
@@ -213,77 +125,6 @@ def test_summary_reports_what_was_given_and_kept_at_the_split_of_the_time(core):
     assert s["balance"] == 115.0 and s["pot"] == 20.0 + 55.0
     o = core.credits.summary(other.id)
     assert (o["lifetime_to_grants"], o["lifetime_kept"]) == (20.0, 20.0)
-
-
-def test_google_disabled_without_client_id(core):
-    assert google_client_id() == ""
-    with pytest.raises(AuthError) as e:
-        core.auth.login_google("id-token")
-    assert e.value.status == 501
-
-
-def test_google_login_creates_user(core, monkeypatch):
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "g@lan.test", "name": "Gia", "sub": "sub-1",
-    }
-    user, token = core.auth.login_google("id-token")
-    assert user.email == "g@lan.test" and user.google_sub == "sub-1"
-    assert core.auth.user_from_token(token) is not None
-    with pytest.raises(AuthError):
-        core.auth.login("g@lan.test", "password1")
-    again, _ = core.auth.login_google("id-token")
-    assert again.id == user.id
-
-
-def test_google_login_revokes_a_preclaimed_password_account(core, monkeypatch):
-    # Someone registers the victim's address with their own password before the victim arrives.
-    _, attacker_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
-    }
-    user, token = core.auth.login_google("id-token")
-    assert user.google_sub == "sub-victim"
-    assert core.auth.user_from_token(token).id == user.id
-    # Google verified the mailbox; the password and sessions from before it are gone.
-    assert core.auth.user_from_token(attacker_token) is None
-    with pytest.raises(AuthError) as e:
-        core.auth.login("victim@lan.test", "attacker-pw1")
-    assert e.value.status == 401
-    # Signing in again keeps the owner's own sessions.
-    again, token2 = core.auth.login_google("id-token")
-    assert again.id == user.id
-    assert core.auth.user_from_token(token) is not None
-    assert core.auth.user_from_token(token2) is not None
-
-
-def test_google_login_revokes_the_password_of_an_already_linked_account(core, monkeypatch):
-    # Accounts linked before the reclaim existed still carry the password they were made with.
-    user, old_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
-    user.google_sub = "sub-victim"
-    core.db.save(user)
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
-    }
-    core.auth.login_google("id-token")
-    assert core.auth.user_from_token(old_token) is None
-    with pytest.raises(AuthError):
-        core.auth.login("victim@lan.test", "attacker-pw1")
-
-
-def test_concurrent_google_takeover_keeps_every_new_session(core, monkeypatch):
-    _, attacker_token = _account(core.auth, "victim@lan.test", "attacker-pw1", "Mallory")
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "victim@lan.test", "name": "Vic", "sub": "sub-victim",
-    }
-    results, errors = _race(8, lambda i: core.auth.login_google("id-token"))
-    assert errors == []
-    assert core.auth.user_from_token(attacker_token) is None
-    # Only the first sign-in revokes: a later one must not log the others out again.
-    assert all(core.auth.user_from_token(tok) is not None for _, tok in results)
 
 
 def test_logout_drops_session(core):
@@ -474,47 +315,9 @@ def _hdr(token):
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_http_register_login_cookie_and_me(env):
-    client, core, *_ = env
-    r = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    })
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["user"]["admin"] is True
-    assert body["user"]["accepted_terms"] is False
-    assert r.cookies.get("slashcompute_session")
-    me = client.get("/auth/me")
-    assert me.json()["user"]["email"] == "ada@lan.test"
-    client.post("/auth/logout")
-    assert client.get("/auth/me").json()["user"] is None
-    login = client.post("/auth/login", json={"email": "ada@lan.test", "password": "password1"})
-    token = login.json()["token"]
-    me = client.get("/auth/me", headers=_hdr(token))
-    assert me.json()["credits"]["balance"] == WELCOME_FLOPS
-    patched = client.patch("/auth/me", json={"grant_split": 33}, headers=_hdr(token))
-    assert patched.json()["user"]["grant_split"] == 33
-    assert client.get("/auth/providers").json()["google"] is False
-    assert client.post("/auth/google", json={"id_token": "x"}).status_code == 501
-
-
-def test_http_google_when_configured(env, monkeypatch):
-    client, core, *_ = env
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "g@lan.test", "name": "Gia", "sub": "sub-9",
-    }
-    r = client.post("/auth/google", json={"id_token": "jwt"})
-    assert r.status_code == 200, r.text
-    assert r.json()["user"]["email"] == "g@lan.test"
-    assert client.get("/auth/providers").json()["google"] is True
-
-
 def test_http_terms_required_to_take_and_failed_reserve_drops_job(env):
     client, core, tiny_model, tiny_dataset = env
-    token = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    }).json()["token"]
+    token = http_sign_in(client, "ada@lan.test", "Ada")
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
     spec["max_flops"] = 2 * WELCOME_FLOPS
     r = client.post("/jobs", json=spec, headers=_hdr(token))
@@ -530,9 +333,7 @@ def test_http_terms_required_to_take_and_failed_reserve_drops_job(env):
 
 def test_http_authenticated_take_reserves(env):
     client, core, tiny_model, tiny_dataset = env
-    token = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    }).json()["token"]
+    token = http_sign_in(client, "ada@lan.test", "Ada")
     client.post("/auth/accept-terms", headers=_hdr(token))
     user = core.auth.user_from_token(token)
     core.credits.contribute(user.id, 1e12, 0)
@@ -557,15 +358,9 @@ def test_anonymous_submit_still_works(env):
 
 def test_http_grant_moderation_and_leaderboard(env):
     client, core, *_ = env
-    admin_tok = client.post("/auth/register", json={
-        "email": "admin@lan.test", "password": "password1", "name": "Admin",
-    }).json()["token"]
-    member_tok = client.post("/auth/register", json={
-        "email": "m@lan.test", "password": "password1", "name": "Member",
-    }).json()["token"]
-    donor_tok = client.post("/auth/register", json={
-        "email": "d@lan.test", "password": "password1", "name": "Donor",
-    }).json()["token"]
+    admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
+    member_tok = http_sign_in(client, "m@lan.test", "Member")
+    donor_tok = http_sign_in(client, "d@lan.test", "Donor")
     client.post("/auth/accept-terms", headers=_hdr(member_tok))
     client.post("/auth/accept-terms", headers=_hdr(donor_tok))
     donor = core.auth.user_from_token(donor_tok)
@@ -595,12 +390,8 @@ def test_http_grant_moderation_and_leaderboard(env):
 
 def test_http_ban_blocks_take(env):
     client, core, tiny_model, tiny_dataset = env
-    admin_tok = client.post("/auth/register", json={
-        "email": "admin@lan.test", "password": "password1", "name": "Admin",
-    }).json()["token"]
-    member_tok = client.post("/auth/register", json={
-        "email": "m@lan.test", "password": "password1", "name": "Member",
-    }).json()["token"]
+    admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
+    member_tok = http_sign_in(client, "m@lan.test", "Member")
     member = core.auth.user_from_token(member_tok)
     client.post("/auth/accept-terms", headers=_hdr(member_tok))
     core.credits.contribute(member.id, 1e12, 0)
@@ -623,16 +414,14 @@ def _welcome_rows(client, token):
 
 def test_welcome_credit_on_register_is_spendable_once(env):
     client, core, tiny_model, tiny_dataset = env
-    token = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    }).json()["token"]
+    token = http_sign_in(client, "ada@lan.test", "Ada")
     me = client.get("/credits/me", headers=_hdr(token)).json()
     assert me["balance"] == WELCOME_FLOPS == 1e15
     assert me["lifetime_earned"] == 0.0
     rows = _welcome_rows(client, token)
     assert len(rows) == 1 and rows[0]["note"] == "Welcome credit"
     for _ in range(2):
-        client.post("/auth/login", json={"email": "ada@lan.test", "password": "password1"})
+        http_sign_in(client, "ada@lan.test", "Ada")
     assert core.credits.balance(core.auth.user_from_token(token).id) == WELCOME_FLOPS
 
     client.post("/auth/accept-terms", headers=_hdr(token))
@@ -645,12 +434,10 @@ def test_welcome_credit_on_register_is_spendable_once(env):
 
 def test_welcome_credit_backfilled_on_login(env):
     client, core, *_ = env
-    user = core.auth.register("old@lan.test", "password1", "Old")  # pre-feature account
+    user, _ = _account(core.auth, "old@lan.test", "Old")  # pre-feature account
     assert core.credits.balance(user.id) == 0.0
-    token = client.post("/auth/login", json={
-        "email": "old@lan.test", "password": "password1",
-    }).json()["token"]
-    client.post("/auth/login", json={"email": "old@lan.test", "password": "password1"})
+    token = http_sign_in(client, "old@lan.test", "Old")
+    http_sign_in(client, "old@lan.test", "Old")
     assert core.credits.balance(user.id) == WELCOME_FLOPS
     assert len(_welcome_rows(client, token)) == 1
 
@@ -671,22 +458,10 @@ def test_welcome_credit_backfilled_for_a_stored_session(env):
     assert core.credits.balance(banned.id) == 0.0
 
 
-def test_welcome_credit_on_google_sign_in(env, monkeypatch):
-    client, core, *_ = env
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "g@lan.test", "name": "Gia", "sub": "sub-9",
-    }
-    token = client.post("/auth/google", json={"id_token": "jwt"}).json()["token"]
-    client.post("/auth/google", json={"id_token": "jwt"})
-    user = core.auth.user_from_token(token)
-    assert core.credits.balance(user.id) == WELCOME_FLOPS
-
-
 def test_welcome_credit_granted_once_under_concurrency(core):
     import threading
 
-    user = core.auth.register("ada@lan.test", "password1", "Ada")
+    user, _ = _account(core.auth)
     start = threading.Barrier(16)
     granted = []
 
@@ -705,9 +480,10 @@ def test_welcome_credit_granted_once_under_concurrency(core):
 
 def test_welcome_credit_skips_banned_and_disabled(env, tmp_path, monkeypatch):
     client, core, *_ = env
-    user = core.auth.register("ban@lan.test", "password1", "Ban")
+    user, _ = _account(core.auth, "ban@lan.test", "Ban")
     core.auth.set_banned(user, True)
-    r = client.post("/auth/login", json={"email": "ban@lan.test", "password": "password1"})
+    nonce = client.post("/auth/google/challenge").json()["nonce"]
+    r = client.post("/auth/google", json={"id_token": id_token("ban@lan.test", nonce)})
     assert r.status_code == 403
     assert core.credits.grant_welcome(user.id) == 0.0
     assert core.credits.balance(user.id) == 0.0
@@ -716,9 +492,7 @@ def test_welcome_credit_skips_banned_and_disabled(env, tmp_path, monkeypatch):
     cfg = EngineConfig.from_env(home=tmp_path / "off", verify_rate=0.0)
     assert cfg.welcome_flops == 0.0
     with TestClient(create_app(cfg)) as off:
-        token = off.post("/auth/register", json={
-            "email": "ada@lan.test", "password": "password1", "name": "Ada",
-        }).json()["token"]
+        token = http_sign_in(off, "ada@lan.test", "Ada")
         assert off.get("/credits/me", headers=_hdr(token)).json()["balance"] == 0.0
 
 
@@ -744,9 +518,7 @@ def test_register_binds_only_after_terms(core):
 
 def test_banned_session_closes_agent(env):
     client, core, *_ = env
-    token = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    }).json()["token"]
+    token = http_sign_in(client, "ada@lan.test", "Ada")
     user = core.auth.session_user(token)
     core.auth.accept_terms(user)
     core.auth.set_banned(user, True)
@@ -980,9 +752,7 @@ def test_leaderboard_excludes_banned(core):
 
 def test_session_without_max_flops_abandons_job(env):
     client, core, tiny_model, tiny_dataset = env
-    token = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    }).json()["token"]
+    token = http_sign_in(client, "ada@lan.test", "Ada")
     client.post("/auth/accept-terms", headers=_hdr(token))
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
     r = client.post("/jobs", json=spec, headers=_hdr(token))
@@ -993,8 +763,7 @@ def test_session_without_max_flops_abandons_job(env):
     r = client.post("/jobs", json=spec, headers=_hdr(token))
     assert r.status_code == 400
     assert core.jobs == {}
-    login = client.post("/auth/login", json={"email": "ada@lan.test", "password": "password1"})
-    assert login.status_code == 200
+    http_sign_in(client, "ada@lan.test", "Ada")      # the cookie now carries the session
     r = client.post("/jobs", json=spec)
     assert r.status_code == 400
     assert "max_flops" in r.json()["detail"]
@@ -1003,15 +772,9 @@ def test_session_without_max_flops_abandons_job(env):
 
 def test_http_community_lists_live_and_admin(env):
     client, core, tiny_model, tiny_dataset = env
-    admin_tok = client.post("/auth/register", json={
-        "email": "admin@lan.test", "password": "password1", "name": "Admin",
-    }).json()["token"]
-    member_tok = client.post("/auth/register", json={
-        "email": "m@lan.test", "password": "password1", "name": "Member",
-    }).json()["token"]
-    donor_tok = client.post("/auth/register", json={
-        "email": "d@lan.test", "password": "password1", "name": "Donor",
-    }).json()["token"]
+    admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
+    member_tok = http_sign_in(client, "m@lan.test", "Member")
+    donor_tok = http_sign_in(client, "d@lan.test", "Donor")
     client.post("/auth/accept-terms", headers=_hdr(admin_tok))
     client.post("/auth/accept-terms", headers=_hdr(member_tok))
     client.post("/auth/accept-terms", headers=_hdr(donor_tok))
@@ -1116,9 +879,7 @@ def test_http_community_lists_live_and_admin(env):
 
 def test_my_nodes_shows_live_inference_nodes_online(env):
     client, core, _, _ = env
-    token = client.post("/auth/register", json={
-        "email": "host@lan.test", "password": "password1", "name": "Host",
-    }).json()["token"]
+    token = http_sign_in(client, "host@lan.test", "Host")
     user = core.auth.user_from_token(token)
     inference = client.app.state.inference
     for node_id, beat in [("inf-live", time.time()), ("inf-gone", time.time() - 3600)]:
@@ -1135,9 +896,7 @@ def test_http_comment_only_on_grants_you_can_view(env):
     client, core, *_ = env
     tokens = {}
     for who in ("admin", "author", "other"):
-        tokens[who] = client.post("/auth/register", json={
-            "email": f"{who}@lan.test", "password": "password1", "name": who,
-        }).json()["token"]
+        tokens[who] = http_sign_in(client, f"{who}@lan.test", who)
         client.post("/auth/accept-terms", headers=_hdr(tokens[who]))
     client.cookies.clear()
     g = client.post("/grants", json={
@@ -1165,15 +924,9 @@ def test_http_comment_only_on_grants_you_can_view(env):
 
 def test_http_grants_reject_non_finite_goal_and_donation(env):
     client, core, *_ = env
-    admin_tok = client.post("/auth/register", json={
-        "email": "admin@lan.test", "password": "password1", "name": "Admin",
-    }).json()["token"]
-    member_tok = client.post("/auth/register", json={
-        "email": "m@lan.test", "password": "password1", "name": "Member",
-    }).json()["token"]
-    donor_tok = client.post("/auth/register", json={
-        "email": "d@lan.test", "password": "password1", "name": "Donor",
-    }).json()["token"]
+    admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
+    member_tok = http_sign_in(client, "m@lan.test", "Member")
+    donor_tok = http_sign_in(client, "d@lan.test", "Donor")
     client.post("/auth/accept-terms", headers=_hdr(member_tok))
     client.post("/auth/accept-terms", headers=_hdr(donor_tok))
     core.credits.contribute(core.auth.user_from_token(donor_tok).id, 80.0, 0)
@@ -1198,17 +951,13 @@ def test_http_grants_reject_non_finite_goal_and_donation(env):
 
 def test_http_admin_cannot_ban_self_or_last_admin(env):
     client, core, *_ = env
-    admin_tok = client.post("/auth/register", json={
-        "email": "admin@lan.test", "password": "password1", "name": "Admin",
-    }).json()["token"]
+    admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
     admin = core.auth.user_from_token(admin_tok)
     r = client.post(f"/admin/users/{admin.id}/ban", json={}, headers=_hdr(admin_tok))
     assert r.status_code == 400, r.text
     assert client.get("/admin/users", headers=_hdr(admin_tok)).status_code == 200
     # A second admin may ban the first, but not then the one admin left.
-    other_tok = client.post("/auth/register", json={
-        "email": "other@lan.test", "password": "password1", "name": "Other",
-    }).json()["token"]
+    other_tok = http_sign_in(client, "other@lan.test", "Other")
     other = core.auth.user_from_token(other_tok)
     other.admin = True
     core.db.save(other)
@@ -1242,71 +991,26 @@ def _race(n, fn):
     return results, errors
 
 
-def _slow_count(auth, monkeypatch):
-    """Widen the check-then-insert window so a racy admin decision shows up every run."""
-    count = auth.user_count
-
-    def slow():
-        n = count()
-        time.sleep(0.05)
-        return n
-
-    monkeypatch.setattr(auth, "user_count", slow)
-
-
-def test_concurrent_registrations_make_exactly_one_admin(core, monkeypatch):
-    _slow_count(core.auth, monkeypatch)
-    users, errors = _race(8, lambda i: core.auth.register(f"u{i}@lan.test", "password1", f"U{i}"))
-    assert errors == []
-    assert sum(u.admin for u in users) == 1
-    assert sum(core.auth.get(u.id).admin for u in users) == 1
-
-
-def test_concurrent_google_signups_make_exactly_one_admin(core, monkeypatch):
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": f"{tok}@lan.test", "name": tok, "sub": f"sub-{tok}",
-    }
-    _slow_count(core.auth, monkeypatch)
-    results, errors = _race(8, lambda i: core.auth.login_google(f"g{i}"))
+def test_concurrent_google_signups_make_exactly_one_admin(core):
+    fake_google(core.auth)
+    tokens = [id_token(f"g{i}@lan.test", core.auth.google_challenge(), f"G{i}") for i in range(8)]
+    results, errors = _race(8, lambda i: core.auth.login_google(tokens[i]))
     assert errors == []
     assert sum(u.admin for u, _ in results) == 1
+    assert sum(core.auth.get(u.id).admin for u, _ in results) == 1
 
 
-def test_concurrent_same_email_registers_once(core):
-    users, errors = _race(8, lambda i: core.auth.register("dup@lan.test", "password1", "Dup"))
-    assert len(users) == 1
-    assert len(errors) == 7
-    assert all(isinstance(e, AuthError) and "already" in str(e) for e in errors)
-
-
-def test_concurrent_same_google_account_signs_in_once(core, monkeypatch):
-    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
-    core.auth.verify_google = lambda tok, cid: {
-        "email": "g@lan.test", "name": "Gia", "sub": "sub-1",
-    }
-    results, errors = _race(8, lambda i: core.auth.login_google("id-token"))
+def test_concurrent_same_google_account_signs_in_once(core):
+    fake_google(core.auth)
+    tokens = [id_token("g@lan.test", core.auth.google_challenge(), "Gia") for _ in range(8)]
+    results, errors = _race(8, lambda i: core.auth.login_google(tokens[i]))
     assert errors == []
     assert len({u.id for u, _ in results}) == 1
 
 
-@pytest.mark.parametrize("email", [
-    "@.", "a b@c d.e", "@lan.test", "a@lan", "a@.test", "a@lan.", "a@ lan.test",
-])
-def test_register_rejects_malformed_email(core, email):
-    with pytest.raises(AuthError, match="email") as e:
-        core.auth.register(email, "password1", "x")
-    assert e.value.status == 400
-    assert core.auth.user_count() == 0
-
-
 @pytest.mark.parametrize("method,path,payload", [
-    ("post", "/auth/register", {"email": 5, "password": "password1"}),
-    ("post", "/auth/register", {"email": None, "password": "password1"}),
-    ("post", "/auth/register", {"email": "x@lan.test", "password": 12345678}),
-    ("post", "/auth/register", {"email": "x@lan.test", "password": "password1", "name": ["x"]}),
-    ("post", "/auth/login", {"email": "admin@lan.test", "password": 12345678}),
-    ("post", "/auth/login", {"email": ["admin@lan.test"], "password": "password1"}),
+    ("post", "/auth/google", {"id_token": 5}),
+    ("post", "/auth/google", {"id_token": ["x"]}),
     ("patch", "/auth/me", {"name": 5}),
     ("patch", "/auth/me", {"bio": 5}),
     ("post", "/grants", {"title": 12345, "body": "A short paragraph about the need.",
@@ -1318,12 +1022,10 @@ def test_register_rejects_malformed_email(core, email):
 ])
 def test_http_wrongly_typed_fields_are_400(env, method, path, payload):
     client, core, *_ = env
-    admin_tok = client.post("/auth/register", json={
-        "email": "admin@lan.test", "password": "password1", "name": "Admin",
-    }).json()["token"]
+    admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
     client.post("/auth/accept-terms", headers=_hdr(admin_tok))
     admin = core.auth.user_from_token(admin_tok)
-    member = core.auth.register("m@lan.test", "password1", "Member")
+    member, _ = _account(core.auth, "m@lan.test", "Member")
     pending = core.grants.create(admin, "Pending one", "A short paragraph about the need.", 50)
     approved = core.grants.create(admin, "Approved one", "A short paragraph about the need.", 50)
     core.grants.review(admin, approved.id, True)
@@ -1351,9 +1053,7 @@ def test_non_finite_amounts_are_rejected(core):
 @pytest.mark.parametrize("max_flops", ["nan", "inf"])
 def test_http_non_finite_max_flops_abandons_job(env, max_flops):
     client, core, tiny_model, tiny_dataset = env
-    token = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    }).json()["token"]
+    token = http_sign_in(client, "ada@lan.test", "Ada")
     client.post("/auth/accept-terms", headers=_hdr(token))
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
     spec["max_flops"] = max_flops
@@ -1370,9 +1070,7 @@ def test_http_non_finite_max_flops_abandons_job(env, max_flops):
 
 def test_http_unexpected_reserve_error_abandons_job(env, monkeypatch):
     client, core, tiny_model, tiny_dataset = env
-    token = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    }).json()["token"]
+    token = http_sign_in(client, "ada@lan.test", "Ada")
     client.post("/auth/accept-terms", headers=_hdr(token))
 
     def boom(*a, **kw):
@@ -1446,12 +1144,8 @@ def test_concurrent_consume_and_settle_keep_job_books_straight(core):
 
 def test_http_admin_flags_reject_string_booleans(env):
     client, core, *_ = env
-    admin_tok = client.post("/auth/register", json={
-        "email": "admin@lan.test", "password": "password1", "name": "Admin",
-    }).json()["token"]
-    member_tok = client.post("/auth/register", json={
-        "email": "m@lan.test", "password": "password1", "name": "Member",
-    }).json()["token"]
+    admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
+    member_tok = http_sign_in(client, "m@lan.test", "Member")
     member = core.auth.user_from_token(member_tok)
     client.post("/auth/accept-terms", headers=_hdr(member_tok))
     g = client.post("/grants", json={

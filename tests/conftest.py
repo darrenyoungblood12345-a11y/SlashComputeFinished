@@ -2,6 +2,7 @@ import errno
 
 import pytest
 
+from accounts import GOOGLE_CLIENT_ID
 from slashcompute.pipeline.tiny import make_tiny_dataset, make_tiny_model
 
 
@@ -12,6 +13,15 @@ def no_real_trash(monkeypatch):
         raise OSError(errno.EPERM, "tests may not use the real Trash")
 
     monkeypatch.setattr("slashcompute.inference.node.agent.move_to_trash", refuse)
+
+
+@pytest.fixture(autouse=True)
+def google_sign_in_configured(monkeypatch):
+    """Every test's pool and app are a build with Google sign-in set up, whatever the machine
+    running them has in its environment."""
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
+    monkeypatch.delenv("SLASHCOMPUTE_GOOGLE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("SLASHCOMPUTE_ADMIN_EMAIL", raising=False)
 
 
 @pytest.fixture(scope="session")

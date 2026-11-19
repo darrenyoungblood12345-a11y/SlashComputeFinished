@@ -117,7 +117,9 @@ class User(SQLModel, table=True):
     __tablename__ = "users"
     id: str = Field(primary_key=True)
     email: str = Field(index=True, unique=True)
-    password_hash: str
+    # Unused: accounts are Google accounts (google_sub). The column stays because databases
+    # from before that have it as NOT NULL.
+    password_hash: str = ""
     name: str
     admin: bool = False
     banned: bool = False
@@ -241,6 +243,16 @@ class Database:
                 conn.exec_driver_sql("ALTER TABLE users ADD COLUMN google_sub VARCHAR")
             if "bio" not in user_cols:
                 conn.exec_driver_sql("ALTER TABLE users ADD COLUMN bio VARCHAR")
+            # Accounts used to be opened with an email and a password nobody verified. Whoever
+            # holds a session issued that way may not own the address: end those sessions and
+            # make the stored passwords inert. The account, its credits and its nodes stay, and
+            # go to whoever Google says holds the email at their next sign-in.
+            conn.exec_driver_sql(
+                "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users "
+                "WHERE password_hash != '' AND password_hash NOT LIKE 'google$%')")
+            conn.exec_driver_sql(
+                "UPDATE users SET password_hash = '' "
+                "WHERE password_hash != '' AND password_hash NOT LIKE 'google$%'")
             usage_cols = {row[1] for row in
                           conn.exec_driver_sql("PRAGMA table_info(usage_records)").fetchall()}
             if "billed_flops" not in usage_cols:
@@ -278,6 +290,20 @@ class Database:
     def get(self, model, key):
         with self.session() as s:
             return s.get(model, key)
+
+    def update(self, model, key, **fields):
+        """Set these columns on the row as it is in the database now, and return it (None if it
+        is gone). Unlike save(), it never writes back a copy read earlier, so it cannot undo a
+        change another request made to the other columns in between."""
+        with self.session() as s:
+            row = s.get(model, key)
+            if row is None:
+                return None
+            for name, value in fields.items():
+                setattr(row, name, value)
+            s.add(row)
+            s.commit()
+            return row
 
     def save(self, row) -> None:
         with self.session() as s:

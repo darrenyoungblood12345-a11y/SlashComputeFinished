@@ -7,6 +7,8 @@ from dataclasses import replace
 import httpx
 import pytest
 
+from accounts import sign_in
+
 from inf_harness import FakeNode, chat, fast_settings, start_harness
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
@@ -20,11 +22,6 @@ from slashcompute.inference.node.fake_engine import FakeEngine
 
 GB = 10 ** 9
 QWEN = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
-
-
-@pytest.fixture(autouse=True)
-def fast_hash(monkeypatch):
-    monkeypatch.setattr("slashcompute.community.auth.ITERATIONS", 1)
 
 
 @pytest.fixture
@@ -45,8 +42,7 @@ def core(h):
 
 def account(h, email, terms=True, balance=0.0):
     auth = core(h).auth
-    auth.register(email, "password1", email.split("@")[0])
-    user, token = auth.login(email, "password1")
+    user, token = sign_in(auth, email, email.split("@")[0])
     if terms:
         user = auth.accept_terms(user)
     if balance:

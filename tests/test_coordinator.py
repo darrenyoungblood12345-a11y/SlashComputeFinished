@@ -4,6 +4,8 @@ import json
 import time
 
 import pytest
+
+from accounts import http_sign_in
 from fastapi.testclient import TestClient
 
 from slashcompute.common import protocol as P
@@ -322,11 +324,8 @@ def test_recovered_job_drops_the_stale_abort_error(env):
 
 
 def test_rejected_job_does_not_come_back_after_restart(env, monkeypatch):
-    monkeypatch.setattr("slashcompute.community.auth.ITERATIONS", 1)
     client, core, tiny_model, tiny_dataset, _ = env
-    token = client.post("/auth/register", json={
-        "email": "ada@lan.test", "password": "password1", "name": "Ada",
-    }).json()["token"]
+    token = http_sign_in(client)
     hdr = {"Authorization": f"Bearer {token}"}
     client.post("/auth/accept-terms", headers=hdr)
     r = client.post("/jobs/upload", headers=hdr,

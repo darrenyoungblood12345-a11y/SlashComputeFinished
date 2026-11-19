@@ -143,8 +143,10 @@ class Grants:
         if not admin.admin:
             raise GrantError("Admin only.", 403)
         reason = text(reason, "reason", GrantError).strip()[:500] or "flagged"
+        # Only this column: ``user`` was read for the request, and saving the whole copy would
+        # undo a ban or a new owner that landed since.
+        self.db.update(User, user.id, flagged=True)
         user.flagged = True
-        self.db.save(user)
         row = UserFlag(user_id=user.id, admin_id=admin.id, reason=reason)
         self.db.add(row)
         return row
