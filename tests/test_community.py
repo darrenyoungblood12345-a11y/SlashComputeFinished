@@ -74,6 +74,13 @@ def _one_stage_epoch(job):
     return EpochState(epoch=1, plans=[StagePlan(0, "n1", 0, job.profile.num_layers, 0)])
 
 
+def _pay_out(core, job):
+    """End the job's epoch and pay what its nodes were held for, as the coordinator's tick does
+    once nothing sampled from that epoch is left to check."""
+    job.current.closed = True
+    return core.verification.settle_holds()
+
+
 def _account(auth, email="ada@lan.test", password="password1", name="Ada"):
     user = auth.register(email, password, name)
     user, token = auth.login(email, password)
@@ -776,6 +783,15 @@ def test_steps_earn_and_spend_one_to_one(core):
         job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
         in_digest="in", out_digest="out", usage=_usage(1e9),
     )))
+    # Charged to the job at once, but only held for the node: nothing to spend yet.
+    assert core.credits.lifetime_spent(user.id) == pytest.approx(1e9)
+    assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12)
+    assert core.credits.balance(user.id) == pytest.approx(1e12 - 5e9)
+    assert core.credits.summary(user.id)["pending_earnings"] == pytest.approx(1e9)
+    assert core.verification.settle_holds() == 0    # the epoch is still running
+
+    assert _pay_out(core, job) == 1
+    assert core.credits.summary(user.id)["pending_earnings"] == 0.0
     assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12 + 1e9)
     assert core.credits.lifetime_spent(user.id) == pytest.approx(1e9)
     assert core.credits.balance(user.id) == pytest.approx(1e12 - 5e9 + 1e9)
@@ -826,6 +842,7 @@ def test_budget_exhaust_cancels_job(core):
     )))
     assert job.row.status == "cancelled"
     assert job.row.error == "FLOP budget spent"
+    assert core.verification.settle_holds() == 1    # the cancel ended the epoch
     assert core.credits.balance(user.id) == pytest.approx(1e12 - 1e9 + 1e9)
 
 
@@ -851,6 +868,8 @@ def test_grant_split_on_step(core):
         job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
         in_digest="in", out_digest="out", usage=_usage(100.0),
     )))
+    assert core.credits.balance(POT_ID) == 0.0
+    _pay_out(core, job)
     assert core.credits.balance(POT_ID) == pytest.approx(40.0)
     assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12 + 100.0)
 
@@ -877,16 +896,19 @@ def test_last_step_mints_only_charged_flops(core):
         in_digest="in", out_digest="out", usage=_usage(2e9),
     )))
     assert core.credits.lifetime_spent(user.id) == pytest.approx(1.5e9)
+    core.verification.settle_holds()
     assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12 + 1.5e9)
     assert job.row.status == "cancelled"
     assert job.row.error == "FLOP budget spent"
 
 
 def _ledger_total(core):
-    """Every FLOP in the book: all balances (pot included) plus reservations still in flight."""
+    """Every FLOP in the book: all balances (pot included) plus reservations still in flight and what
+    is held for nodes until their epoch's checks are in."""
     with core.db.session() as s:
         ids = [u.id for u in s.exec(select(User)).all()] + [POT_ID]
-    return sum(core.credits.balance(i) + core.credits.reserved_in_flight(i) for i in ids)
+    held = sum(h.flops for h in core.credits.open_holds())
+    return sum(core.credits.balance(i) + core.credits.reserved_in_flight(i) for i in ids) + held
 
 
 def _host_and_chatter(core):
@@ -940,6 +962,8 @@ def test_training_share_without_eligible_host_goes_to_pot(core, banned):
         in_digest="in", out_digest="out", usage=_usage(1e9),
     )))
     assert core.credits.lifetime_spent(chatter.id) == pytest.approx(1e9)
+    assert _ledger_total(core) == pytest.approx(before)     # held, not lost
+    _pay_out(core, job)
     assert core.credits.lifetime_earned(host.id) == 0.0
     assert core.credits.balance(POT_ID) == pytest.approx(1e9)
     assert _ledger_total(core) == pytest.approx(before)

@@ -254,21 +254,24 @@ function credits() {
   if (state.credits) {
     const earned = Math.max(0, Number(state.credits.lifetime_earned) || 0);
     const balance = Math.max(0, Number(state.credits.balance) || 0);
+    // Charged to jobs for this account's Macs but not paid yet: training pays once the checks
+    // sampled from an epoch are in.
+    const pending = Math.max(0, Number(state.credits.pending_earnings) || 0);
     // The split is applied as credits are earned, so what was given and kept is what the pool
     // posted at the time. The split is only the setting for what comes next: multiplying lifetime
     // earnings by it rewrote history each time the slider moved.
     if (state.credits.lifetime_to_grants != null) {
       const toGrants = Math.max(0, Number(state.credits.lifetime_to_grants) || 0);
       const kept = Math.max(0, Number(state.credits.lifetime_kept ?? earned - toGrants) || 0);
-      return { earned, toGrants, kept, split, balance, posted: true };
+      return { earned, toGrants, kept, split, balance, pending, posted: true };
     }
     // A pool from before it reported those totals: an estimate, shown as one.
     const toGrants = earned * split / 100;
-    return { earned, toGrants, kept: earned - toGrants, split, balance, posted: false };
+    return { earned, toGrants, kept: earned - toGrants, split, balance, pending, posted: false };
   }
   const earned = Math.max(0, Number(me().flops) || 0);
   const toGrants = earned * split / 100;
-  return { earned, toGrants, kept: earned - toGrants, split, balance: 0, posted: false };
+  return { earned, toGrants, kept: earned - toGrants, split, balance: 0, pending: 0, posted: false };
 }
 
 function grantBalance() {
@@ -580,7 +583,8 @@ function renderContributions() {
     : "Nothing yet. Start contributing to earn.");
   sparkline($("#c-spark"), state.rates);
   setText("#c-earned", fmtFlops(c.earned));
-  setText("#c-earned-sub", c.posted ? `On this account · you kept ${withUnit(c.kept)}`
+  setText("#c-earned-sub", c.pending > 0 ? `On this account · ${withUnit(c.pending)} more pending checks`
+    : c.posted ? `On this account · you kept ${withUnit(c.kept)}`
     : signedIn() ? `On this account · you keep ≈ ${withUnit(c.kept)}`
     : `Estimated · you keep ${withUnit(c.kept)}`);
   setText("#c-grants", fmtFlops(c.toGrants));

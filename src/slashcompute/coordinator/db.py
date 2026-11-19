@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import event
+from sqlalchemy import UniqueConstraint, event
 from sqlmodel import Field, Session, SQLModel, create_engine
 
 
@@ -69,6 +69,9 @@ class UsageRecord(SQLModel, table=True):
     node_id: str = Field(index=True)
     step: Optional[int] = None
     flops: float
+    # What the job was really charged for this step: the node's own figure, capped by what the
+    # coordinator knows the step can cost and by what the budget still held.
+    billed_flops: float = 0.0
     tokens: int = 0
     peak_mem_bytes: int = 0
     resident_mem_bytes: int = 0
@@ -92,7 +95,8 @@ class Verification(SQLModel, table=True):
     stage_idx: Optional[int] = None
     target_node_id: str
     verifier_node_id: Optional[str] = None
-    # fetching -> queued -> running -> passed|failed ; or error
+    # fetching -> queued -> running -> passed|failed ; or error (nobody's fault, no penalty),
+    # or refused (the target kept back a sampled step while its stage was still running)
     status: str = "fetching"
     rel_error: Optional[float] = None
     detail: Optional[str] = None
@@ -160,6 +164,26 @@ class JobAccount(SQLModel, table=True):
     spent_flops: float = 0.0
 
 
+class EarningHold(SQLModel, table=True):
+    """What one node has been charged to a job in one epoch, kept back until the epoch's sampled
+    checks are in. Not a balance: it becomes one when released, or goes back to the job when
+    forfeited."""
+
+    __tablename__ = "earning_holds"
+    __table_args__ = (UniqueConstraint("job_id", "epoch", "node_id"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    job_id: str = Field(index=True)
+    epoch: int
+    node_id: str
+    # Who is paid, fixed when the first step is held: a node can change hands later.
+    owner_id: Optional[str] = Field(default=None, index=True)
+    flops: float = 0.0
+    forfeited_flops: float = 0.0
+    status: str = Field(default="held", index=True)  # held | released | forfeited
+    created_at: float = Field(default_factory=now)
+    resolved_at: Optional[float] = None
+
+
 class Grant(SQLModel, table=True):
     __tablename__ = "grants"
     id: str = Field(primary_key=True)
@@ -217,6 +241,11 @@ class Database:
                 conn.exec_driver_sql("ALTER TABLE users ADD COLUMN google_sub VARCHAR")
             if "bio" not in user_cols:
                 conn.exec_driver_sql("ALTER TABLE users ADD COLUMN bio VARCHAR")
+            usage_cols = {row[1] for row in
+                          conn.exec_driver_sql("PRAGMA table_info(usage_records)").fetchall()}
+            if "billed_flops" not in usage_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE usage_records ADD COLUMN billed_flops FLOAT NOT NULL DEFAULT 0")
             grant_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(grants)").fetchall()}
             if grant_cols:
                 if "reviewed_at" not in grant_cols:

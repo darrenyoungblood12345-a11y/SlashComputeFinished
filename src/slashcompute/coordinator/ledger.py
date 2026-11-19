@@ -13,11 +13,12 @@ class Ledger:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def record_step(self, node_id: str, msg: StepMetrics) -> UsageRecord:
+    def record_step(self, node_id: str, msg: StepMetrics, billed_flops: float = 0.0) -> UsageRecord:
         u = msg.usage
         row = UsageRecord(
             kind="train", job_id=msg.job_id, epoch=msg.epoch, stage_idx=msg.stage_idx,
-            node_id=node_id, step=msg.step, flops=u.flops, tokens=u.tokens,
+            node_id=node_id, step=msg.step, flops=u.flops, billed_flops=billed_flops,
+            tokens=u.tokens,
             peak_mem_bytes=u.peak_mem_bytes, resident_mem_bytes=u.resident_mem_bytes,
             mem_byte_seconds=u.mem_byte_seconds, wall_s=u.wall_s, busy_s=u.busy_s,
             loss=msg.loss, in_digest=msg.in_digest, out_digest=msg.out_digest,

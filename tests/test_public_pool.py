@@ -353,7 +353,9 @@ def test_assigned_node_cannot_bill_more_than_its_stage_can_cost(victim_job):
     job = client.get(f"/jobs/{asg.job_id}").json()
     assert job["spent_flops"] == _stage_cost(asg) < 1e10
     assert job["status"] not in ("cancelled", "failed") and job["error"] is None
-    assert core.credits.lifetime_earned(host_id) == _stage_cost(asg)
+    # held for the node at that price, and not paid before the epoch's checks are in
+    assert core.credits.pending_earnings(host_id) == _stage_cost(asg)
+    assert core.credits.lifetime_earned(host_id) == 0.0
 
 
 @pytest.mark.parametrize("claim", [float("nan"), float("inf"), -1e15])

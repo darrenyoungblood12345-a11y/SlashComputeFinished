@@ -82,6 +82,14 @@ class EngineConfig:
     # GPU fp32 vs NumPy reference; zeros/random still fail (~1.0).
     canary_rel_tolerance: float = 0.5
     verify_ring_size: int = 8
+    # A node asked for a sampled step's bundle has this long to upload it.
+    verify_fetch_timeout_s: float = 120.0
+    # A node that keeps back this many sampled steps of one epoch while its stage is running
+    # is treated like one whose replay failed.
+    verify_max_target_errors: int = 2
+    # Once its epoch has ended, a replay waits this long for another Mac to become free to run
+    # it; after that it is dropped and the earnings it held up are paid.
+    verify_queue_timeout_s: float = 300.0
 
     # Fraction of each stage's weight bytes reserved for activations, grads and
     # optimizer state, plus a fixed headroom per stage.
