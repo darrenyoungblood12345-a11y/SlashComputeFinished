@@ -21,7 +21,7 @@ from sqlmodel import select
 
 from slashcompute.common.config import google_client_id
 from slashcompute.community.fields import text
-from slashcompute.coordinator.db import Database, SessionRow, User, now
+from slashcompute.coordinator.db import Database, SessionRow, User, UserFlag, now
 
 SESSION_TTL_S = 30 * 24 * 3600
 GOOGLE_ISSUERS = ("https://accounts.google.com", "accounts.google.com")
@@ -212,7 +212,6 @@ class Auth:
         return self._update(user, accepted_terms_at=now())
 
     def update_profile(self, user: User, name: Optional[str] = None,
-                       grant_split: Optional[int] = None,
                        bio: Optional[str] = None) -> User:
         changes: dict = {}
         if name is not None:
@@ -220,14 +219,6 @@ class Auth:
             if not name:
                 raise AuthError("Name cannot be empty.")
             changes["name"] = name
-        if grant_split is not None:
-            try:
-                split = int(grant_split)
-            except (TypeError, ValueError) as e:
-                raise AuthError("grant_split must be 0–100.") from e
-            if split < 0 or split > 100:
-                raise AuthError("grant_split must be 0–100.")
-            changes["grant_split"] = split
         if bio is not None:
             changes["bio"] = text(bio, "bio", AuthError).strip()[:280] or None
         return self._update(user, **changes)
@@ -238,11 +229,32 @@ class Auth:
     def set_flagged(self, user: User, flagged: bool) -> User:
         return self._update(user, flagged=flagged)
 
+    def flag_user(self, admin: User, user: User, reason: str) -> UserFlag:
+        """Mark an account for the admins' attention and record who did it and why."""
+        if not admin.admin:
+            raise AuthError("Admin only.", 403)
+        reason = text(reason, "reason", AuthError).strip()[:500] or "flagged"
+        self.set_flagged(user, True)
+        user.flagged = True
+        row = UserFlag(user_id=user.id, admin_id=admin.id, reason=reason)
+        self.db.add(row)
+        return row
+
+    def list_flags(self) -> list[dict]:
+        with self.db.session() as s:
+            rows = list(s.exec(select(UserFlag).order_by(UserFlag.created_at.desc())).all())
+        return [
+            {
+                "id": r.id, "user_id": r.user_id, "admin_id": r.admin_id,
+                "reason": r.reason, "created_at": r.created_at,
+            }
+            for r in rows
+        ]
+
     def public_view(self, user: User) -> dict:
         return {
             "id": user.id, "email": user.email, "name": user.name,
             "admin": user.admin, "banned": user.banned, "flagged": user.flagged,
-            "grant_split": user.grant_split,
             "accepted_terms": user.accepted_terms_at is not None,
             "bio": user.bio or "",
         }

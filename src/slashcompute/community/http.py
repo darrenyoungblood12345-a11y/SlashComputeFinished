@@ -1,4 +1,4 @@
-"""HTTP surface for accounts, credits, grants, and admin."""
+"""HTTP surface for accounts, credits, and admin."""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from sqlmodel import select
 
 from slashcompute.community.auth import AuthError, google_client_id
-from slashcompute.community.credits import CreditError
-from slashcompute.community.grants import GrantError
 from slashcompute.community.terms import TERMS
 from slashcompute.common.jsonbool import body_bool
 from slashcompute.coordinator.core import Coordinator
@@ -37,16 +35,6 @@ def mount_community(app, core: Coordinator) -> None:
         if user.banned:
             raise HTTPException(403, "This account is banned.")
         return user
-
-    def require_terms(request: Request, authorization: Optional[str] = None) -> User:
-        user = require(request, authorization)
-        if user.accepted_terms_at is None:
-            raise HTTPException(403, "Accept the terms first.")
-        return user
-
-    def names() -> dict[str, str]:
-        with core.db.session() as s:
-            return {u.id: u.name for u in s.exec(select(User)).all()}
 
     @r.get("/auth/terms")
     def terms():
@@ -100,10 +88,7 @@ def mount_community(app, core: Coordinator) -> None:
     def patch_me(body: dict, request: Request, authorization: Optional[str] = Header(default=None)):
         user = require(request, authorization)
         try:
-            user = core.auth.update_profile(
-                user, name=body.get("name"), grant_split=body.get("grant_split"),
-                bio=body.get("bio"),
-            )
+            user = core.auth.update_profile(user, name=body.get("name"), bio=body.get("bio"))
         except AuthError as e:
             _raise(e)
         return {"user": core.auth.public_view(user)}
@@ -147,74 +132,6 @@ def mount_community(app, core: Coordinator) -> None:
     def leaderboard():
         return core.credits.leaderboard()
 
-    @r.get("/grants")
-    def list_grants(request: Request, sort: str = "top",
-                    authorization: Optional[str] = Header(default=None)):
-        user = core.auth.session_user(_token(request, authorization))
-        nm = names()
-        return [core.grants.view(g, nm) for g in core.grants.list(sort=sort, viewer=user)]
-
-    @r.get("/grants/{grant_id}")
-    def get_grant(grant_id: str, request: Request,
-                  authorization: Optional[str] = Header(default=None)):
-        try:
-            g = core.grants.get(grant_id)
-        except GrantError as e:
-            _raise(e)
-        user = core.auth.session_user(_token(request, authorization))
-        if not core.grants.visible(g, user):
-            raise HTTPException(404, "Grant not found.")
-        comments = []
-        nm = names()
-        for c in core.grants.comments(grant_id):
-            comments.append({
-                "user_id": c.user_id, "name": nm.get(c.user_id, c.user_id[:8]),
-                "body": c.body, "created_at": c.created_at,
-            })
-        return {**core.grants.view(g, nm), "comments": comments}
-
-    @r.post("/grants")
-    def create_grant(body: dict, request: Request, authorization: Optional[str] = Header(default=None)):
-        user = require_terms(request, authorization)
-        try:
-            g = core.grants.create(user, body.get("title", ""), body.get("body", ""),
-                                   body.get("goal_flops", 0))
-        except GrantError as e:
-            _raise(e)
-        return core.grants.view(g, names())
-
-    @r.post("/grants/{grant_id}/donate")
-    def donate(grant_id: str, body: dict, request: Request,
-               authorization: Optional[str] = Header(default=None)):
-        user = require_terms(request, authorization)
-        try:
-            g = core.grants.donate(user, grant_id, float(body.get("flops", 0)),
-                                   from_pot=body_bool(body, "from_pot"))
-        except (GrantError, CreditError, TypeError, ValueError) as e:
-            _raise(e if isinstance(e, (GrantError, CreditError)) else CreditError(str(e)))
-        return core.grants.view(g, names())
-
-    @r.post("/grants/{grant_id}/comments")
-    def comment(grant_id: str, body: dict, request: Request,
-                authorization: Optional[str] = Header(default=None)):
-        user = require_terms(request, authorization)
-        try:
-            c = core.grants.comment(user, grant_id, body.get("body", ""))
-        except GrantError as e:
-            _raise(e)
-        return {"ok": True, "id": c.id, "created_at": c.created_at}
-
-    @r.post("/admin/grants/{grant_id}/review")
-    def review(grant_id: str, body: dict, request: Request,
-               authorization: Optional[str] = Header(default=None)):
-        admin = require(request, authorization)
-        try:
-            g = core.grants.review(admin, grant_id, body_bool(body, "approve"),
-                                  note=body.get("note"))
-        except GrantError as e:
-            _raise(e)
-        return core.grants.view(g, names())
-
     @r.post("/admin/users/{user_id}/ban")
     def ban(user_id: str, body: dict, request: Request,
             authorization: Optional[str] = Header(default=None)):
@@ -242,8 +159,8 @@ def mount_community(app, core: Coordinator) -> None:
         if user is None:
             raise HTTPException(404, "No such user.")
         try:
-            core.grants.flag_user(admin, user, body.get("reason", ""))
-        except GrantError as e:
+            core.auth.flag_user(admin, user, body.get("reason", ""))
+        except AuthError as e:
             _raise(e)
         return {"user": core.auth.public_view(user)}
 
@@ -261,6 +178,6 @@ def mount_community(app, core: Coordinator) -> None:
         admin = require(request, authorization)
         if not admin.admin:
             raise HTTPException(403, "Admin only.")
-        return core.grants.list_flags()
+        return core.auth.list_flags()
 
     app.include_router(r)

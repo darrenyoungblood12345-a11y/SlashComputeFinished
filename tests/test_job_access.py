@@ -22,7 +22,7 @@ def pool(tmp_path, tiny_model, tiny_dataset, monkeypatch):
     for role in ('admin', 'owner', 'other', 'worker', 'verifier'):
         user, token = sign_in(core.auth, f'{role}@example.test', role)
         user = core.auth.accept_terms(user)
-        core.credits.contribute(user.id, 1e12, 0)
+        core.credits.contribute(user.id, 1e12)
         users[role], tokens[role] = user, token
     # No background scheduling: each test controls the current assignment explicitly.
     client = TestClient(app, raise_server_exceptions=True)

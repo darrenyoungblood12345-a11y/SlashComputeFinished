@@ -1,4 +1,4 @@
-"""Accounts, 1:1 credits, grants, and the engine hooks that keep them honest."""
+"""Accounts, 1:1 credits, and the engine hooks that keep them honest."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from slashcompute.common import protocol as P
 from slashcompute.common.config import WELCOME_FLOPS, EngineConfig
 from slashcompute.community.auth import AuthError
 from slashcompute.community.credits import POT_ID, CreditError
-from slashcompute.community.grants import GrantError
 from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
 from slashcompute.coordinator.db import CreditTxn, User
@@ -92,39 +91,27 @@ def test_first_user_is_admin_second_is_not(core):
     assert b.admin is False
 
 
-def test_terms_and_grant_split(core):
+def test_terms_and_profile(core):
     user, _ = _account(core.auth)
     assert user.accepted_terms_at is None
     user = core.auth.accept_terms(user)
     assert user.accepted_terms_at is not None
-    user = core.auth.update_profile(user, grant_split=25, bio="  hello  ")
-    assert user.grant_split == 25
+    user = core.auth.update_profile(user, bio="  hello  ")
     assert user.bio == "hello"
     assert core.auth.public_view(user)["bio"] == "hello"
-    with pytest.raises(AuthError):
-        core.auth.update_profile(user, grant_split=101)
+    assert "grant_split" not in core.auth.public_view(user)
     with pytest.raises(AuthError):
         core.auth.update_profile(user, name="  ")
 
 
-def test_summary_reports_what_was_given_and_kept_at_the_split_of_the_time(core):
+def test_summary_reports_everything_earned_as_the_owners(core):
     user, _ = _account(core.auth)
     other, _ = _account(core.auth, "o@lan.test")
-    core.credits.contribute(user.id, 100.0, user.grant_split)     # earned while keeping everything
-    core.credits.contribute(other.id, 40.0, 50)                   # someone else's share is theirs alone
+    core.credits.contribute(user.id, 100.0)
+    core.credits.contribute(other.id, 40.0)                   # someone else's earnings are theirs alone
     s = core.credits.summary(user.id)
-    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (100.0, 0.0, 100.0)
-    # A new split is for what comes next: nothing already posted moves.
-    user = core.auth.update_profile(user, grant_split=100)
-    s = core.credits.summary(user.id)
-    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (100.0, 0.0, 100.0)
-    core.credits.contribute(user.id, 50.0, user.grant_split)
-    core.credits.contribute(user.id, 20.0, 25)
-    s = core.credits.summary(user.id)
-    assert (s["lifetime_earned"], s["lifetime_to_grants"], s["lifetime_kept"]) == (170.0, 55.0, 115.0)
-    assert s["balance"] == 115.0 and s["pot"] == 20.0 + 55.0
-    o = core.credits.summary(other.id)
-    assert (o["lifetime_to_grants"], o["lifetime_kept"]) == (20.0, 20.0)
+    assert (s["lifetime_earned"], s["balance"], s["pot"]) == (100.0, 100.0, 0.0)
+    assert "lifetime_to_grants" not in s and "lifetime_kept" not in s
 
 
 def test_logout_drops_session(core):
@@ -137,20 +124,20 @@ def test_logout_drops_session(core):
 # --------------------------------------------------------------------------- credits
 
 
-def test_contribute_split_and_one_to_one_balance(core):
+def test_contribute_is_one_to_one_and_all_the_owners(core):
     user, _ = _account(core.auth)
-    core.credits.contribute(user.id, 100.0, 25, node_id="n1")
+    core.credits.contribute(user.id, 100.0, node_id="n1")
     assert core.credits.lifetime_earned(user.id) == 100.0
-    assert core.credits.balance(user.id) == 75.0
-    assert core.credits.balance(POT_ID) == 25.0
-    core.credits.contribute(user.id, 100.0, 0)
-    assert core.credits.balance(user.id) == 175.0
+    assert core.credits.balance(user.id) == 100.0
+    assert core.credits.balance(POT_ID) == 0.0
+    core.credits.contribute(user.id, 100.0)
+    assert core.credits.balance(user.id) == 200.0
     assert core.credits.lifetime_earned(user.id) == 200.0
 
 
 def test_reserve_consume_settle(core):
     user, _ = _account(core.auth)
-    core.credits.contribute(user.id, 1000.0, 0)
+    core.credits.contribute(user.id, 1000.0)
     with pytest.raises(CreditError):
         core.credits.reserve_job(user.id, "job-x", 5000.0)
     core.credits.reserve_job(user.id, "job-1", 400.0)
@@ -170,7 +157,7 @@ def test_reserve_consume_settle(core):
 
 def test_settle_releases_leftover(core):
     user, _ = _account(core.auth)
-    core.credits.contribute(user.id, 100.0, 0)
+    core.credits.contribute(user.id, 100.0)
     core.credits.reserve_job(user.id, "job-2", 80.0)
     core.credits.consume_job("job-2", 30.0)
     core.credits.settle_job("job-2")
@@ -178,27 +165,27 @@ def test_settle_releases_leftover(core):
     assert core.credits.lifetime_spent(user.id) == 30.0
 
 
-def test_donate_and_pot_allocate(core):
+def test_rows_from_when_credits_could_be_given_away_still_count(core):
+    """Donations and pot allocations are no longer made, but a ledger from before holds them: the
+    accounts they moved credits between keep the balances they had."""
     donor, _ = _account(core.auth, "d@lan.test", name="Donor")
     recip, _ = _account(core.auth, "r@lan.test", name="Recip")
-    core.credits.contribute(donor.id, 100.0, 50)
-    assert core.credits.balance(donor.id) == 50.0
-    assert core.credits.balance(POT_ID) == 50.0
-    core.credits.donate(donor.id, recip.id, "g1", 20.0)
-    assert core.credits.balance(donor.id) == 30.0
-    assert core.credits.balance(recip.id) == 20.0
-    core.credits.allocate_pot(recip.id, "g1", 50.0)
-    assert core.credits.balance(POT_ID) == 0.0
+    core.credits.contribute(donor.id, 100.0)
+    core.credits.post(POT_ID, "earn", 50.0, note=f"tithe from {donor.id}")
+    core.credits.post(donor.id, "donate", -20.0)
+    core.credits.post(recip.id, "receive", 20.0)
+    core.credits.post(POT_ID, "allocate", -50.0)
+    core.credits.post(recip.id, "receive", 50.0)
+    assert core.credits.balance(donor.id) == 80.0
     assert core.credits.balance(recip.id) == 70.0
-    with pytest.raises(CreditError):
-        core.credits.allocate_pot(recip.id, "g1", 1.0)
+    assert core.credits.balance(POT_ID) == 0.0
 
 
 def test_leaderboard_ranks_generated(core):
     a, _ = _account(core.auth, "a@lan.test", name="Ann")
     b, _ = _account(core.auth, "b@lan.test", name="Bea")
-    core.credits.contribute(a.id, 10.0, 0)
-    core.credits.contribute(b.id, 50.0, 0)
+    core.credits.contribute(a.id, 10.0)
+    core.credits.contribute(b.id, 50.0)
     board = core.credits.leaderboard()
     assert [row["name"] for row in board] == ["Bea", "Ann"]
     assert board[0]["lifetime_earned"] == 50.0
@@ -229,83 +216,23 @@ def test_settle_open_jobs_refunds_only_the_accounts_under_its_prefix(core):
     assert sorted((r.job_id, r.amount) for r in releases) == [("inf-crashed", 250.0), ("inf-settled", 70.0)]
 
 
-# --------------------------------------------------------------------------- grants
+# --------------------------------------------------------------------------- moderation
 
 
-def test_grant_lifecycle(core):
-    admin, _ = _account(core.auth, "admin@lan.test", name="Admin")
-    member, _ = _account(core.auth, "m@lan.test", name="Member")
-    donor, _ = _account(core.auth, "d@lan.test", name="Donor")
-    core.credits.contribute(donor.id, 200.0, 0)
-    with pytest.raises(GrantError):
-        core.grants.create(member, "hi", "too short", 1e3)
-    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 100.0)
-    assert g.status == "pending"
-    assert core.grants.list(viewer=member)[0].id == g.id
-    assert core.grants.list(viewer=None) == []
-    with pytest.raises(GrantError, match="Admin"):
-        core.grants.review(member, g.id, True)
-    with pytest.raises(GrantError, match="approved"):
-        core.grants.donate(donor, g.id, 10.0)
-    core.grants.review(admin, g.id, True)
-    with pytest.raises(GrantError, match="someone else"):
-        core.grants.donate(member, g.id, 10.0)
-    core.grants.donate(donor, g.id, 40.0)
-    got = core.grants.get(g.id)
-    assert got.status == "approved" and got.received_flops == 40.0
-    assert core.credits.balance(donor.id) == 160.0
-    assert core.credits.balance(member.id) == 40.0
-    pub = core.grants.list(viewer=None)
-    assert len(pub) == 1 and pub[0].id == g.id
-
-
-def test_grant_view_counts_its_distinct_backers(core):
-    admin, _ = _account(core.auth, "admin@lan.test", name="Admin")
-    member, _ = _account(core.auth, "m@lan.test", name="Member")
-    other, _ = _account(core.auth, "o@lan.test", name="Other")
-    ada, _ = _account(core.auth, "ada@lan.test", name="Ada")
-    bea, _ = _account(core.auth, "bea@lan.test", name="Bea")
-    for donor in (ada, bea):
-        core.credits.contribute(donor.id, 100.0, 0)
-    core.credits.contribute(member.id, 100.0, 100)            # fills the community pot
-    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 100.0)
-    elsewhere = core.grants.create(other, "Another need", "A short paragraph about that one.", 100.0)
-    for grant in (g, elsewhere):
-        core.grants.review(admin, grant.id, True)
-    assert core.grants.view(g)["backers"] == 0
-    core.grants.donate(ada, g.id, 10.0)
-    core.grants.donate(ada, g.id, 5.0)                        # the same person twice is one backer
-    core.grants.donate(bea, g.id, 1.0)
-    core.grants.donate(admin, g.id, 10.0, from_pot=True)      # the pot is not a person
-    core.grants.donate(bea, elsewhere.id, 2.0)                # another grant's backers are its own
-    assert core.grants.view(core.grants.get(g.id))["backers"] == 2
-    assert core.grants.view(core.grants.get(elsewhere.id))["backers"] == 1
-
-
-def test_pot_allocate_admin_only(core):
-    admin, _ = _account(core.auth, "admin@lan.test")
-    member, _ = _account(core.auth, "m@lan.test")
-    core.credits.contribute(member.id, 100.0, 100)
-    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 50.0)
-    core.grants.review(admin, g.id, True)
-    with pytest.raises(GrantError, match="admin"):
-        core.grants.donate(member, g.id, 10.0, from_pot=True)
-    core.grants.donate(admin, g.id, 10.0, from_pot=True)
-    assert core.grants.get(g.id).received_flops == 10.0
-    assert core.credits.balance(member.id) == 10.0
-
-
-def test_flag_and_comment(core):
+def test_flag_marks_the_account_and_is_admin_only(core):
     admin, _ = _account(core.auth, "admin@lan.test")
     member, _ = _account(core.auth, "m@lan.test", name="Member")
-    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 10.0)
-    core.grants.comment(member, g.id, "please")
-    assert core.grants.comments(g.id)[0].body == "please"
-    core.grants.review(admin, g.id, False)
-    with pytest.raises(GrantError):
-        core.grants.comment(member, g.id, "after decline")
-    core.grants.flag_user(admin, member, "spam")
+    with pytest.raises(AuthError, match="Admin") as refused:
+        core.auth.flag_user(member, admin, "no")
+    assert refused.value.status == 403
+    assert core.auth.get(admin.id).flagged is False and core.auth.list_flags() == []
+    core.auth.flag_user(admin, member, "  spam  ")
+    core.auth.flag_user(admin, member, "")
     assert core.auth.get(member.id).flagged is True
+    assert [(f["user_id"], f["admin_id"], f["reason"]) for f in core.auth.list_flags()] in (
+        [(member.id, admin.id, "flagged"), (member.id, admin.id, "spam")],
+        [(member.id, admin.id, "spam"), (member.id, admin.id, "flagged")],   # same timestamp
+    )
 
 
 # --------------------------------------------------------------------------- http
@@ -336,7 +263,7 @@ def test_http_authenticated_take_reserves(env):
     token = http_sign_in(client, "ada@lan.test", "Ada")
     client.post("/auth/accept-terms", headers=_hdr(token))
     user = core.auth.user_from_token(token)
-    core.credits.contribute(user.id, 1e12, 0)
+    core.credits.contribute(user.id, 1e12)
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
     spec["max_flops"] = 2e11
     r = client.post("/jobs", json=spec, headers=_hdr(token))
@@ -356,32 +283,14 @@ def test_anonymous_submit_still_works(env):
     assert r.json()["id"] in core.jobs
 
 
-def test_http_grant_moderation_and_leaderboard(env):
+def test_http_leaderboard_is_public_and_the_user_list_is_admin_only(env):
     client, core, *_ = env
-    admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
+    http_sign_in(client, "admin@lan.test", "Admin")
     member_tok = http_sign_in(client, "m@lan.test", "Member")
     donor_tok = http_sign_in(client, "d@lan.test", "Donor")
-    client.post("/auth/accept-terms", headers=_hdr(member_tok))
-    client.post("/auth/accept-terms", headers=_hdr(donor_tok))
     donor = core.auth.user_from_token(donor_tok)
-    core.credits.contribute(donor.id, 80.0, 0)
-    g = client.post("/grants", json={
-        "title": "Need compute", "body": "A short paragraph about the need.",
-        "goal_flops": 50,
-    }, headers=_hdr(member_tok)).json()
-    assert g["status"] == "pending"
+    core.credits.contribute(donor.id, 80.0)
     client.cookies.clear()
-    assert client.get("/grants").json() == []
-    hidden = client.get(f"/grants/{g['id']}")
-    assert hidden.status_code == 404
-    mine = client.get("/grants", headers=_hdr(member_tok)).json()
-    assert mine[0]["id"] == g["id"]
-    client.post(f"/admin/grants/{g['id']}/review", json={"approve": True},
-                headers=_hdr(admin_tok))
-    client.post(f"/grants/{g['id']}/donate", json={"flops": 20},
-                headers=_hdr(donor_tok))
-    pub = client.get("/grants").json()
-    assert pub[0]["received_flops"] == 20
     board = client.get("/community/leaderboard").json()
     assert board[0]["name"] == "Donor"
     users = client.get("/admin/users", headers=_hdr(member_tok))
@@ -394,7 +303,7 @@ def test_http_ban_blocks_take(env):
     member_tok = http_sign_in(client, "m@lan.test", "Member")
     member = core.auth.user_from_token(member_tok)
     client.post("/auth/accept-terms", headers=_hdr(member_tok))
-    core.credits.contribute(member.id, 1e12, 0)
+    core.credits.contribute(member.id, 1e12)
     client.post(f"/admin/users/{member.id}/ban", json={"banned": True},
                 headers=_hdr(admin_tok))
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
@@ -537,7 +446,7 @@ def test_steps_earn_and_spend_one_to_one(core):
     tiny_model, tiny_dataset = core._tiny
     user, token = _account(core.auth)
     core.auth.accept_terms(user)
-    core.credits.contribute(user.id, 1e12, 0)
+    core.credits.contribute(user.id, 1e12)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 5e9)
     job.current = _one_stage_epoch(job)
@@ -595,7 +504,7 @@ def test_budget_exhaust_cancels_job(core):
     tiny_model, tiny_dataset = core._tiny
     user, token = _account(core.auth)
     core.auth.accept_terms(user)
-    core.credits.contribute(user.id, 1e12, 0)
+    core.credits.contribute(user.id, 1e12)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1e9)
     job.current = _one_stage_epoch(job)
@@ -618,12 +527,14 @@ def test_budget_exhaust_cancels_job(core):
     assert core.credits.balance(user.id) == pytest.approx(1e12 - 1e9 + 1e9)
 
 
-def test_grant_split_on_step(core):
+def test_a_step_pays_its_owner_in_full(core):
+    """Also for an account that once chose to send part of its earnings to the community pot:
+    that setting is still in its row, and no longer does anything."""
     tiny_model, tiny_dataset = core._tiny
     user, token = _account(core.auth)
     core.auth.accept_terms(user)
-    core.auth.update_profile(user, grant_split=40)
-    core.credits.contribute(user.id, 1e12, 0)
+    core.db.update(User, user.id, grant_split=40)
+    core.credits.contribute(user.id, 1e12)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1e10)
     job.current = _one_stage_epoch(job)
@@ -640,9 +551,10 @@ def test_grant_split_on_step(core):
         job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
         in_digest="in", out_digest="out", usage=_usage(100.0),
     )))
-    assert core.credits.balance(POT_ID) == 0.0
+    before = core.credits.balance(user.id)
     _pay_out(core, job)
-    assert core.credits.balance(POT_ID) == pytest.approx(40.0)
+    assert core.credits.balance(POT_ID) == 0.0
+    assert core.credits.balance(user.id) == pytest.approx(before + 100.0)
     assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12 + 100.0)
 
 
@@ -650,7 +562,7 @@ def test_last_step_mints_only_charged_flops(core):
     tiny_model, tiny_dataset = core._tiny
     user, token = _account(core.auth)
     core.auth.accept_terms(user)
-    core.credits.contribute(user.id, 1e12, 0)
+    core.credits.contribute(user.id, 1e12)
     job = core.submit(_spec(tiny_model, tiny_dataset))
     core.credits.reserve_job(user.id, job.id, 1.5e9)
     job.current = _one_stage_epoch(job)
@@ -688,7 +600,7 @@ def _host_and_chatter(core):
     chatter, _ = _account(core.auth, "bea@lan.test", name="Bea")
     core.auth.accept_terms(host)
     core.auth.accept_terms(chatter)
-    core.credits.contribute(chatter.id, 1e12, 0)
+    core.credits.contribute(chatter.id, 1e12)
     return host, host_tok, chatter
 
 
@@ -744,8 +656,8 @@ def test_training_share_without_eligible_host_goes_to_pot(core, banned):
 def test_leaderboard_excludes_banned(core):
     a, _ = _account(core.auth, "a@lan.test", name="A")
     b, _ = _account(core.auth, "b@lan.test", name="B")
-    core.credits.contribute(a.id, 10.0, 0)
-    core.credits.contribute(b.id, 50.0, 0)
+    core.credits.contribute(a.id, 10.0)
+    core.credits.contribute(b.id, 50.0)
     core.auth.set_banned(b, True)
     assert [r["user_id"] for r in core.credits.leaderboard()] == [a.id]
 
@@ -780,18 +692,18 @@ def test_http_community_lists_live_and_admin(env):
     client.post("/auth/accept-terms", headers=_hdr(donor_tok))
     donor = core.auth.user_from_token(donor_tok)
     member = core.auth.user_from_token(member_tok)
-    core.credits.contribute(donor.id, 200.0, 50)
+    core.credits.contribute(donor.id, 200.0)
     core.credits.bind_node("n-mac", member.id)
 
     me = client.get("/credits/me", headers=_hdr(donor_tok)).json()
-    assert me["balance"] == WELCOME_FLOPS + 100.0
+    assert me["balance"] == WELCOME_FLOPS + 200.0
     assert me["reserved_in_flight"] == 0.0
-    assert me["pot"] == 100.0
+    assert me["pot"] == 0.0
 
     tx = client.get("/credits/transactions?limit=2", headers=_hdr(donor_tok)).json()
     assert len(tx["items"]) == 2
     assert {row["kind"] for row in tx["items"]} <= {"earn", "generated"}
-    assert all("created_at" in row for row in tx["items"])
+    assert all("created_at" in row and "grant_id" not in row for row in tx["items"])
     page = client.get(
         f"/credits/transactions?limit=1&before_id={tx['items'][0]['id']}",
         headers=_hdr(donor_tok),
@@ -811,10 +723,14 @@ def test_http_community_lists_live_and_admin(env):
         "status": None, "gpu_percent": None,
     }]
 
-    bio = client.patch("/auth/me", json={"bio": "writes grants"}, headers=_hdr(member_tok))
-    assert bio.json()["user"]["bio"] == "writes grants"
+    # A window from before the split was removed may still send it: it is ignored, not refused.
+    bio = client.patch("/auth/me", json={"bio": "trains adapters", "grant_split": 40},
+                       headers=_hdr(member_tok))
+    assert bio.status_code == 200, bio.text
+    assert bio.json()["user"]["bio"] == "trains adapters"
+    assert "grant_split" not in bio.json()["user"]
 
-    core.credits.contribute(member.id, 1e12, 0)
+    core.credits.contribute(member.id, 1e12)
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
     spec["max_flops"] = 2e11
     taken = client.post("/jobs", json=spec, headers=_hdr(member_tok))
@@ -825,53 +741,15 @@ def test_http_community_lists_live_and_admin(env):
     others = client.get("/jobs?mine=1", headers=_hdr(donor_tok)).json()
     assert others == []
 
-    g = client.post("/grants", json={
-        "title": "Need compute", "body": "A short paragraph about the need.",
-        "goal_flops": 50,
-    }, headers=_hdr(member_tok)).json()
     client.cookies.clear()
-    comment = client.post(f"/grants/{g['id']}/comments", json={"body": "please fund"},
+    refused = client.post(f"/admin/users/{donor.id}/flag", json={"reason": "no"},
                           headers=_hdr(member_tok))
-    assert comment.status_code == 200, comment.text
-    assert comment.json()["id"] is not None
-
-    declined = client.post(f"/admin/grants/{g['id']}/review",
-                           json={"approve": False, "note": "too vague"},
-                           headers=_hdr(admin_tok)).json()
-    assert declined["status"] == "declined"
-    assert declined["review_note"] == "too vague"
-    assert declined["reviewed_by"]
-    assert declined["reviewed_at"]
-
-    g2 = client.post("/grants", json={
-        "title": "Need more", "body": "Another short paragraph about the need.",
-        "goal_flops": 80,
-    }, headers=_hdr(member_tok)).json()
-    client.post(f"/admin/grants/{g2['id']}/review", json={"approve": True},
-                headers=_hdr(admin_tok))
-    g3 = client.post("/grants", json={
-        "title": "Need most", "body": "A third short paragraph about the need.",
-        "goal_flops": 20,
-    }, headers=_hdr(member_tok)).json()
-    client.post(f"/admin/grants/{g3['id']}/review", json={"approve": True},
-                headers=_hdr(admin_tok))
-    d1 = client.post(f"/grants/{g2['id']}/donate", json={"flops": 10},
-                     headers=_hdr(donor_tok))
-    assert d1.status_code == 200, d1.text
-    d2 = client.post(f"/grants/{g3['id']}/donate", json={"flops": 20, "from_pot": True},
-                     headers=_hdr(admin_tok))
-    assert d2.status_code == 200, d2.text
-    assert d1.json()["received_flops"] == 10
-    assert d2.json()["received_flops"] == 20
-
-    least = client.get("/grants?sort=least").json()
-    assert [row["id"] for row in least] == [g2["id"], g3["id"]]
-    trending = client.get("/grants?sort=trending").json()
-    assert [row["id"] for row in trending] == [g3["id"], g2["id"]]
-
-    client.post(f"/admin/users/{member.id}/flag", json={"reason": "spam"},
-                headers=_hdr(admin_tok))
+    assert refused.status_code == 403, refused.text
+    flagged = client.post(f"/admin/users/{member.id}/flag", json={"reason": "spam"},
+                          headers=_hdr(admin_tok))
+    assert flagged.json()["user"]["flagged"] is True
     flags = client.get("/admin/flags", headers=_hdr(admin_tok)).json()
+    assert len(flags) == 1
     assert flags[0]["user_id"] == member.id
     assert flags[0]["reason"] == "spam"
     assert client.get("/admin/flags", headers=_hdr(member_tok)).status_code == 403
@@ -892,61 +770,15 @@ def test_my_nodes_shows_live_inference_nodes_online(env):
     assert nodes["inf-gone"]["online"] is False and nodes["inf-gone"]["status"] is None
 
 
-def test_http_comment_only_on_grants_you_can_view(env):
-    client, core, *_ = env
-    tokens = {}
-    for who in ("admin", "author", "other"):
-        tokens[who] = http_sign_in(client, f"{who}@lan.test", who)
-        client.post("/auth/accept-terms", headers=_hdr(tokens[who]))
-    client.cookies.clear()
-    g = client.post("/grants", json={
-        "title": "Need compute", "body": "A short paragraph about the need.",
-        "goal_flops": 50,
-    }, headers=_hdr(tokens["author"])).json()
-    path = f"/grants/{g['id']}"
-    assert client.get(path, headers=_hdr(tokens["other"])).status_code == 404
-    denied = client.post(f"{path}/comments", json={"body": "sneaky"},
-                         headers=_hdr(tokens["other"]))
-    assert denied.status_code == 404
-    assert denied.json()["detail"] == "Grant not found."
-    for who in ("author", "admin"):
-        ok = client.post(f"{path}/comments", json={"body": "pending note"},
-                         headers=_hdr(tokens[who]))
-        assert ok.status_code == 200, ok.text
-    client.post(f"/admin/grants/{g['id']}/review", json={"approve": True},
-                headers=_hdr(tokens["admin"]))
-    ok = client.post(f"{path}/comments", json={"body": "now public"},
-                     headers=_hdr(tokens["other"]))
-    assert ok.status_code == 200, ok.text
-    bodies = [c["body"] for c in client.get(path).json()["comments"]]
-    assert bodies == ["pending note", "pending note", "now public"]
-
-
-def test_http_grants_reject_non_finite_goal_and_donation(env):
-    client, core, *_ = env
+@pytest.mark.parametrize("method,path", [
+    ("get", "/grants"), ("post", "/grants"), ("get", "/grants/g1"), ("post", "/grants/g1/donate"),
+    ("post", "/grants/g1/comments"), ("post", "/admin/grants/g1/review"),
+])
+def test_http_grants_routes_are_gone(env, method, path):
+    client, *_ = env
     admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
-    member_tok = http_sign_in(client, "m@lan.test", "Member")
-    donor_tok = http_sign_in(client, "d@lan.test", "Donor")
-    client.post("/auth/accept-terms", headers=_hdr(member_tok))
-    client.post("/auth/accept-terms", headers=_hdr(donor_tok))
-    core.credits.contribute(core.auth.user_from_token(donor_tok).id, 80.0, 0)
-    grant = {"title": "Need compute", "body": "A short paragraph about the need."}
-    for goal in ("1e309", "inf", "-inf", "nan", 1e31):
-        r = client.post("/grants", json={**grant, "goal_flops": goal},
-                        headers=_hdr(member_tok))
-        assert r.status_code == 400, (goal, r.text)
-    assert client.get("/grants", headers=_hdr(member_tok)).json() == []
-    g = client.post("/grants", json={**grant, "goal_flops": 50},
-                    headers=_hdr(member_tok)).json()
-    client.post(f"/admin/grants/{g['id']}/review", json={"approve": True},
-                headers=_hdr(admin_tok))
-    for flops in ("nan", "inf", "-inf", "1e309"):
-        r = client.post(f"/grants/{g['id']}/donate", json={"flops": flops},
-                        headers=_hdr(donor_tok))
-        assert r.status_code == 400, (flops, r.text)
-    for sort in ("top", "least", "trending"):
-        r = client.get("/grants", params={"sort": sort})
-        assert r.status_code == 200 and r.json()[0]["received_flops"] == 0
+    r = client.request(method, path, json={} if method == "post" else None, headers=_hdr(admin_tok))
+    assert r.status_code == 404, r.text
 
 
 def test_http_admin_cannot_ban_self_or_last_admin(env):
@@ -1013,41 +845,29 @@ def test_concurrent_same_google_account_signs_in_once(core):
     ("post", "/auth/google", {"id_token": ["x"]}),
     ("patch", "/auth/me", {"name": 5}),
     ("patch", "/auth/me", {"bio": 5}),
-    ("post", "/grants", {"title": 12345, "body": "A short paragraph about the need.",
-                         "goal_flops": 50}),
-    ("post", "/grants", {"title": "Need compute", "body": {"x": 1}, "goal_flops": 50}),
-    ("post", "/grants/{approved}/comments", {"body": 123}),
-    ("post", "/admin/grants/{pending}/review", {"approve": True, "note": 5}),
     ("post", "/admin/users/{member}/flag", {"reason": 5}),
 ])
 def test_http_wrongly_typed_fields_are_400(env, method, path, payload):
     client, core, *_ = env
     admin_tok = http_sign_in(client, "admin@lan.test", "Admin")
     client.post("/auth/accept-terms", headers=_hdr(admin_tok))
-    admin = core.auth.user_from_token(admin_tok)
     member, _ = _account(core.auth, "m@lan.test", "Member")
-    pending = core.grants.create(admin, "Pending one", "A short paragraph about the need.", 50)
-    approved = core.grants.create(admin, "Approved one", "A short paragraph about the need.", 50)
-    core.grants.review(admin, approved.id, True)
     client.cookies.clear()
-    url = path.format(pending=pending.id, approved=approved.id, member=member.id)
+    url = path.format(member=member.id)
     r = client.request(method, url, json=payload, headers=_hdr(admin_tok))
     assert r.status_code == 400, r.text
     assert core.auth.user_count() == 2
-    assert core.grants.get(pending.id).status == "pending"
+    assert core.auth.get(member.id).flagged is False
 
 
 def test_non_finite_amounts_are_rejected(core):
     user, _ = _account(core.auth)
-    core.credits.contribute(user.id, 100.0, 50)
+    core.credits.contribute(user.id, 100.0)
     for bad in (float("nan"), float("inf")):
         with pytest.raises(CreditError):
             core.credits.reserve_job(user.id, "job-nan", bad)
-        with pytest.raises(CreditError):
-            core.credits.allocate_pot(user.id, "g1", bad)
     assert core.credits.job_account("job-nan") is None
-    assert core.credits.balance(user.id) == 50.0
-    assert core.credits.balance(POT_ID) == 50.0
+    assert core.credits.balance(user.id) == 100.0
 
 
 @pytest.mark.parametrize("max_flops", ["nan", "inf"])
@@ -1093,7 +913,7 @@ def _race_count(n, fn):
         try:
             fn()
             ok.append(1)
-        except (CreditError, GrantError):
+        except CreditError:
             pass
 
     threads = [threading.Thread(target=run) for _ in range(n)]
@@ -1105,23 +925,8 @@ def _race_count(n, fn):
 
 
 def test_concurrent_spends_cannot_overdraw(core):
-    admin, _ = _account(core.auth, "admin@lan.test")
     member, _ = _account(core.auth, "m@lan.test")
-    donor, _ = _account(core.auth, "d@lan.test")
-    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 1e3)
-    core.grants.review(admin, g.id, True)
-    for _ in range(3):
-        core.credits.contribute(donor.id, 10.0, 0)
-        assert _race_count(16, lambda: core.grants.donate(donor, g.id, 10.0)) == 1
-        assert core.credits.balance(donor.id) == 0.0
-    assert core.grants.get(g.id).received_flops == 30.0
-    assert core.credits.balance(member.id) == 30.0
-
-    core.credits.contribute(member.id, 10.0, 100)
-    assert _race_count(16, lambda: core.grants.donate(admin, g.id, 10.0, from_pot=True)) == 1
-    assert core.credits.balance(POT_ID) == 0.0
-    assert core.grants.get(g.id).received_flops == 40.0
-
+    core.credits.contribute(member.id, 40.0)
     jobs = iter(range(16))
     assert _race_count(16, lambda: core.credits.reserve_job(member.id, f"job-{next(jobs)}", 40.0)) == 1
     assert core.credits.balance(member.id) == 0.0
@@ -1129,7 +934,7 @@ def test_concurrent_spends_cannot_overdraw(core):
 
 def test_concurrent_consume_and_settle_keep_job_books_straight(core):
     user, _ = _account(core.auth)
-    core.credits.contribute(user.id, 100.0, 0)
+    core.credits.contribute(user.id, 100.0)
     core.credits.reserve_job(user.id, "job-r", 80.0)
     # Every charge lands on the account: no lost updates to spent_flops.
     assert _race_count(16, lambda: core.credits.consume_job("job-r", 1.0)) == 16
@@ -1148,26 +953,12 @@ def test_http_admin_flags_reject_string_booleans(env):
     member_tok = http_sign_in(client, "m@lan.test", "Member")
     member = core.auth.user_from_token(member_tok)
     client.post("/auth/accept-terms", headers=_hdr(member_tok))
-    g = client.post("/grants", json={
-        "title": "Need compute", "body": "A short paragraph about the need.",
-        "goal_flops": 50,
-    }, headers=_hdr(member_tok)).json()
-    # bool("false") is True: these used to approve and ban.
+    # bool("false") is True: these used to ban.
     for bad in ("yes", 0, 1, [], "False"):
-        r = client.post(f"/admin/grants/{g['id']}/review", json={"approve": bad},
-                        headers=_hdr(admin_tok))
-        assert r.status_code == 400, (bad, r.text)
         r = client.post(f"/admin/users/{member.id}/ban", json={"banned": bad},
                         headers=_hdr(admin_tok))
         assert r.status_code == 400, (bad, r.text)
-        r = client.post(f"/grants/{g['id']}/donate", json={"flops": 1, "from_pot": bad},
-                        headers=_hdr(member_tok))
-        assert r.status_code == 400, (bad, r.text)
     assert core.auth.get(member.id).banned is False
-    declined = client.post(f"/admin/grants/{g['id']}/review", json={"approve": "false"},
-                           headers=_hdr(admin_tok))
-    assert declined.status_code == 200, declined.text
-    assert declined.json()["status"] == "declined"
     r = client.post(f"/admin/users/{member.id}/ban", json={"banned": "false"},
                     headers=_hdr(admin_tok))
     assert r.status_code == 200, r.text

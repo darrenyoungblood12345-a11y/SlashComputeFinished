@@ -17,14 +17,12 @@ from slashcompute.coordinator.db import (
     CreditTxn, Database, EarningHold, JobAccount, NodeOwner, User, now,
 )
 
+# Holds what nobody may earn (see _host_rows), so charged FLOPs never vanish.
 POT_ID = "__pot__"
+# "donate", "receive" and "allocate" are no longer posted. They stay because ledgers from before
+# hold such rows, and dropping the kinds would change those accounts' balances.
 BALANCE_KINDS = ("earn", "reserve", "release", "donate", "receive", "allocate",
                  "welcome")
-
-
-def _tithe_note(user_id: str) -> str:
-    """Marks the pot's share of what ``user_id`` earned: the only record of whose earnings it came from."""
-    return f"tithe from {user_id}"
 
 
 class CreditError(Exception):
@@ -45,10 +43,9 @@ class Credits:
         self._welcomed: set[str] = set()   # users known to hold their welcome credit: skip the insert
 
     def post(self, user_id: str, kind: str, amount: float, *, job_id: Optional[str] = None,
-             grant_id: Optional[str] = None, node_id: Optional[str] = None,
-             note: Optional[str] = None) -> CreditTxn:
+             node_id: Optional[str] = None, note: Optional[str] = None) -> CreditTxn:
         row = CreditTxn(user_id=user_id, kind=kind, amount=float(amount), job_id=job_id,
-                        grant_id=grant_id, node_id=node_id, note=note)
+                        node_id=node_id, note=note)
         self.db.add(row)
         return row
 
@@ -70,18 +67,6 @@ class Credits:
             ).one()
         return float(total or 0.0)
 
-    def lifetime_to_grants(self, user_id: str) -> float:
-        """What this user's earnings really sent to the community pot: the shares posted as they were
-        earned, each at the split of its time. Never lifetime earnings times today's split."""
-        with self.db.session() as s:
-            total = s.exec(
-                select(func.coalesce(func.sum(CreditTxn.amount), 0.0)).where(
-                    CreditTxn.user_id == POT_ID, CreditTxn.kind == "earn",
-                    CreditTxn.note == _tithe_note(user_id),
-                )
-            ).one()
-        return float(total or 0.0)
-
     def lifetime_spent(self, user_id: str) -> float:
         with self.db.session() as s:
             total = s.exec(
@@ -97,14 +82,10 @@ class Credits:
         return float(sum(max(0.0, a.reserved_flops - a.spent_flops) for a in rows))
 
     def summary(self, user_id: str) -> dict:
-        earned, to_grants = self.lifetime_earned(user_id), self.lifetime_to_grants(user_id)
         return {
             "user_id": user_id,
             "balance": self.balance(user_id),
-            "lifetime_earned": earned,
-            # every earning is posted as the pot's share plus the rest, so these two add up to it
-            "lifetime_to_grants": to_grants,
-            "lifetime_kept": earned - to_grants,
+            "lifetime_earned": self.lifetime_earned(user_id),
             "lifetime_spent": self.lifetime_spent(user_id),
             "pot": self.balance(POT_ID),
             "reserved_in_flight": self.reserved_in_flight(user_id),
@@ -130,7 +111,7 @@ class Credits:
             "items": [
                 {
                     "id": r.id, "kind": r.kind, "amount": r.amount,
-                    "job_id": r.job_id, "grant_id": r.grant_id, "node_id": r.node_id,
+                    "job_id": r.job_id, "node_id": r.node_id,
                     "note": r.note, "created_at": r.created_at,
                 }
                 for r in items
@@ -181,20 +162,14 @@ class Credits:
         row = self.db.get(NodeOwner, node_id)
         return row.user_id if row else None
 
-    def _earning_rows(self, user_id: str, flops: float, grant_split: int, *,
+    def _earning_rows(self, user_id: str, flops: float, *,
                       node_id: Optional[str], job_id: Optional[str]) -> list[CreditTxn]:
-        split = max(0, min(100, int(grant_split))) / 100.0
-        pot = flops * split
-        personal = flops - pot
-        rows = [CreditTxn(user_id=user_id, kind="generated", amount=flops, node_id=node_id,
-                          job_id=job_id)]
-        if personal:
-            rows.append(CreditTxn(user_id=user_id, kind="earn", amount=personal, node_id=node_id,
-                                  job_id=job_id))
-        if pot:
-            rows.append(CreditTxn(user_id=POT_ID, kind="earn", amount=pot, node_id=node_id,
-                                  job_id=job_id, note=_tithe_note(user_id)))
-        return rows
+        """What ``user_id`` earns for ``flops`` of work: the record of the work ("generated",
+        which counts for nothing in a balance) and the credit itself, all of it theirs."""
+        return [
+            CreditTxn(user_id=user_id, kind=kind, amount=flops, node_id=node_id, job_id=job_id)
+            for kind in ("generated", "earn")
+        ]
 
     def _host_rows(self, owner: Optional[User], flops: float, *, node_id: Optional[str],
                    job_id: Optional[str]) -> list[CreditTxn]:
@@ -203,15 +178,13 @@ class Credits:
         if owner is None or owner.banned:
             return [CreditTxn(user_id=POT_ID, kind="earn", amount=flops, node_id=node_id,
                               job_id=job_id, note="unclaimed host share")]
-        return self._earning_rows(owner.id, flops, owner.grant_split, node_id=node_id,
-                                  job_id=job_id)
+        return self._earning_rows(owner.id, flops, node_id=node_id, job_id=job_id)
 
-    def contribute(self, user_id: str, flops: float, grant_split: int, *,
+    def contribute(self, user_id: str, flops: float, *,
                    node_id: Optional[str] = None, job_id: Optional[str] = None) -> None:
         if flops <= 0:
             return
-        self.db.add(*self._earning_rows(user_id, flops, grant_split, node_id=node_id,
-                                        job_id=job_id))
+        self.db.add(*self._earning_rows(user_id, flops, node_id=node_id, job_id=job_id))
 
     def credit_host(self, owner_id: Optional[str], flops: float, *,
                     node_id: Optional[str] = None, job_id: Optional[str] = None) -> None:
@@ -270,7 +243,7 @@ class Credits:
         return float(total or 0.0)
 
     def release_hold(self, hold_id: int) -> float:
-        """Pay a hold to its owner: the grant split and the banned-owner rule are those of now.
+        """Pay a hold to its owner: the banned-owner rule is that of now.
         Returns the FLOPs paid; a hold that is no longer held pays nothing."""
         with self._spend_lock, self.db.session() as s:
             hold = s.get(EarningHold, hold_id)
@@ -402,28 +375,6 @@ class Credits:
         for job_id in open_ids:
             self.settle_job(job_id)
         return len(open_ids)
-
-    def donate(self, donor_id: str, recipient_id: str, grant_id: str, flops: float) -> None:
-        if flops <= 0:
-            raise CreditError("Donation must be positive.")
-        self._transfer(donor_id, "donate", recipient_id, grant_id, flops,
-                       "Not enough personal credits to donate.")
-
-    def allocate_pot(self, recipient_id: str, grant_id: str, flops: float) -> None:
-        if not math.isfinite(flops) or flops <= 0:
-            raise CreditError("Allocation must be positive.")
-        self._transfer(POT_ID, "allocate", recipient_id, grant_id, flops,
-                       "Community pot does not have that many FLOPs.")
-
-    def _transfer(self, source_id: str, kind: str, recipient_id: str, grant_id: str,
-                  flops: float, short_msg: str) -> None:
-        with self._spend_lock:
-            if self.balance(source_id) < flops:
-                raise CreditError(short_msg)
-            self.db.add(
-                CreditTxn(user_id=source_id, kind=kind, amount=-flops, grant_id=grant_id),
-                CreditTxn(user_id=recipient_id, kind="receive", amount=flops, grant_id=grant_id),
-            )
 
     def leaderboard(self, limit: int = 20) -> list[dict]:
         with self.db.session() as s:

@@ -92,8 +92,10 @@ def test_index_and_css(tmp_path):
         r = c.get("/")
         assert r.status_code == 200
         assert b"COMPUTE" in r.content
-        for tab in (b"contributions", b"usage", b"grants", b"pool"):
+        for tab in (b"contributions", b"usage", b"pool", b"llm"):
             assert b'data-tab="' + tab + b'"' in r.content
+        assert b'data-tab="grants"' not in r.content and b'id="split"' not in r.content
+        assert b'id="leaders"' in r.content
         assert b'data-ink="signal"' in r.content
         assert b"/static/logo.png" in r.content
         assert c.get("/static/logo.png").status_code == 200
@@ -105,6 +107,7 @@ def test_index_and_css(tmp_path):
         assert js.status_code == 200
         assert b"AUTH.sc" not in js.content
         assert b"/api/overview" in js.content
+        assert b"/api/grants" not in js.content and b"grant_split" not in js.content
         assert b"GOOGLE" not in js.content
         assert b"connect-public" in js.content
         assert b'mode: "host", contribute: false' not in js.content   # hosting must not stop contributing
@@ -114,19 +117,6 @@ def test_index_and_css(tmp_path):
         assert b"archivo-black" not in css.content
         assert c.get("/static/fonts/ibm-plex-sans-regular.woff2").status_code == 200
         assert c.get("/static/fonts/ibm-plex-mono-regular.woff2").status_code == 200
-
-
-def test_logout_rebuilds_grant_board(tmp_path):
-    # The admin review queue is only toggled by renderGrants(); signing out has
-    # to reload the board or Approve/Decline stays on screen for the next user.
-    app, _, _ = _shell(tmp_path)
-    with TestClient(app, base_url=SHELL) as c:
-        js = c.get("/static/app.js").text
-    start = js.index("  logout: (btn) =>")
-    body = js[start:js.index("\n  }),", start)]
-    assert "state.user = null" in body
-    assert "await loadGrants()" in body
-    assert body.index("state.user = null") < body.index("await loadGrants()")
 
 
 def test_settings_and_status(tmp_path):
@@ -139,7 +129,7 @@ def test_settings_and_status(tmp_path):
         assert body["mode"] == "join" and body["finish"] == "signal"
         assert body["url"] == "10.1.2.3"
         assert body["has_session"] is False
-        assert body["grant_split"] == 0
+        assert "grant_split" not in body
         got = c.get("/api/settings").json()
         assert got["gpu_percent"] == 40
         st = c.get("/api/status").json()
@@ -335,7 +325,7 @@ def test_settings_accept_public_mode(tmp_path, monkeypatch):
 
 def test_overview_online_ranks_this_mac(tmp_path):
     app, launcher, _ = _shell(tmp_path, http=RoutedHTTP(POOL))
-    launcher.save_settings(LauncherSettings(mode="host", grant_split=25))
+    launcher.save_settings(LauncherSettings(mode="host"))
     launcher.paths.node_id_file.write_text("me\n")
     with TestClient(app, base_url=SHELL) as c:
         ov = c.get("/api/overview").json()
@@ -344,7 +334,7 @@ def test_overview_online_ranks_this_mac(tmp_path):
     assert ov["pool"]["jobs"][0]["progress"] == 0.4 and ov["pool"]["jobs"][0]["can_cancel"]
     assert ov["pool"]["capacity"]["macs"] == 2 and ov["pool"]["capacity"]["running"] == 1
     assert ov["me"]["flops"] == 4e12
-    assert ov["me"]["credits"] == {"earned": 4e12, "kept": 3e12, "to_grants": 1e12}
+    assert "credits" not in ov["me"]                      # credits are 1:1 with the FLOPs above
     assert (ov["me"]["rank"], ov["me"]["of"]) == (2, 2)
     assert [n["is_me"] for n in ov["pool"]["nodes"]] == [True, False]
 
@@ -410,88 +400,6 @@ def test_stop_agent_endpoint_leaves_coordinator(tmp_path, monkeypatch):
     with TestClient(app, base_url=SHELL) as c:
         assert c.post("/api/stop-agent").status_code == 200
     assert (222, 15) in kills and (111, 15) not in kills
-
-
-class GrantHTTP:
-    """In-memory coordinator stand-in for the live grants adapter."""
-
-    def __init__(self) -> None:
-        self.grants = [
-            {"id": "g1", "title": "Parser", "author": "Ada",
-             "body": "Need FLOPs for a parser thesis project.",
-             "goal_flops": 50e12, "received_flops": 10e12, "status": "approved", "progress": 0.2},
-            {"id": "g2", "title": "Waiting", "author": "Bea",
-             "body": "Waiting for review of this grant request.",
-             "goal_flops": 20e12, "received_flops": 0.0, "status": "pending", "progress": 0.0},
-        ]
-        self.donated = 0.0
-
-    def _path(self, url: str) -> str:
-        return "/" + url.split("://", 1)[-1].split("/", 1)[-1].split("?")[0]
-
-    def _resp(self, payload, status=200):
-        raw = json.dumps(payload).encode()
-
-        class R:
-            status_code = status
-            content = raw
-            headers = {"content-type": "application/json"}
-
-            def json(self_inner):
-                return payload
-        return R()
-
-    def get(self, url: str, timeout: float = 1.0, params=None, headers=None):
-        path = self._path(url)
-        if path == "/grants":
-            return self._resp(self.grants)
-        if path == "/auth/me":
-            return self._resp({
-                "user": {"id": "u1", "name": "Ada", "admin": True, "grant_split": 10,
-                         "accepted_terms": True},
-                "credits": {"balance": 80e12, "lifetime_earned": 100e12},
-            })
-        if path == "/credits/transactions":
-            return self._resp({"items": [
-                {"kind": "donate", "amount": -self.donated} if self.donated else {"kind": "earn", "amount": 1},
-            ]})
-        if path == "/community/leaderboard":
-            return self._resp([{"user_id": "u1", "name": "Ada", "lifetime_earned": 100e12}])
-        raise ConnectionError("down")
-
-    def post(self, url: str, content=None, headers=None, timeout: float = 1.0, **_):
-        path = self._path(url)
-        body = json.loads(content or b"{}")
-        if path == "/grants":
-            title = str(body.get("title", "")).strip()
-            text = str(body.get("body", "")).strip()
-            if len(title) < 4 or len(text) < 20:
-                return self._resp({"detail": "Describe the need: a title and at least a short paragraph."}, 400)
-            row = {"id": "g3", "title": title, "author": "You", "body": text,
-                   "goal_flops": float(body.get("goal_flops") or 0), "received_flops": 0.0,
-                   "status": "pending", "progress": 0.0}
-            self.grants.append(row)
-            return self._resp(row)
-        if path.endswith("/donate"):
-            gid = path.split("/")[2]
-            g = next((x for x in self.grants if x["id"] == gid), None)
-            if g is None or g["status"] != "approved":
-                return self._resp({"detail": "Only approved grants can receive FLOPs."}, 400)
-            flops = float(body.get("flops") or 0)
-            if flops <= 0:
-                return self._resp({"detail": "Enter a number."}, 400)
-            g["received_flops"] += flops
-            g["progress"] = g["received_flops"] / g["goal_flops"]
-            self.donated += flops
-            return self._resp(g)
-        if "/admin/grants/" in path and path.endswith("/review"):
-            gid = path.split("/")[3]
-            g = next((x for x in self.grants if x["id"] == gid), None)
-            if g is None or g["status"] != "pending":
-                return self._resp({"detail": "This grant was already reviewed."}, 400)
-            g["status"] = "approved" if body.get("approve") else "declined"
-            return self._resp(g)
-        return self._resp({"detail": "not found"}, 404)
 
 
 def test_proxy_forwards_set_cookie(tmp_path):
@@ -660,7 +568,7 @@ def test_proxy_retries_a_refused_lent_token_as_a_stranger(tmp_path):
     """A 401 to a request the shell signed in itself: asked again without the token, an answer means
     the token was what was wrong, so it is dropped. A route that needs a sign-in 401s both times
     and the token is kept (the next /auth/me poll settles it)."""
-    http = SessionHTTP(live=[], strict=["/grants"], private=["/auth/me/nodes"])
+    http = SessionHTTP(live=[], strict=["/community/leaderboard"], private=["/auth/me/nodes"])
     app, launcher, _ = _shell(tmp_path, http=http)
     launcher.save_settings(launcher.with_session(LauncherSettings(mode="host"), "stale"))
     with TestClient(app, base_url=SHELL) as c:
@@ -669,12 +577,12 @@ def test_proxy_retries_a_refused_lent_token_as_a_stranger(tmp_path):
         assert [h.get("authorization") for h in http.seen] == ["Bearer stale", None]
         assert launcher.load_settings().session_token == "stale"
         http.seen.clear()
-        r = c.get("/api/coord/grants")
-        assert r.status_code == 200 and r.json()["path"] == "/grants"
+        r = c.get("/api/coord/community/leaderboard")
+        assert r.status_code == 200 and r.json()["path"] == "/community/leaderboard"
         assert [h.get("authorization") for h in http.seen] == ["Bearer stale", None]
         assert launcher.load_settings().session_token == ""
         http.seen.clear()
-        assert c.get("/api/coord/grants").status_code == 200
+        assert c.get("/api/coord/community/leaderboard").status_code == 200
         assert http.seen == [{}]                                    # one try, nothing to lend
 
 
@@ -804,16 +712,16 @@ def test_launcher_calls_stay_off_the_event_loop(tmp_path, path):
 
 def test_partial_settings_keep_the_stored_fields(tmp_path):
     app, launcher, _ = _shell(tmp_path)
-    launcher.save_settings(LauncherSettings(mode="join", url="10.1.2.3", inference=True, grant_split=25,
+    launcher.save_settings(LauncherSettings(mode="join", url="10.1.2.3", inference=True,
                                             memory_gb=8, models_dir="/Volumes/m", transport="relay",
                                             training=False, inference_memory_gb=12))
     with TestClient(app, base_url=SHELL) as c:
         body = c.post("/api/settings", json={"gpu_percent": 30}).json()   # the slider alone
     assert body["gpu_percent"] == 30
     s = launcher.load_settings()
-    assert (s.mode, s.url, s.inference, s.grant_split, s.memory_gb, s.models_dir, s.transport,
+    assert (s.mode, s.url, s.inference, s.memory_gb, s.models_dir, s.transport,
             s.training, s.inference_memory_gb) == \
-        ("join", "10.1.2.3", True, 25, 8, "/Volumes/m", "relay", False, 12)
+        ("join", "10.1.2.3", True, 8, "/Volumes/m", "relay", False, 12)
     assert body["mode"] == "join" and body["models_dir"] == "/Volumes/m"
     # The body never sets the session fields directly (only session_token, as a sign-in or sign-out).
     assert launcher.load_settings().session_url == ""
@@ -837,65 +745,47 @@ def test_unexpected_errors_are_json_and_logged(tmp_path):
     assert "GET /api/status" in log and "RuntimeError: boom" in log and "Traceback" in log
 
 
-def test_live_grants_empty_when_coordinator_down(tmp_path):
-    app, _, _ = _shell(tmp_path, http=RoutedHTTP({}))
-    with TestClient(app, base_url=SHELL) as c:
-        board = c.get("/api/grants?sort=least").json()
-    assert board["sample"] is True
-    assert board["online"] is False
-    assert any("Irish-language" in g["title"] for g in board["grants"])
-    assert board["pending"]
-
-
-def test_sample_grants_when_coordinator_has_none(tmp_path):
-    app, launcher, _ = _shell(tmp_path, http=RoutedHTTP({**POOL, "/grants": []}))
+@pytest.mark.parametrize("method,path", [
+    ("get", "/api/grants"), ("post", "/api/grants"), ("post", "/api/grants/g1/fund"),
+    ("post", "/api/grants/g1/review"),
+])
+def test_grants_routes_are_gone(tmp_path, method, path):
+    app, launcher, _ = _shell(tmp_path, http=RoutedHTTP(POOL))
     launcher.save_settings(LauncherSettings(mode="host"))
     with TestClient(app, base_url=SHELL) as c:
-        board = c.get("/api/grants?sort=top").json()
-    assert board["sample"] is True
-    assert board["online"] is True
-    assert any("Irish-language" in g["title"] for g in board["grants"])
-    assert all(g["id"].startswith("g") for g in board["grants"])
+        r = c.request(method, path, json={} if method == "post" else None)
+    assert r.status_code in (404, 405), r.text
 
 
-def test_live_grants_are_not_mixed_with_samples(tmp_path):
-    grant = {"id": "live-1", "title": "Parser", "author": "Ada",
-             "body": "Need FLOPs for a parser.", "goal_flops": 50e12,
-             "received_flops": 10e12, "status": "approved"}
-    app, launcher, _ = _shell(tmp_path, http=RoutedHTTP({**POOL, "/grants": [grant]}))
-    launcher.save_settings(LauncherSettings(mode="host"))
+def test_settings_saved_with_a_credit_split_still_load(tmp_path):
+    """A settings file from before the split was removed has the field: it is dropped, not an error."""
+    app, launcher, _ = _shell(tmp_path)
+    launcher.save_settings(LauncherSettings(mode="join", url="10.1.2.3", gpu_percent=40))
+    stored = json.loads(launcher.settings_path.read_text())
+    launcher.settings_path.write_text(json.dumps({**stored, "grant_split": 25}))
+    s = launcher.load_settings()
+    assert (s.mode, s.url, s.gpu_percent) == ("join", "10.1.2.3", 40)
     with TestClient(app, base_url=SHELL) as c:
-        board = c.get("/api/grants?sort=top").json()
-    assert board["sample"] is False
-    assert [g["id"] for g in board["grants"]] == ["live-1"]
-    assert not any("Irish-language" in g["title"] for g in board["grants"])
+        # An older window may still send it with a save.
+        body = c.post("/api/settings", json={"gpu_percent": 30, "grant_split": 60}).json()
+    assert body["gpu_percent"] == 30 and "grant_split" not in body
+    assert "grant_split" not in json.loads(launcher.settings_path.read_text())
 
 
-def test_live_grant_cards_show_their_backers(tmp_path, monkeypatch):
-    """Against the real coordinator, not a stand-in: its grant rows never carried the backer count the
-    card reads, so every live grant showed "0 backers" whatever it had received."""
+def test_leaderboard_reaches_the_window_from_a_real_coordinator(tmp_path):
+    """Against the real coordinator, not a stand-in: the rows carry what the card reads."""
     coord_app = create_app(EngineConfig(home=tmp_path / "coord", scheduler_tick_s=0.05))
     with TestClient(coord_app) as coord:
         core = coord_app.state.core
-        people = {}
-        for name in ("admin", "author", "ada", "bea"):
-            people[name] = core.auth.accept_terms(sign_in(core.auth, f"{name}@lan.test", name)[0])
-        for donor in ("ada", "bea"):
-            core.credits.contribute(people[donor].id, 100.0, 0)
-        g = core.grants.create(people["author"], "Need compute", "A short paragraph about the need.", 100.0)
-        core.grants.review(people["admin"], g.id, True)
+        people = {name: sign_in(core.auth, f"{name}@lan.test", name)[0] for name in ("ada", "bea")}
+        core.credits.contribute(people["ada"].id, 10.0)
+        core.credits.contribute(people["bea"].id, 50.0)
         app, launcher, _ = _shell(tmp_path / "shell", http=stateless_http(transport=coord._transport))
         launcher.save_settings(LauncherSettings(mode="join", url="http://testserver"))
         with TestClient(app, base_url=SHELL) as c:
-            (card,) = c.get("/api/grants?sort=top").json()["grants"]
-            assert card["id"] == g.id and card["backers"] == 0
-            core.grants.donate(people["ada"], g.id, 10.0)
-            core.grants.donate(people["ada"], g.id, 5.0)
-            core.grants.donate(people["bea"], g.id, 1.0)
-            board = c.get("/api/grants?sort=top").json()
-            assert board["sample"] is False
-            (card,) = board["grants"]
-            assert card["raised"] == 16.0 and card["backers"] == 2
+            board = c.get("/api/coord/community/leaderboard").json()   # no session: it is public
+    assert [(r["user_id"], r["name"], r["lifetime_earned"]) for r in board] == \
+        [(people["bea"].id, "bea", 50.0), (people["ada"].id, "ada", 10.0)]
 
 
 # Runs app.js under Node with a stub DOM; fetch answers from the `routes` the
@@ -947,13 +837,11 @@ const settle = () => new Promise((r) => setTimeout(r, 30));
     routes = phase.routes;
     if (i === 0) {
       vm.runInContext(fs.readFileSync(appJs, "utf8"), ctx);
-      vm.runInContext("showTab('grants')", ctx);
     } else {
       vm.runInContext(phase.run, ctx);
     }
     await settle();
-    seen.push({ pill: element("#g-pill").textContent, open: element("#g-open").textContent,
-      list: element("#g-list").innerHTML, probe: phase.probe && vm.runInContext(phase.probe, ctx) });
+    seen.push({ leaders: element("#leaders").innerHTML, probe: phase.probe && vm.runInContext(phase.probe, ctx) });
   }
   console.log(JSON.stringify(seen));
 })();
@@ -961,71 +849,67 @@ const settle = () => new Promise((r) => setTimeout(r, 30));
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
-def test_grants_tab_follows_coordinator_on_poll(tmp_path):
-    grant = {"id": "g1", "title": "Parser", "author": "Ada", "body": "Need FLOPs for a parser.",
-             "goal_flops": 50e12, "received_flops": 10e12, "status": "approved"}
-    app, launcher, _ = _shell(tmp_path / "up", http=RoutedHTTP({**POOL, "/grants": [grant]}))
+def test_leaderboard_follows_the_coordinator_on_poll(tmp_path):
+    app, launcher, _ = _shell(tmp_path / "up", http=RoutedHTTP(POOL))
     launcher.save_settings(LauncherSettings(mode="host"))
     with TestClient(app, base_url=SHELL) as c:
-        live = {"/api/overview": c.get("/api/overview").json(), "/api/grants": c.get("/api/grants").json()}
-    assert live["/api/overview"]["status"]["coordinator_up"] and live["/api/grants"]["online"]
+        up = c.get("/api/overview").json()
+    assert up["status"]["coordinator_up"]
     app, _, _ = _shell(tmp_path / "down", http=RoutedHTTP({}))
     with TestClient(app, base_url=SHELL) as c:
-        down = {"/api/overview": c.get("/api/overview").json(), "/api/grants": c.get("/api/grants").json()}
-    assert not down["/api/overview"]["status"]["coordinator_up"]
-    board = live["/api/grants"]
-    more = {**live, "/api/grants": {**board, "grants": board["grants"] + [{**board["grants"][0], "id": "g2"}]}}
+        down = c.get("/api/overview").json()
+    assert not down["status"]["coordinator_up"]
+    accounts = [{"user_id": "u1", "name": "Ada", "lifetime_earned": 9e12, "balance": 9e12},
+                {"user_id": "u2", "name": "Bea", "lifetime_earned": 4e12, "balance": 1e12}]
+    me = {"user": {"id": "u2", "name": "Bea", "accepted_terms": True}, "credits": {"balance": 1e12}}
+    board = "/api/coord/community/leaderboard"
+    live = {"/api/overview": up, "/api/coord/auth/me": me, board: accounts}
+    more = {**live, board: accounts + [{"user_id": "u3", "name": "Cy", "lifetime_earned": 1e12}]}
     phases = [
         {"routes": live},
-        {"routes": down, "run": "poll()"},
+        {"routes": {"/api/overview": down}, "run": "poll()"},
         {"routes": live, "run": "poll()"},
-        # Same coordinator, new grant: only the slow refresh picks it up.
+        # Same coordinator, a new account: only the slow refresh picks it up.
         {"routes": more, "run": "poll()"},
-        {"routes": more, "run": "state.grantsAt -= 60000; poll()"},
+        {"routes": more, "run": "state.leadersAt -= 60000; poll()"},
+        # A pool with no accounts yet (or one that will not say): the overview's ranking of its Macs.
+        {"routes": {**live, board: []}, "run": "state.leadersAt -= 60000; poll()"},
+        {"routes": {"/api/overview": up, "/api/coord/auth/me": me}, "run": "state.leadersAt -= 60000; poll()"},
     ]
     (tmp_path / "phases.json").write_text(json.dumps(phases))
     out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
                          capture_output=True, text=True, timeout=30, check=True)
-    seen = json.loads(out.stdout.strip().splitlines()[-1])
-    assert (seen[0]["pill"], seen[0]["open"]) == ("Live", "1")
-    assert "Fund this grant" in seen[0]["list"]
-    assert (seen[1]["pill"], seen[1]["open"]) == ("Demo", "6")
-    assert "Fund this grant" not in seen[1]["list"]
-    assert "Irish-language" in seen[1]["list"]
-    assert "Demo grant" in seen[1]["list"]
-    assert (seen[2]["pill"], seen[2]["open"]) == ("Live", "1")
-    assert seen[3]["open"] == "1"
-    assert seen[4]["open"] == "2"
+    first, offline, back, unchanged, refreshed, no_accounts, silent = \
+        [s["leaders"] for s in json.loads(out.stdout.strip().splitlines()[-1])]
+    assert first.index("Ada") < first.index("Bea") and first.count("<li") == 2
+    assert first.count("You") == 1 and first.index("Bea") < first.index("You")   # the signed-in account
+    assert "Start or join a pool" in offline and "Ada" not in offline
+    assert back == first
+    assert unchanged == first
+    assert "Cy" in refreshed and refreshed.count("<li") == 3
+    assert no_accounts.index("Studio") < no_accounts.index("Air") and "Ada" not in no_accounts
+    assert silent == no_accounts
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
-def test_given_and_kept_totals_come_from_the_ledger_not_from_the_current_split(tmp_path):
-    """The split is applied when credits are earned. The tiles multiplied lifetime earnings by today's
-    split, so moving it to 100% claimed everything ever earned had gone to grants."""
+def test_credits_tile_shows_what_the_account_earned(tmp_path):
+    """Everything earned is the account's: no share is given away, whatever an older pool reports."""
     probe = """renderContributions();
         ({ earned: $("#c-earned").textContent, earnedSub: $("#c-earned-sub").textContent,
-           grants: $("#c-grants").textContent, grantsSub: $("#c-grants-sub").textContent,
-           pct: [$("#split-grants").textContent, $("#split-keep").textContent],
-           amounts: [$("#split-grants-amt").textContent, $("#split-keep-amt").textContent],
-           hint: $("#split-hint").textContent, all: withUnit(100e12), part: withUnit(40e12), rest: withUnit(60e12) })"""
+           usage: (renderUsage(), $("#u-pill").textContent),
+           all: fmtFlops(100e12), allUnit: withUnit(100e12), part: withUnit(5e12) })"""
     phases = [
         {"routes": {}},
-        # everything was earned at a 0% split; the account's split is 100% now
         {"routes": {}, "probe": probe, "run": """
-            state.user = { id: "u1", grant_split: 100 };
-            state.settings = { grant_split: 100 };
-            state.credits = { balance: 100e12, lifetime_earned: 100e12, lifetime_to_grants: 0,
-                              lifetime_kept: 100e12 };"""},
-        # dragging the slider previews the setting, not another history
+            state.user = { id: "u1" };
+            state.credits = { balance: 60e12, lifetime_earned: 100e12, pending_earnings: 0 };"""},
+        {"routes": {}, "probe": probe, "run": "state.credits.pending_earnings = 5e12;"},
+        # a pool from before the split was removed still reports it: nothing here reads it
         {"routes": {}, "probe": probe, "run": """
-            state.dragging.add("split"); $("#split").value = 40;      // the thumb, as the input event leaves it
-            state.settings.grant_split = 40;"""},
-        # a pool from before it reported these totals: an estimate, and labelled as one
-        {"routes": {}, "probe": probe, "run": """
-            state.dragging.clear();
-            state.user.grant_split = 40;
-            state.credits = { balance: 100e12, lifetime_earned: 100e12 };"""},
-        # signed out: the same estimate from this Mac's own work
+            state.user = { id: "u1", grant_split: 40 };
+            state.credits = { balance: 60e12, lifetime_earned: 100e12, lifetime_to_grants: 40e12,
+                              lifetime_kept: 60e12 };"""},
+        # signed out: an estimate from this Mac's own work
         {"routes": {}, "probe": probe, "run": """
             state.user = null; state.credits = null;
             state.ov = { me: { flops: 100e12 } };"""},
@@ -1033,24 +917,12 @@ def test_given_and_kept_totals_come_from_the_ledger_not_from_the_current_split(t
     (tmp_path / "phases.json").write_text(json.dumps(phases))
     out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
                          capture_output=True, text=True, timeout=30, check=True)
-    moved, dragging, older, signed_out = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
-    everything, part, rest = moved["all"], moved["part"], moved["rest"]
-
-    assert moved["grants"] == "0" and moved["earnedSub"] == f"On this account · you kept {everything}"
-    assert moved["grantsSub"] == "Given so far · 100% of new earnings"     # the setting, apart from the total
-    assert moved["pct"] == ["100%", "0%"]
-    assert moved["amounts"] == ["0 FLOPs so far", f"{everything} so far"]
-    assert "from now on" in moved["hint"]
-
-    assert dragging["pct"] == ["40%", "60%"] and dragging["grantsSub"] == "Given so far · 40% of new earnings"
-    assert (dragging["grants"], dragging["earnedSub"], dragging["amounts"]) == \
-        (moved["grants"], moved["earnedSub"], moved["amounts"])
-
-    assert older["grantsSub"] == "Estimated · 40% of what you earn"
-    assert older["amounts"] == [f"≈ {part}", f"≈ {rest}"]
-    assert older["earnedSub"] == f"On this account · you keep ≈ {rest}"
-    assert signed_out["grantsSub"] == "Estimated · 40% of what you earn"
-    assert signed_out["earnedSub"] == f"Estimated · you keep {rest}" and signed_out["amounts"] == older["amounts"]
+    paid, pending, older, signed_out = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    assert paid["earned"] == paid["all"] and paid["earnedSub"] == "On this account · 1:1 with FLOPs"
+    assert pending["earnedSub"] == f"On this account · {pending['part']} more pending checks"
+    assert (older["earned"], older["earnedSub"]) == (paid["earned"], paid["earnedSub"])
+    assert signed_out["earned"] == paid["all"] and signed_out["earnedSub"] == "Estimated from this Mac's work"
+    assert signed_out["usage"] == f"≈ {signed_out['allUnit']} to spend"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
@@ -1187,68 +1059,6 @@ def test_sign_out_shows_the_sign_in_button_again(tmp_path):
     assert probes[1] == [None, 0, False, "Sign in with Google"]
 
 
-def test_live_grants_flow(tmp_path):
-    T = 1e12
-    app, launcher, _ = _shell(tmp_path, http=GrantHTTP())
-    launcher.save_settings(LauncherSettings(mode="host"))
-    with TestClient(app, base_url=SHELL) as c:
-        board = c.get("/api/grants?sort=top").json()
-        assert board["sample"] is False and board["online"] is True
-        assert board["grants"][0]["summary"].startswith("Need FLOPs")
-        assert board["grants"][0]["goal"] == 50e12
-        assert board["pending"][0]["title"] == "Waiting"
-        assert board["leaders"][0]["name"] == "Ada"
-        assert board["available"] == 80e12
-
-        funded = c.post("/api/grants/g1/fund", json={"amount": 10 * T})
-        assert funded.status_code == 200, funded.text
-        assert funded.json()["pledged"] == 10 * T
-        assert funded.json()["grants"][0]["raised"] == 20e12
-
-        made = c.post("/api/grants", json={
-            "title": "Lecture notes",
-            "summary": "Fine-tune a helper on my course notes for first years.",
-            "goal": 50 * T,
-        })
-        assert made.status_code == 200, made.text
-        assert any(g["title"] == "Lecture notes" for g in made.json()["pending"])
-        assert c.post("/api/grants", json={"title": "", "summary": "x", "goal": 1}).status_code == 400
-        assert c.post("/api/grants", json={"title": "t", "summary": "x",
-                                           "goal": "1e309"}).status_code == 400
-        assert c.post("/api/grants/g1/fund", json={"amount": "nan"}).status_code == 400
-
-        approved = c.post("/api/grants/g2/review", json={"approve": True}).json()
-        assert any(g["id"] == "g2" for g in approved["grants"])
-        again = c.post("/api/grants/g2/review", json={"approve": True})
-        assert again.status_code == 400
-        # bool("false") is True: the shell used to forward this as an approval.
-        assert c.post("/api/grants/g3/review", json={"approve": "yes"}).status_code == 400
-        declined = c.post("/api/grants/g3/review", json={"approve": "false"})
-        assert declined.status_code == 200, declined.text
-        assert all(g["id"] != "g3" for g in declined.json()["grants"])
-
-
-def test_grant_amounts_must_be_positive_and_finite(tmp_path):
-    http = GrantHTTP()
-    app, launcher, _ = _shell(tmp_path, http=http)
-    launcher.save_settings(LauncherSettings(mode="host"))
-    summary = "Fine-tune a helper on my course notes for first years."
-    with TestClient(app, base_url=SHELL) as c:
-        # Raw bodies: the JSON spec has no NaN/Infinity, but Python's parser (and float("inf")) accepts them.
-        for bad in ("NaN", "Infinity", "-Infinity", "0", "-5", '"nan"', '"inf"', '"1e999"'):
-            made = c.post("/api/grants", content=f'{{"title": "Lecture notes", "summary": "{summary}", '
-                                                 f'"goal": {bad}}}',
-                          headers={"content-type": "application/json"})
-            assert made.status_code == 400, (bad, made.text)
-            assert "finite" in made.json()["detail"]
-            funded = c.post("/api/grants/g1/fund", content=f'{{"amount": {bad}}}',
-                            headers={"content-type": "application/json"})
-            assert funded.status_code == 400, (bad, funded.text)
-        assert c.post("/api/grants/g1/fund", json={"amount": "lots"}).status_code == 400
-        assert c.get("/api/grants").status_code == 200
-    assert len(http.grants) == 2 and http.donated == 0.0
-
-
 def test_non_finite_settings_are_clamped_not_500(tmp_path):
     app, _, _ = _shell(tmp_path)
     with TestClient(app, base_url=SHELL) as c:
@@ -1257,8 +1067,8 @@ def test_non_finite_settings_are_clamped_not_500(tmp_path):
                    headers={"content-type": "application/json"})
     assert r.status_code == 200, r.text
     body = r.json()
-    assert (body["gpu_percent"], body["grant_split"], body["memory_gb"], body["inference_memory_gb"]) == \
-        (50, 0, 0, 0)
+    assert (body["gpu_percent"], body["memory_gb"], body["inference_memory_gb"]) == (50, 0, 0)
+    assert "grant_split" not in body
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")

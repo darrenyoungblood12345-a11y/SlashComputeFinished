@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import math
 import os
 import time
 import traceback
@@ -29,20 +28,18 @@ from starlette.requests import ClientDisconnect
 from slashcompute.common.config import (
     DEMO_MODEL_CANDIDATES, DEV_MODEL, google_client_id, google_client_secret,
 )
-from slashcompute.common.jsonbool import body_bool
 from slashcompute.launcher.controller import (
     FINISHES, INFERENCE_SETTINGS, OUTDATED_COORDINATOR, Launcher, LauncherError, LauncherSettings,
     SettingsEdit, supports_inference,
 )
 from slashcompute.launcher.dashboard import POOL_LISTS, PoolData, fresh_pool, overview
-from slashcompute.web import sample_grants
 from slashcompute.web.google_sign_in import SignInError, SignIns, exchange_code, result_page
 
 STATIC = Path(__file__).resolve().parent / "static"
 SHELL_HOST = os.environ.get("SLASHCOMPUTE_SHELL_HOST", "127.0.0.1")
 SHELL_PORT = int(os.environ.get("SLASHCOMPUTE_SHELL_PORT", "8766"))
 # Bump when the shell changes: a running older shell is then replaced instead of reused.
-SHELL_GENERATION = 11
+SHELL_GENERATION = 12
 MODELS = [DEV_MODEL, *DEMO_MODEL_CANDIDATES]
 SESSION_COOKIE = "slashcompute_session"
 # Coordinator routes whose 200 carries a freshly issued session token, and the one that says whose it is.
@@ -50,7 +47,6 @@ SIGN_IN_ROUTES = frozenset({"auth/google"})
 ME_ROUTE = "auth/me"
 NO_COORDINATOR = "No coordinator URL. Host or enter one, then Start."
 _PROXY_BLOCK = {"verify"}
-_SORTS = ("top", "trending", "least")
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _SESSION_FIELDS = frozenset({"session_token", "session_url"})
@@ -262,40 +258,6 @@ async def _drain(request: Request, limit: int = DRAIN_LIMIT) -> None:
             taken += len(chunk)
             if taken >= limit:
                 break
-
-
-def _grant_card(row: dict) -> dict:
-    goal = float(row.get("goal_flops") or row.get("goal") or 0)
-    raised = float(row.get("received_flops") or row.get("raised") or 0)
-    progress = float(row.get("progress") or 0)
-    if not progress and goal:
-        progress = raised / goal
-    return {
-        "id": row.get("id"),
-        "title": row.get("title", ""),
-        "author": row.get("author", ""),
-        "summary": row.get("body") or row.get("summary") or "",
-        "goal": goal,
-        "raised": raised,
-        "progress": progress,
-        "remaining": max(0.0, goal - raised),
-        "backers": int(row.get("backers") or 0),
-        "tag": str(row.get("status") or "approved"),
-        "status": row.get("status", "approved"),
-    }
-
-
-def _sample_board(sort: str, *, online: bool, share: float = 0.0,
-                  available: Optional[float] = None, pledged: float = 0.0,
-                  leaders: Optional[list] = None) -> dict:
-    mode = sort if sort in _SORTS else "top"
-    board = sample_grants.board(sample_grants.sample_book(), mode, share)
-    board["online"] = online
-    board["leaders"] = leaders or []
-    board["pledged"] = pledged
-    if available is not None:
-        board["available"] = available
-    return board
 
 
 def _stateless_async_client() -> httpx.AsyncClient:
@@ -658,135 +620,7 @@ def create_shell(launcher: Optional[Launcher] = None,
         app.state.pool, app.state.pool_url = pool, url
         status = {**asdict(snap), **shown(s), **instance(), "coordinator_url": coordinator_url,
                   "models": MODELS, "public_url": launch.cfg.public_url or ""}
-        return overview(status, pool, my_id, s.grant_split)
-
-    # ------------------------------------------------------------ live grants
-
-    def amount(value) -> float:
-        try:
-            v = float(value)
-        except (TypeError, ValueError):
-            raise HTTPException(400, "Enter a number.") from None
-        # float() takes "NaN"/"Infinity", which would reach the coordinator as non-standard JSON.
-        if not math.isfinite(v) or v <= 0:
-            raise HTTPException(400, "Enter a positive, finite number.")
-        return v
-
-    def coord_call(request: Request, method: str, path: str, *,
-                   params: Optional[dict] = None, payload: Optional[dict] = None,
-                   required: bool = True):
-        s = launch.load_settings()
-        base = launch.proxy_url(s)
-        if not base:
-            if required:
-                raise HTTPException(503, NO_COORDINATOR)
-            return None
-        url = f"{base.rstrip('/')}/{path.lstrip('/')}"
-        headers = fwd(request, s)
-        try:
-            if method == "GET":
-                r = launch._http.get(url, params=params or None,
-                                     headers=headers or None, timeout=30.0)
-            else:
-                body = json.dumps(payload or {}).encode()
-                fwd_headers = dict(headers)
-                fwd_headers["content-type"] = "application/json"
-                r = launch._http.post(url, content=body, headers=fwd_headers, timeout=30.0)
-        except httpx.InvalidURL as e:
-            if required:
-                raise HTTPException(400, f"Invalid coordinator address {base}: {e}") from e
-            return None
-        except (httpx.RequestError, ConnectionError, OSError) as e:
-            if required:
-                raise HTTPException(502, f"Coordinator unreachable at {base}: {e}") from e
-            return None
-        if r.status_code >= 400:
-            if required:
-                raise HTTPException(r.status_code, _coord_detail(r))
-            return None
-        try:
-            return r.json()
-        except Exception:
-            return None
-
-    def grant_board(request: Request, sort: str = "top") -> dict:
-        mode = sort if sort in _SORTS else "top"
-        rows = coord_call(request, "GET", "/grants", params={"sort": mode}, required=False)
-        if rows is None:
-            return _sample_board(mode, online=False, available=0.0)
-        if not isinstance(rows, list):
-            rows = []
-        cards = [_grant_card(g) for g in rows if isinstance(g, dict)]
-        approved = [g for g in cards if g["status"] == "approved"]
-        pending = [g for g in cards if g["status"] == "pending"]
-        me = coord_call(request, "GET", "/auth/me", required=False) or {}
-        user = me.get("user") if isinstance(me, dict) else None
-        credits = me.get("credits") if isinstance(me, dict) else None
-        available = float((credits or {}).get("balance") or 0)
-        pledged = 0.0
-        txns = coord_call(request, "GET", "/credits/transactions",
-                          params={"limit": 50}, required=False)
-        if isinstance(txns, dict):
-            pledged = sum(
-                abs(float(t.get("amount") or 0))
-                for t in txns.get("items") or []
-                if t.get("kind") == "donate"
-            )
-        raw_leaders = coord_call(request, "GET", "/community/leaderboard", required=False)
-        me_id = user.get("id") if isinstance(user, dict) else None
-        leaders = []
-        if isinstance(raw_leaders, list):
-            for i, row in enumerate(raw_leaders, 1):
-                if not isinstance(row, dict):
-                    continue
-                leaders.append({
-                    "rank": i,
-                    "user_id": row.get("user_id"),
-                    "name": row.get("name", ""),
-                    "flops": float(row.get("lifetime_earned") or 0),
-                    "is_me": bool(me_id and row.get("user_id") == me_id),
-                })
-        share = float((user or {}).get("grant_split") or 0)
-        if not approved and not pending:
-            return _sample_board(mode, online=True, share=share, available=available,
-                                 pledged=pledged, leaders=leaders)
-        return {
-            "sample": False, "online": True,
-            "grants": approved, "pending": pending,
-            "pledged": pledged, "starter": 0.0,
-            "share": share,
-            "available": available, "leaders": leaders,
-        }
-
-    @app.get("/api/grants")
-    def list_grants(request: Request, sort: str = "top"):
-        return grant_board(request, sort)
-
-    @app.post("/api/grants")
-    def request_grant(body: dict, request: Request):
-        goal = amount(body.get("goal"))
-        coord_call(request, "POST", "/grants", payload={
-            "title": str(body.get("title", "")),
-            "body": str(body.get("summary", "") or body.get("body", "")),
-            "goal_flops": goal,
-        })
-        return grant_board(request, str(body.get("sort", "top")))
-
-    @app.post("/api/grants/{grant_id}/fund")
-    def fund_grant(grant_id: str, body: dict, request: Request):
-        coord_call(request, "POST", f"/grants/{grant_id}/donate", payload={
-            "flops": amount(body.get("amount") if body.get("amount") is not None
-                            else body.get("flops")),
-        })
-        return grant_board(request, str(body.get("sort", "top")))
-
-    @app.post("/api/grants/{grant_id}/review")
-    def review_grant(grant_id: str, body: dict, request: Request):
-        coord_call(request, "POST", f"/admin/grants/{grant_id}/review", payload={
-            "approve": body_bool(body, "approve"),
-            "note": body.get("note"),
-        })
-        return grant_board(request, str(body.get("sort", "top")))
+        return overview(status, pool, my_id)
 
     @app.post("/api/discover")
     def discover():

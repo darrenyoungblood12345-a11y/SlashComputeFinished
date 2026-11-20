@@ -21,9 +21,8 @@
       <nav class="nav" role="tablist" aria-label="Sections">
         <button class="nav-item is-on" data-tab="contributions" role="tab"><span class="num">01</span>Contributions</button>
         <button class="nav-item" data-tab="usage" role="tab"><span class="num">02</span>Usage</button>
-        <button class="nav-item" data-tab="grants" role="tab"><span class="num">03</span>Grants</button>
-        <button class="nav-item" data-tab="pool" role="tab"><span class="num">04</span>Pool</button>
-        <button class="nav-item" data-tab="llm" role="tab"><span class="num">05</span>LLMs</button>
+        <button class="nav-item" data-tab="pool" role="tab"><span class="num">03</span>Pool</button>
+        <button class="nav-item" data-tab="llm" role="tab"><span class="num">04</span>LLMs</button>
       </nav>
 
       <div class="side-account" id="acct">
@@ -61,7 +60,7 @@
           <span class="tag" id="c-pill">Not contributing</span>
         </header>
 
-        <div class="grid tiles">
+        <div class="grid three">
           <article class="card tile">
             <label>FLOPs given</label>
             <strong id="c-flops">0</strong>
@@ -72,11 +71,6 @@
             <label>Credits earned</label>
             <strong id="c-earned">0</strong>
             <small id="c-earned-sub"></small>
-          </article>
-          <article class="card tile">
-            <label>To grants</label>
-            <strong class="hot" id="c-grants">0</strong>
-            <small id="c-grants-sub"></small>
           </article>
           <article class="card tile">
             <label>Your rank</label>
@@ -104,22 +98,23 @@
             <button type="button" class="btn primary block" id="c-toggle" data-act="toggle-contribute">Start contributing</button>
           </article>
 
-          <article class="card">
-            <header class="card-head"><h2>Credit split</h2></header>
-            <p class="muted">Choose how much of what you earn goes to community grants.</p>
-            <div class="split">
-              <div><label>To grants</label><strong class="hot" id="split-grants">0%</strong><small id="split-grants-amt"></small></div>
-              <div class="right"><label>You keep</label><strong class="sig" id="split-keep">100%</strong><small id="split-keep-amt"></small></div>
-            </div>
-            <input type="range" class="split-range" id="split" min="0" max="100" value="0" aria-label="Share of credits given to grants" disabled>
-            <p class="hint" id="split-hint">Credits are 1:1 with FLOPs. Sign in so this split is saved on your account.</p>
-            <ul class="terms">
-              <li>Runs in the background at the GPU share you choose, only while contributing is on.</li>
-              <li>Only predefined job types run. Nobody can send your Mac arbitrary code.</li>
-              <li>Every step is metered in FLOPs and spot-checked by other Macs. Disputed work earns nothing.</li>
-              <li>Stop whenever you like. The current step finishes, then your Mac is released.</li>
-            </ul>
-          </article>
+          <div class="stack">
+            <article class="card">
+              <header class="card-head"><h2>Top contributors</h2></header>
+              <p class="muted">Accounts ranked by FLOPs earned on this coordinator.</p>
+              <ol class="leaders" id="leaders"></ol>
+            </article>
+            <article class="card">
+              <header class="card-head"><h2>How contributing works</h2></header>
+              <p class="muted">Credits are 1:1 with FLOPs, and everything this Mac earns is yours.</p>
+              <ul class="terms">
+                <li>Runs in the background at the GPU share you choose, only while contributing is on.</li>
+                <li>Only predefined job types run. Nobody can send your Mac arbitrary code.</li>
+                <li>Every step is metered in FLOPs and spot-checked by other Macs. Disputed work earns nothing.</li>
+                <li>Stop whenever you like. The current step finishes, then your Mac is released.</li>
+              </ul>
+            </article>
+          </div>
         </div>
       </section>
 
@@ -172,63 +167,6 @@
           <article class="card">
             <header class="card-head"><h2>Jobs</h2><span class="tag" id="u-count">0</span></header>
             <div class="list" id="jobs"></div>
-          </article>
-        </div>
-      </section>
-
-      <!-- ============================================================ GRANTS -->
-      <section class="view" id="view-grants">
-        <header class="view-head">
-          <div>
-            <h1>Grants</h1>
-            <p>Community requests for compute. Back a project with your grant credits, or ask for help with yours.</p>
-          </div>
-          <span class="tag" id="g-pill">Live</span>
-        </header>
-
-        <div class="toolbar">
-          <div class="seg" id="g-sort" role="tablist" aria-label="Sort grants">
-            <button type="button" data-sort="top" class="is-on">Top</button>
-            <button type="button" data-sort="trending">Trending</button>
-            <button type="button" data-sort="least">Least funded</button>
-          </div>
-          <div class="toolbar-right">
-            <button type="button" class="btn primary" data-act="toggle-request">Request a grant</button>
-          </div>
-        </div>
-
-        <div class="grid three">
-          <article class="card tile"><label>Your grant credits</label><strong class="hot" id="g-avail">0</strong><small id="g-avail-sub"></small></article>
-          <article class="card tile"><label>You've pledged</label><strong id="g-pledged">0</strong><small>across all grants</small></article>
-          <article class="card tile"><label>Open grants</label><strong id="g-open">0</strong><small id="g-open-sub"></small></article>
-        </div>
-
-        <article class="card form-card" id="g-request" hidden>
-          <header class="card-head"><h2>Request a grant</h2></header>
-          <p class="muted">Describe what the compute is for. An admin reviews every request before it goes public.</p>
-          <form id="grant-form" novalidate>
-            <div class="field"><label for="g-title">Title</label><input type="text" id="g-title" maxlength="80"></div>
-            <div class="field"><label for="g-summary">What it's for</label><textarea id="g-summary" rows="3" maxlength="400"></textarea></div>
-            <div class="field narrow"><label for="g-goal">Goal (TFLOPs)</label><input type="number" id="g-goal" min="1" value="300"></div>
-            <p class="msg" id="g-msg"></p>
-            <div class="btn-row">
-              <button type="submit" class="btn primary">Submit for review</button>
-              <button type="button" class="btn ghost" data-act="toggle-request">Cancel</button>
-            </div>
-          </form>
-        </article>
-
-        <article class="card" id="g-review" hidden>
-          <header class="card-head"><h2>Waiting for review</h2><span class="tag hot" id="g-review-count">0</span></header>
-          <div class="list" id="g-pending"></div>
-        </article>
-
-        <div class="grid split-3-2 top">
-          <div class="stack" id="g-list"></div>
-          <article class="card">
-            <header class="card-head"><h2>Top contributors</h2></header>
-            <p class="muted">Accounts ranked by FLOPs earned on this coordinator.</p>
-            <ol class="leaders" id="leaders"></ol>
           </article>
         </div>
       </section>

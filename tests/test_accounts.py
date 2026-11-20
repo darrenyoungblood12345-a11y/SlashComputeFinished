@@ -6,6 +6,7 @@ earlier can be written back over what the account has become since.
 
 from __future__ import annotations
 
+import sqlite3
 import time
 
 import jwt
@@ -17,6 +18,7 @@ from accounts import GOOGLE_CLIENT_ID, fake_google, http_sign_in, id_token, sign
 from slashcompute.common.config import WELCOME_FLOPS, EngineConfig
 from slashcompute.community import auth as auth_module
 from slashcompute.community.auth import Auth, AuthError, verify_google_id_token
+from slashcompute.community.credits import POT_ID, Credits
 from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
 from slashcompute.coordinator.db import Database, SessionRow, User
@@ -217,11 +219,59 @@ def test_upgrading_ends_every_session_a_password_opened(tmp_path):
     assert auth.user_count() == 3                           # the accounts and what they hold stay
 
 
+def test_a_pool_from_when_there_were_grants_opens_with_its_balances(tmp_path):
+    """Grants are gone, and so is the share of earnings an account could send to the community
+    pot. A pool's database from before still has their tables, columns and ledger rows: it
+    opens, nobody's balance moves, and what is earned from now on is all the earner's."""
+    path = tmp_path / "coordinator.db"
+    Database(path)
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            CREATE TABLE grants (
+                id VARCHAR PRIMARY KEY, author_id VARCHAR NOT NULL, title VARCHAR NOT NULL,
+                body VARCHAR NOT NULL, goal_flops FLOAT NOT NULL, received_flops FLOAT NOT NULL,
+                status VARCHAR NOT NULL, created_at FLOAT NOT NULL);
+            CREATE TABLE grant_comments (
+                id INTEGER PRIMARY KEY, grant_id VARCHAR NOT NULL, user_id VARCHAR NOT NULL,
+                body VARCHAR NOT NULL, created_at FLOAT NOT NULL);
+            ALTER TABLE credit_txns ADD COLUMN grant_id VARCHAR;
+            CREATE INDEX ix_credit_txns_grant ON credit_txns (grant_id) WHERE grant_id IS NOT NULL;
+            INSERT INTO users (id, email, password_hash, name, admin, banned, flagged, grant_split, created_at)
+            VALUES ('donor', 'd@lan.test', '', 'Donor', 1, 0, 0, 40, 1.0),
+                   ('author', 'a@lan.test', '', 'Author', 0, 0, 0, 0, 1.0);
+            INSERT INTO grants VALUES ('g1', 'author', 'Need compute', 'For a parser.', 100.0, 30.0, 'approved', 1.0);
+            INSERT INTO grant_comments VALUES (1, 'g1', 'donor', 'good luck', 2.0);
+            INSERT INTO credit_txns (user_id, kind, amount, grant_id, note, created_at)
+            VALUES ('donor', 'generated', 100.0, NULL, NULL, 1.0),
+                   ('donor', 'earn', 60.0, NULL, NULL, 1.0),
+                   ('__pot__', 'earn', 40.0, NULL, 'tithe from donor', 1.0),
+                   ('donor', 'donate', -20.0, 'g1', NULL, 2.0),
+                   ('author', 'receive', 20.0, 'g1', NULL, 2.0),
+                   ('__pot__', 'allocate', -10.0, 'g1', NULL, 3.0),
+                   ('author', 'receive', 10.0, 'g1', NULL, 3.0);
+        """)
+
+    db = Database(path)                                     # the new version opens the same file
+    auth, credits = Auth(db), Credits(db)
+    assert (credits.balance("donor"), credits.balance("author"), credits.balance(POT_ID)) == (40.0, 30.0, 30.0)
+    assert credits.lifetime_earned("donor") == 100.0
+    assert [t["kind"] for t in credits.list_txns("donor")["items"]] == ["donate", "earn", "generated"]
+
+    credits.credit_host("donor", 50.0)                      # the 40% it once chose no longer applies
+    assert (credits.balance("donor"), credits.balance(POT_ID)) == (90.0, 30.0)
+    newcomer, token = sign_in(auth, "new@lan.test", "New")  # an account made now fits the old table
+    assert auth.session_user(token).id == newcomer.id and auth.user_count() == 3
+    assert "grant_split" not in auth.public_view(auth.get("donor"))
+    with sqlite3.connect(path) as conn:                     # nothing of the old pool was deleted
+        assert conn.execute("SELECT count(*) FROM grants").fetchone() == (1,)
+        assert conn.execute("SELECT count(*) FROM grant_comments").fetchone() == (1,)
+
+
 def test_google_sign_in_takes_over_the_account_holding_its_email(core):
     """Hermes scan google-password-account-preclaim-0002: someone registers the victim's address
     before the victim arrives, and kept access next to them afterwards."""
     squatter, squatter_token = _password_account(core.db, "victim@lan.test")
-    core.credits.contribute(squatter.id, 500.0, 0)
+    core.credits.contribute(squatter.id, 500.0)
 
     owner, token = sign_in(core.auth, "victim@lan.test", "Vic", sub="sub-victim")
     assert owner.id == squatter.id and owner.google_sub == "sub-victim"
@@ -283,12 +333,12 @@ def test_a_request_holding_an_old_copy_cannot_undo_what_happened_since(core):
     sign_in(core.auth, "victim@lan.test", sub="sub-new")     # the account changes hands
     core.auth.set_banned(user, True)                         # and is banned
 
-    core.auth.update_profile(stale, name="Renamed", grant_split=10, bio="hi")
+    core.auth.update_profile(stale, name="Renamed", bio="hi")
     core.auth.accept_terms(stale)
-    core.grants.flag_user(admin, stale, "spam")
+    core.auth.flag_user(admin, stale, "spam")
     now = core.auth.get(user.id)
     assert (now.google_sub, now.banned) == ("sub-new", True)
-    assert (now.name, now.grant_split, now.bio, now.flagged) == ("Renamed", 10, "hi", True)
+    assert (now.name, now.bio, now.flagged) == ("Renamed", "hi", True)
     assert now.accepted_terms_at is not None
 
 
@@ -326,8 +376,8 @@ def test_http_sign_in_cookie_me_and_sign_out(env):
     me = client.get("/auth/me", headers=_hdr(body["token"])).json()
     assert me["user"]["email"] == "ada@lan.test"
     assert me["credits"]["balance"] == WELCOME_FLOPS
-    patched = client.patch("/auth/me", json={"grant_split": 33}, headers=_hdr(body["token"]))
-    assert patched.json()["user"]["grant_split"] == 33
+    patched = client.patch("/auth/me", json={"bio": "hello"}, headers=_hdr(body["token"]))
+    assert patched.json()["user"]["bio"] == "hello"
     client.post("/auth/logout")
     assert client.get("/auth/me").json()["user"] is None
     # The same token again: its nonce is spent.

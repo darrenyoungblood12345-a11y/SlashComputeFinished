@@ -2,7 +2,7 @@
 
 Pooling engine: pipeline-parallel LoRA fine-tunes across Apple Silicon Macs on a LAN. Contributors run a headless agent; one coordinator schedules stages, records usage, and checks work.
 
-Accounts are Google accounts, with credits and grants kept per pool; see [docs/google-sign-in.md](docs/google-sign-in.md) for how sign-in works and how to set it up.
+Accounts are Google accounts, with credits kept per pool; see [docs/google-sign-in.md](docs/google-sign-in.md) for how sign-in works and how to set it up.
 
 ## Install
 

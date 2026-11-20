@@ -1,3 +1,39 @@
+# Remove grants and the credit split
+
+Base: SlashComputeFinished main at 6c1f808. Branch: claude/remove-grants-feature-6a8611.
+Plan: `/Users/darren/.claude/plans/can-you-remove-the-calm-kettle.md`. Baseline: 764 passed.
+
+- [x] Account moderation (`flag_user`, `list_flags`) moved from `Grants` into `Auth`; the admin flag
+      routes are unchanged
+- [x] Grants are gone: `community/grants.py`, `web/sample_grants.py`, the coordinator's `/grants*` and
+      `/admin/grants/*` routes, the shell's `/api/grants*` routes, the `Grant` / `GrantComment` models,
+      `Credits.donate` / `allocate_pot`, `CreditTxn.grant_id`
+- [x] The credit split is gone: every earning (a training step's hold, LLM hosting, `contribute`) is the
+      earner's in full; no `grant_split` in the profile, the account's public view, the launcher settings
+      or the overview; the summary no longer reports `lifetime_to_grants` / `lifetime_kept`
+- [x] App: four tabs (Contributions, Usage, Pool, LLMs); Top contributors moved to Contributions, fed by
+      `/community/leaderboard` through the coordinator proxy, with the overview's ranking of the pool's Macs
+      as the fallback; shell generation 12
+- [x] Kept on purpose: the `users.grant_split` column (old databases have it NOT NULL), the `donate` /
+      `receive` / `allocate` balance kinds (old ledgers hold such rows), the community pot for a share no
+      host may earn. Old `grants` / `grant_comments` tables are left in place, unread
+- [x] Tests: grants cases removed; new ones for a pre-removal database (opens, balances unchanged, new
+      sign-in, full payout), the removed routes (404), legacy `grant_split` in a settings file and in
+      request bodies, the leaderboard on Contributions
+- [x] README, docs/google-sign-in.md, terms text
+- [ ] Rebuild + reinstall the app (the installed one still carries the old shell)
+- [ ] PR to SlashComputeFinished
+
+## Results
+
+Full suite: 739 passed, 0 failed (764 at base; the grants and split tests are gone, new ones for what
+replaced them in their place). `node --check` on app.js and `uv build` pass.
+
+Checked in a browser against a throwaway pool (real coordinator and shell on spare loopback ports, three
+seeded accounts, one of them stored with a 40% split): four tabs, three tiles and the leaderboard on
+Contributions with the signed-in account marked, no split slider, no console errors, no request to
+`/api/grants`, no sideways scroll at 375 px.
+
 # Hermes scan bugs (payout before verification, password account preclaim) and Google-only accounts
 
 Base: SlashComputeFinished main at 9994123 (the commit Hermes scanned). Branch: claude/hermes-bugs-google-auth-bef01f.
