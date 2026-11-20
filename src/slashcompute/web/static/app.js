@@ -3,16 +3,16 @@
 
 const T = 1e12;
 const SETTING_KEYS = [
-  "mode", "url", "gpu_percent", "contribute", "finish", "session_token", "grant_split",
+  "mode", "url", "gpu_percent", "contribute", "finish", "session_token",
   "training", "memory_gb", "inference", "inference_memory_gb", "inference_head", "models_dir", "transport",
 ];
 const GIB = 1024 ** 3;
-const GRANTS_REFRESH_MS = 20000;
+const LEADERS_REFRESH_MS = 20000;
 const POLL_MS = 2000;
 const API_TIMEOUT_MS = 20000;       // polls: a hung one must not hold up the next
 const ACTION_TIMEOUT_MS = 120000;   // starts, stops, saves: the controller may wait on a process
 // Reads made every poll or on a timer; everything else is an action (or the dataset upload).
-const POLL_PATHS = ["/api/overview", "/api/grants", "/api/coord/auth/me", "/api/coord/auth/terms", "/api/status", "/inference/status", "/v1/models"];
+const POLL_PATHS = ["/api/overview", "/api/coord/community/leaderboard", "/api/coord/auth/me", "/api/coord/auth/terms", "/api/status", "/inference/status", "/v1/models"];
 const MAX_UPLOAD_GIB = 64;          // the shell refuses a bigger GGUF: no Mac pool loads one
 const RATE_WINDOW = 5;          // polls averaged into the "now" rate
 const OUTDATED_COORDINATOR = "This pool's coordinator has no LLM inference: it runs an older /compute. "
@@ -34,18 +34,12 @@ const state = {
   rates: [],
   last: null,
   rateKey: "",        // pool + node the FLOPs counter belongs to; a change restarts the samples
-  grants: null,
-  grantsUp: null,     // coordinator_up when the board was last loaded
-  grantsAt: 0,
-  grantsSeq: 0,
-  sort: "top",
-  admin: false,
-  fundOpen: null,
-  fundMsg: "",
+  leaders: null,      // the pool's accounts by FLOPs earned; null until it answers
+  leadersAt: 0,
+  leadersSeq: 0,
   busy: new Set(),
   dirty: { url: false, publicUrl: false },   // address fields being edited: polls leave them alone
   dragging: new Set(),                        // slider ids mid-drag: polls leave them alone
-  grantsWho: "",      // user id + admin flag the grant board was rendered for
   dataset: null,
   modelsShown: "",
   keys: {},
@@ -119,7 +113,6 @@ async function api(path, opts = {}) {
 }
 
 const post = (path, body) => api(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
-const patch = (path, body) => api(path, { method: "PATCH", body: JSON.stringify(body) });
 const signedIn = () => !!(state.user && state.user.id);
 // The controller's "Restarting the training agent / the LLM node after the current step finishes":
 // news that new settings are on their way, not a failure. Only the tone of a toast or the banner
@@ -247,37 +240,14 @@ const liveGpuPercent = () => status().agent_gpu_percent
   ?? (me().node || {}).gpu_percent ?? (state.settings || {}).gpu_percent ?? 0;
 
 function credits() {
-  const s = state.settings || {};
-  // Mid-drag the split under the thumb is the one on screen, before the account has saved it.
-  const split = Number(state.dragging.has("split") ? s.grant_split
-    : ((state.user && state.user.grant_split) ?? s.grant_split)) || 0;
-  if (state.credits) {
-    const earned = Math.max(0, Number(state.credits.lifetime_earned) || 0);
-    const balance = Math.max(0, Number(state.credits.balance) || 0);
+  if (!state.credits) return { earned: Math.max(0, Number(me().flops) || 0), balance: 0, pending: 0 };
+  return {
+    earned: Math.max(0, Number(state.credits.lifetime_earned) || 0),
+    balance: Math.max(0, Number(state.credits.balance) || 0),
     // Charged to jobs for this account's Macs but not paid yet: training pays once the checks
     // sampled from an epoch are in.
-    const pending = Math.max(0, Number(state.credits.pending_earnings) || 0);
-    // The split is applied as credits are earned, so what was given and kept is what the pool
-    // posted at the time. The split is only the setting for what comes next: multiplying lifetime
-    // earnings by it rewrote history each time the slider moved.
-    if (state.credits.lifetime_to_grants != null) {
-      const toGrants = Math.max(0, Number(state.credits.lifetime_to_grants) || 0);
-      const kept = Math.max(0, Number(state.credits.lifetime_kept ?? earned - toGrants) || 0);
-      return { earned, toGrants, kept, split, balance, pending, posted: true };
-    }
-    // A pool from before it reported those totals: an estimate, shown as one.
-    const toGrants = earned * split / 100;
-    return { earned, toGrants, kept: earned - toGrants, split, balance, pending, posted: false };
-  }
-  const earned = Math.max(0, Number(me().flops) || 0);
-  const toGrants = earned * split / 100;
-  return { earned, toGrants, kept: earned - toGrants, split, balance: 0, pending: 0, posted: false };
-}
-
-function grantBalance() {
-  if (state.credits) return Math.max(0, Number(state.credits.balance) || 0);
-  if (state.grants && state.grants.available != null) return Math.max(0, Number(state.grants.available) || 0);
-  return 0;
+    pending: Math.max(0, Number(state.credits.pending_earnings) || 0),
+  };
 }
 
 function agentActivity(st) {
@@ -327,13 +297,11 @@ function saveSettings(changes) {
 }
 
 // Settings from a poll replace ours only when no save began after the poll did and none is in
-// flight: the save's own answer is the newer truth. A split slider mid-drag keeps its value.
+// flight: the save's own answer is the newer truth.
 function applySettings(st, version) {
   if (!st) return;
   if (state.settings && (version !== state.settingsVersion || state.saving > 0)) return;
-  const next = pickSettings(st);
-  if (state.settings && state.dragging.has("split")) next.grant_split = state.settings.grant_split;
-  state.settings = next;
+  state.settings = pickSettings(st);
 }
 
 // ------------------------------------------------------------ polling
@@ -392,17 +360,8 @@ async function pollOnce() {
     state.ov = null;
     dropPool();
   }
-  // The board comes from the coordinator: reload it when the pool comes or goes,
-  // and now and then while the tab is open, so it never reads Live while offline.
-  const up = !!status().coordinator_up;
-  const stale = state.tab === "grants" && Date.now() - state.grantsAt > GRANTS_REFRESH_MS;
-  // It is also per account (pledges, the admin's review queue): a session that ended or began
-  // elsewhere redraws it at once and reloads it.
-  const who = `${(state.user || {}).id || ""}:${!!(state.user && state.user.admin)}`;
-  const whoChanged = who !== state.grantsWho;
-  state.grantsWho = who;
-  if (whoChanged && state.grants) renderGrants();
-  if (up !== state.grantsUp || stale || (whoChanged && up)) loadGrants(true);
+  // The leaderboard comes from the coordinator: asked when a pool comes up, then now and then.
+  if (status().coordinator_up && Date.now() - state.leadersAt > LEADERS_REFRESH_MS) loadLeaders();
   render();
 }
 
@@ -410,6 +369,8 @@ async function pollOnce() {
 function dropPool() {
   state.user = null;
   state.credits = null;
+  state.leaders = null;
+  state.leadersAt = 0;
   state.llm.net = null;
   state.llm.models = [];
   state.llm.error = "";
@@ -463,7 +424,7 @@ function render() {
   renderAuth();
   renderContributions();
   renderUsage();
-  renderGrantsLive();
+  renderLeaders();
   renderPool();
   renderLlm();
 }
@@ -471,7 +432,7 @@ function render() {
 // Nothing that saves a setting is usable before the first overview: there is nothing to merge into.
 function renderGate() {
   const locked = !state.settings;
-  $$("#gpu, #mem, #split, #l-mem, #l-dir, #p-mode button, #l-role button, #l-transport-seg button")
+  $$("#gpu, #mem, #l-mem, #l-dir, #p-mode button, #l-role button, #l-transport-seg button")
     .forEach((el) => { el.disabled = locked; });
 }
 
@@ -487,7 +448,6 @@ function showTab(name) {
   $$(".view").forEach((v) => v.classList.toggle("is-on", v.id === `view-${name}`));
   $("#main").scrollTop = 0;
   if (document.scrollingElement) document.scrollingElement.scrollTop = 0;   // narrow windows scroll the page itself
-  if (name === "grants") loadGrants();
   if (name === "llm" && status().coordinator_up) loadLlm().then(renderLlm);
 }
 
@@ -549,7 +509,6 @@ async function watchSignIn() {
     state.signingIn = 0;
     setMsg("#auth-msg", "", "");
     toast("Signed in.");
-    loadGrants();
     return;
   }
   let outcome = null;
@@ -596,13 +555,8 @@ function renderContributions() {
   sparkline($("#c-spark"), state.rates);
   setText("#c-earned", fmtFlops(c.earned));
   setText("#c-earned-sub", c.pending > 0 ? `On this account · ${withUnit(c.pending)} more pending checks`
-    : c.posted ? `On this account · you kept ${withUnit(c.kept)}`
-    : signedIn() ? `On this account · you keep ≈ ${withUnit(c.kept)}`
-    : `Estimated · you keep ${withUnit(c.kept)}`);
-  setText("#c-grants", fmtFlops(c.toGrants));
-  setText("#c-grants-sub", c.posted
-    ? `Given so far · ${c.split}% of new earnings`
-    : `Estimated · ${c.split}% of what you earn`);
+    : signedIn() ? "On this account · 1:1 with FLOPs"
+    : "Estimated from this Mac's work");
   setText("#c-rank", m.rank ? `#${m.rank}` : "—");
   setText("#c-rank-sub", m.rank ? `of ${plural(m.of, "Mac")} in the pool` : "Not ranked yet");
 
@@ -656,17 +610,6 @@ function renderContributions() {
     ? `Lending ${fmtBytes(lent)} now. A new amount applies next time you start.`
     : `Auto lends what is free when you start.${upTo()} More than is free makes macOS squeeze other apps.`);
 
-  const split = $("#split");
-  if (!state.dragging.has("split")) split.value = c.split;
-  rangeFill(split);
-  setText("#split-grants", `${split.value}%`);
-  setText("#split-keep", `${100 - split.value}%`);
-  setText("#split-grants-amt", c.posted ? `${withUnit(c.toGrants)} so far` : `≈ ${withUnit(c.toGrants)}`);
-  setText("#split-keep-amt", c.posted ? `${withUnit(c.kept)} so far` : `≈ ${withUnit(c.kept)}`);
-  setText("#split-hint", signedIn()
-    ? "Credits are 1:1 with FLOPs. This split is saved on your account and applies to what you earn from now on."
-    : "Credits are 1:1 with FLOPs. Sign in so this split is saved on your account.");
-
   const node = m.node;
   renderOnce("mac", [node, m.node_id], $("#c-mac"), () => node ? `
     <dl class="kv">
@@ -693,7 +636,7 @@ function renderUsage() {
   setText("#u-jobs-sub", `running · ${cap.waiting || 0} waiting`);
   setText("#u-pill", signedIn()
     ? `${withUnit(credits().balance)} available`
-    : `≈ ${withUnit(credits().kept)} to spend`);
+    : `≈ ${withUnit(credits().earned)} to spend`);
   $("#flop-budget").hidden = !signedIn();
   const minMacs = $("#min_stages");
   if ((state.settings || {}).mode === "public") {
@@ -801,40 +744,37 @@ function setMsg(sel, text, tone) {
   el.className = `msg ${tone || ""}`.trim();
 }
 
-// ------------------------------------------------------------ grants
+// ------------------------------------------------------------ leaderboard
 
-async function loadGrants(quiet = false) {
-  const seq = ++state.grantsSeq;
-  state.grantsUp = !!status().coordinator_up;
-  state.grantsAt = Date.now();
-  let board = null;
+async function loadLeaders() {
+  const seq = ++state.leadersSeq;
+  state.leadersAt = Date.now();
+  let rows = null;
   try {
-    board = await api(`/api/grants?sort=${encodeURIComponent(state.sort)}`);
+    rows = await api("/api/coord/community/leaderboard");
   } catch (e) {
-    if (!quiet) toast(e.message, "bad");
+    // A pool that does not answer keeps the overview's ranking of its Macs on screen.
   }
-  if (seq !== state.grantsSeq) return;
-  state.grants = board;
-  renderGrants();
-  renderGrantsLive();
+  if (seq !== state.leadersSeq) return;
+  state.leaders = Array.isArray(rows) ? rows : null;
+  renderLeaders();
 }
 
-function renderGrantsLive() {
-  const g = state.grants;
-  const bal = grantBalance();
-  setText("#g-avail", g || signedIn() ? fmtFlops(bal) : "—");
-  setText("#g-avail-sub", signedIn()
-    ? `${withUnit(credits().balance)} personal balance`
-    : "Sign in to fund grants with your credits.");
-  setText("#g-pledged", g ? fmtFlops(g.pledged) : "—");
-  setText("#g-open", g ? String(g.grants.length) : "—");
-  setText("#g-open-sub", g ? (g.sample ? "demo grants" : `${g.pending.length} waiting for review`) : "");
-  setTag("#g-pill", g && g.sample ? "Demo" : g && g.online ? "Live" : "Offline",
-    g && g.sample ? "line" : g && g.online ? "ok" : "");
+// Accounts by what they earned on this pool. Before the pool has answered (or when it has no
+// accounts yet), the overview's ranking of the pool's Macs stands in.
+function leaderRows() {
+  const myId = (state.user || {}).id;
+  const accounts = (state.leaders || []).filter((r) => r && typeof r === "object").map((r, i) => ({
+    rank: i + 1,
+    name: r.name || "",
+    flops: Number(r.lifetime_earned) || 0,
+    is_me: !!myId && r.user_id === myId,
+  }));
+  return accounts.length ? accounts : ((state.ov && state.ov.leaderboard) || []);
+}
 
-  const board = (g && g.leaders && g.leaders.length)
-    ? g.leaders
-    : ((state.ov && state.ov.leaderboard) || []);
+function renderLeaders() {
+  const board = leaderRows();
   const online = pool().online;
   renderOnce("leaders", [board, online], $("#leaders"), () => {
     if (!board.length) {
@@ -846,77 +786,6 @@ function renderGrantsLive() {
       <span class="flops">${esc(withUnit(r.flops))}</span>
     </li>`).join("");
   });
-}
-
-function renderGrants() {
-  const g = state.grants;
-  $$("#g-sort button").forEach((b) => b.classList.toggle("is-on", b.dataset.sort === state.sort));
-  const admin = !!(state.user && state.user.admin);
-  const online = !!(g && g.online);
-  const grants = g ? g.grants : [];
-  const pending = g ? g.pending : [];
-
-  // Rebuilding the cards would reset the pledge being typed: carry its value (and the focus) over.
-  const fund = state.fundOpen ? document.getElementById(`fund-${state.fundOpen}`) : null;
-  const typed = fund ? { id: fund.id, value: fund.value, focused: document.activeElement === fund } : null;
-  const rebuilt = renderOnce("grants", [grants, online, !!(g && g.sample), state.fundOpen, state.fundMsg], $("#g-list"), () => grants.length
-    ? grants.map(grantCard).join("")
-    : `<article class="card"><p class="empty">${online ? "No public grants yet." : "Start or join a pool to see live grants."}</p></article>`);
-  const again = rebuilt && typed ? document.getElementById(typed.id) : null;
-  if (again) {
-    again.value = typed.value;
-    if (typed.focused) again.focus();
-  }
-
-  if (!signedIn()) $("#g-request").hidden = true;   // the request form belongs to a session
-  $("#g-review").hidden = !admin || !!(g && g.sample);
-  setTag("#g-review-count", String(pending.length), pending.length ? "hot" : "");
-  renderOnce("pending", pending, $("#g-pending"), () => pending.length ? pending.map((p) => `<div class="pending">
-      <div class="top"><b>${esc(p.title)}</b><span class="muted">${esc(withUnit(p.goal))} goal</span></div>
-      <p class="hint">by ${esc(p.author)}</p>
-      <p class="summary">${esc(p.summary)}</p>
-      <div class="btn-row">
-        <button type="button" class="btn primary sm" data-review="${esc(p.id)}" data-approve="1">Approve</button>
-        <button type="button" class="btn danger sm" data-review="${esc(p.id)}" data-approve="">Decline</button>
-      </div>
-    </div>`).join("") : `<p class="empty">Nothing waiting for review.</p>`);
-}
-
-function grantCard(g) {
-  const funded = g.remaining <= 0;
-  const open = state.fundOpen === g.id;
-  const demo = !!(state.grants && state.grants.sample);
-  const actions = demo ? `<p class="hint">Demo grant — not spendable.</p>`
-    : open ? `
-      <input type="number" min="1" step="1" id="fund-${esc(g.id)}" value="${Math.max(1, Math.min(25, Math.floor(g.remaining / T)))}" aria-label="TFLOPs to pledge">
-      <span class="unit">TFLOPs</span>
-      <button type="button" class="btn primary sm" data-fund-go="${esc(g.id)}">Pledge</button>
-      <button type="button" class="btn ghost sm" data-fund-close>Cancel</button>`
-    : `<button type="button" class="btn ${funded ? "ghost" : "primary"} sm" data-fund-open="${esc(g.id)}" ${funded ? "disabled" : ""}>${funded ? "Funded" : "Fund this grant"}</button>`;
-  return `<article class="card grant">
-    <div class="top"><span class="tag line">${esc(g.tag)}</span><span class="hint">${plural(g.backers, "backer")}</span></div>
-    <h3>${esc(g.title)}</h3>
-    <p class="by">by ${esc(g.author)}</p>
-    <p class="summary">${esc(g.summary)}</p>
-    <div class="bar ${funded ? "done" : ""}"><i style="width:${(g.progress * 100).toFixed(1)}%"></i></div>
-    <div class="nums"><span>${esc(fmtFlops(g.raised))} of ${esc(withUnit(g.goal))}</span><span>${Math.round(g.progress * 100)}%</span></div>
-    <div class="actions">${actions}</div>
-    ${open && state.fundMsg ? `<p class="msg bad">${esc(state.fundMsg)}</p>` : ""}
-  </article>`;
-}
-
-async function grantAction(path, body, okText) {
-  state.grantsSeq += 1;   // a board load already in flight is older than this answer
-  try {
-    state.grants = await post(path, { ...body, sort: state.sort });
-    if (okText) toast(okText);
-    return true;
-  } catch (e) {
-    return e.message;
-  } finally {
-    renderGrants();
-    renderGrantsLive();
-  }
 }
 
 // ------------------------------------------------------------ pool
@@ -1812,21 +1681,9 @@ const actions = {
     state.credits = null;
     state.signingIn = 0;
     setMsg("#auth-msg", "", "");
-    // The grant board is per user (admin review queue, pledges): rebuild it
-    // so nothing from the old session stays on screen.
-    $("#g-request").hidden = true;
-    await loadGrants();
     if (remote) toast("Signed out.");
     else toast("Signed out on this Mac (the pool did not answer)", "bad");
   }),
-
-  "toggle-request": () => {
-    if (!signedIn()) return toast("Sign in to request a grant.", "bad");
-    const card = $("#g-request");
-    card.hidden = !card.hidden;
-    setMsg("#g-msg", "", "");
-    if (!card.hidden) $("#g-title").focus();
-  },
 };
 
 document.addEventListener("click", async (e) => {
@@ -1855,46 +1712,8 @@ document.addEventListener("click", async (e) => {
       : "Saved. Used next time this Mac hosts.");
     return renderLlm();
   }
-  if (d.sort) {
-    state.sort = d.sort;
-    return loadGrants();
-  }
   if (d.cancel) {
     return withBusy(`cancel-${d.cancel}`, el, "Cancelling…", () => post(`/api/coord/jobs/${encodeURIComponent(d.cancel)}/cancel`));
-  }
-  if (d.fundOpen) {
-    state.fundOpen = d.fundOpen;
-    state.fundMsg = "";
-    renderGrants();
-    const input = $(`#fund-${CSS.escape(d.fundOpen)}`);
-    if (input) input.focus();
-    return;
-  }
-  if ("fundClose" in d) {
-    state.fundOpen = null;
-    return renderGrants();
-  }
-  if ((d.fundGo || d.review) && state.grants && state.grants.sample) return;
-  if (d.fundGo) {
-    const input = $(`#fund-${CSS.escape(d.fundGo)}`);
-    const tflops = Number(input ? input.value : 0);
-    const grant = state.grants.grants.find((g) => g.id === d.fundGo);
-    // Busy per grant: a double-click must not pledge twice.
-    return withBusy(`fund-${d.fundGo}`, el, "Pledging…", async () => {
-      const res = await grantAction(`/api/grants/${encodeURIComponent(d.fundGo)}/fund`,
-        { amount: tflops * T }, `Pledged ${withUnit(tflops * T)} to ${grant ? grant.title : "the grant"}`);
-      state.fundMsg = res === true ? "" : res;
-      if (res === true) state.fundOpen = null;
-      renderGrants();
-    });
-  }
-  if (d.review) {
-    const approve = !!d.approve;
-    return withBusy(`review-${d.review}`, el, approve ? "Approving…" : "Declining…", async () => {
-      const res = await grantAction(`/api/grants/${encodeURIComponent(d.review)}/review`, { approve },
-        approve ? "Approved. It's public now." : "Declined.");
-      if (res !== true) toast(res, "bad");
-    });
   }
 });
 
@@ -1920,7 +1739,7 @@ function bindSlider(el, onInput, onChange) {
     const wandered = moved;
     moved = false;
     state.dragging.delete(key);
-    if (wandered) render();   // the split's input wrote the value into settings: draw from them again
+    if (wandered) render();   // the thumb came back to the saved value: draw from the settings again
   };
   window.addEventListener("pointerup", release);
   window.addEventListener("pointercancel", release);
@@ -1944,21 +1763,6 @@ bindSlider($("#mem"), (el) => {
   rangeFill(el);
   setText("#mem-out", memLabel(Number(el.value), trainingAutoGb()));
 }, (memory_gb) => saveSettings({ memory_gb }));
-
-bindSlider($("#split"), (el) => {
-  state.settings = { ...state.settings, grant_split: Number(el.value) };
-  renderContributions();
-  renderGrantsLive();
-}, async (grant_split) => {
-  await saveSettings({ grant_split });
-  if (!signedIn()) return;
-  try {
-    const r = await patch("/api/coord/auth/me", { grant_split });
-    if (r && r.user) state.user = r.user;
-  } catch (err) {
-    toast(err.message, "bad");
-  }
-});
 
 $("#url").addEventListener("input", () => { state.dirty.url = true; });
 $("#url").addEventListener("keydown", (e) => {
@@ -2016,21 +1820,6 @@ $("#job-form").addEventListener("submit", (e) => {
     } finally {
       delete msg.dataset.sticky;
     }
-  });
-});
-
-$("#grant-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  return withBusy("grant-request", e.target.querySelector("[type=submit]"), "Sending…", async () => {
-    const res = await grantAction("/api/grants", {
-      title: $("#g-title").value,
-      summary: $("#g-summary").value,
-      goal: Number($("#g-goal").value) * T,
-    }, "Request sent. It goes public once an admin approves it.");
-    if (res !== true) return setMsg("#g-msg", res, "bad");
-    $("#g-title").value = "";
-    $("#g-summary").value = "";
-    $("#g-request").hidden = true;
   });
 });
 

@@ -93,7 +93,7 @@ async def test_signed_in_chatter_pays_hosts_in_flops(pool, authentication):
     assert flops > 0
     assert credits.lifetime_earned(host.id) == pytest.approx(flops)       # both nodes belong to the host
     assert credits.balance(chatter.id) == pytest.approx(1e16 - flops)       # reservation consumed, rest refunded
-    assert credits.balance(host.id) == pytest.approx(flops * (1 - host.grant_split / 100))
+    assert credits.balance(host.id) == pytest.approx(flops)                  # all of it is the host's
 
 
 async def test_anonymous_chat_is_free_and_earns_nobody(pool):

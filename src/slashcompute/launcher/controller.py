@@ -114,7 +114,6 @@ class LauncherSettings:
     finish: str = "carbon"
     session_token: str = ""
     session_url: str = ""              # the pool that issued session_token: it is never sent to another
-    grant_split: int = 0
     training: bool = True              # lend this Mac to MLX fine-tunes
     memory_gb: int = 0                 # GiB lent to fine-tunes; 0 = automatic (what is free at start)
     inference: bool = False            # also host llama.cpp layers for the pool's LLMs
@@ -132,10 +131,6 @@ class LauncherSettings:
         except (TypeError, ValueError, OverflowError):
             gpu = 50
         try:
-            split = max(0, min(100, int(self.grant_split)))
-        except (TypeError, ValueError, OverflowError):
-            split = 0
-        try:
             mem = max(0, min(1024, int(self.inference_memory_gb)))
         except (TypeError, ValueError, OverflowError):
             mem = 0
@@ -147,7 +142,6 @@ class LauncherSettings:
             mode=mode, url=str(self.url or ""), gpu_percent=gpu,
             contribute=bool(self.contribute), finish=finish,
             session_token=str(self.session_token or ""), session_url=str(self.session_url or ""),
-            grant_split=split,
             training=bool(self.training), memory_gb=train_mem, inference=bool(self.inference),
             inference_memory_gb=mem,
             inference_head=bool(self.inference_head), models_dir=str(self.models_dir or "~/models"),
@@ -438,7 +432,6 @@ class Launcher:
             finish=raw.get("finish", "carbon"),
             session_token=raw.get("session_token", ""),
             session_url=raw.get("session_url", ""),
-            grant_split=raw.get("grant_split", 0),
             training=raw.get("training", True),
             memory_gb=raw.get("memory_gb", 0),
             inference=raw.get("inference", False),

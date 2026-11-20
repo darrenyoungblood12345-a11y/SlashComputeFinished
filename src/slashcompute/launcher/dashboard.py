@@ -55,30 +55,6 @@ def recent_jobs(jobs: list, limit: int = JOBS_SHOWN) -> list:
     return sorted(live + finished[:max(0, limit - len(live))], key=_submitted, reverse=True)
 
 
-def format_flops(flops: float) -> str:
-    """``1.24e12`` -> ``"1.24 T"``."""
-    v, unit = float(flops or 0.0), ""
-    for u in ("K", "M", "G", "T", "P", "E"):
-        if abs(v) < 1000:
-            break
-        v, unit = v / 1000, u
-    if v == 0:
-        text = "0"
-    elif abs(v) >= 100:
-        text = f"{v:.0f}"
-    elif abs(v) >= 10:
-        text = f"{v:.1f}"
-    else:
-        text = f"{v:.2f}"
-    return f"{text} {unit}".rstrip()
-
-
-def with_unit(flops: float, unit: str = "FLOPs") -> str:
-    """``1.24e12`` -> ``"1.24 TFLOPs"``, ``512`` -> ``"512 FLOPs"``."""
-    s = format_flops(flops)
-    return f"{s}{unit}" if s[-1].isalpha() else f"{s} {unit}"
-
-
 def node_flops(ledger: list, node_id: Optional[str]) -> float:
     """FLOPs a node has been credited with: all metered work minus disputed work."""
     if not node_id:
@@ -87,12 +63,6 @@ def node_flops(ledger: list, node_id: Optional[str]) -> float:
         float(r.get("flops") or 0.0) - float(r.get("disputed_flops") or 0.0)
         for r in ledger if r.get("node_id") == node_id
     )
-
-
-def split_credits(flops: float, grant_percent: int) -> dict:
-    earned = max(0.0, float(flops))
-    to_grants = earned * max(0, min(100, int(grant_percent))) / 100.0
-    return {"earned": earned, "kept": earned - to_grants, "to_grants": to_grants}
 
 
 def _node_name(nodes: list, node_id: str) -> str:
@@ -138,7 +108,7 @@ def job_card(job: dict) -> dict:
             "can_cancel": job.get("status") not in JOB_TERMINAL}
 
 
-def overview(status: dict, pool: PoolData, my_id: Optional[str], grant_percent: int) -> dict:
+def overview(status: dict, pool: PoolData, my_id: Optional[str]) -> dict:
     """Everything the dashboard renders, in one payload."""
     board = leaderboard(pool.ledger, pool.nodes, my_id)
     me_row = next((r for r in board if r["is_me"]), None)
@@ -158,7 +128,6 @@ def overview(status: dict, pool: PoolData, my_id: Optional[str], grant_percent: 
             "node_id": my_id,
             "node": next((n for n in pool.nodes if my_id and n.get("node_id") == my_id), None),
             "flops": my_flops,
-            "credits": split_credits(my_flops, grant_percent),
             # A rank only means something once this Mac has done some work.
             "rank": me_row["rank"] if me_row and my_flops > 0 else None,
             "of": len(board),

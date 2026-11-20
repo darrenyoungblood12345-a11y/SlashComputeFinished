@@ -124,6 +124,8 @@ class User(SQLModel, table=True):
     admin: bool = False
     banned: bool = False
     flagged: bool = False
+    # Unused: earnings are no longer split with a community pot. The column stays because
+    # databases from before that have it as NOT NULL.
     grant_split: int = 0
     google_sub: Optional[str] = Field(default=None, index=True)
     bio: Optional[str] = None
@@ -146,7 +148,6 @@ class CreditTxn(SQLModel, table=True):
     kind: str
     amount: float
     job_id: Optional[str] = Field(default=None, index=True)
-    grant_id: Optional[str] = None
     node_id: Optional[str] = None
     note: Optional[str] = None
     created_at: float = Field(default_factory=now)
@@ -184,30 +185,6 @@ class EarningHold(SQLModel, table=True):
     status: str = Field(default="held", index=True)  # held | released | forfeited
     created_at: float = Field(default_factory=now)
     resolved_at: Optional[float] = None
-
-
-class Grant(SQLModel, table=True):
-    __tablename__ = "grants"
-    id: str = Field(primary_key=True)
-    author_id: str = Field(index=True)
-    title: str
-    body: str
-    goal_flops: float
-    received_flops: float = 0.0
-    status: str = "pending"
-    created_at: float = Field(default_factory=now)
-    reviewed_at: Optional[float] = None
-    reviewed_by: Optional[str] = None
-    review_note: Optional[str] = None
-
-
-class GrantComment(SQLModel, table=True):
-    __tablename__ = "grant_comments"
-    id: Optional[int] = Field(default=None, primary_key=True)
-    grant_id: str = Field(index=True)
-    user_id: str
-    body: str
-    created_at: float = Field(default_factory=now)
 
 
 class UserFlag(SQLModel, table=True):
@@ -258,23 +235,10 @@ class Database:
             if "billed_flops" not in usage_cols:
                 conn.exec_driver_sql(
                     "ALTER TABLE usage_records ADD COLUMN billed_flops FLOAT NOT NULL DEFAULT 0")
-            grant_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(grants)").fetchall()}
-            if grant_cols:
-                if "reviewed_at" not in grant_cols:
-                    conn.exec_driver_sql("ALTER TABLE grants ADD COLUMN reviewed_at FLOAT")
-                if "reviewed_by" not in grant_cols:
-                    conn.exec_driver_sql("ALTER TABLE grants ADD COLUMN reviewed_by VARCHAR")
-                if "review_note" not in grant_cols:
-                    conn.exec_driver_sql("ALTER TABLE grants ADD COLUMN review_note VARCHAR")
             # At most one welcome credit per user, even under concurrent sign-ins.
             conn.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_txns_welcome "
                 "ON credit_txns (user_id) WHERE kind = 'welcome'"
-            )
-            # Each grant card counts its donors: without this, one scan of every credit row per card.
-            conn.exec_driver_sql(
-                "CREATE INDEX IF NOT EXISTS ix_credit_txns_grant "
-                "ON credit_txns (grant_id) WHERE grant_id IS NOT NULL"
             )
             conn.commit()
 

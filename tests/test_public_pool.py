@@ -62,7 +62,7 @@ def test_public_anon_submit_rejected(env):
 def test_public_upload_clamps_to_one_stage(env):
     client, core, tiny_model, tiny_dataset = env
     token = _account(client)
-    core.credits.contribute(core.auth.session_user(token).id, 1e12, 0)
+    core.credits.contribute(core.auth.session_user(token).id, 1e12)
     r = client.post(
         "/jobs/upload",
         headers=_hdr(token),
@@ -156,7 +156,7 @@ def test_public_account_switch_while_offline_rebinds_node(env):
     first_id, second_id = core.auth.session_user(first).id, core.auth.session_user(second).id
     with client.websocket_connect("/ws/agent") as ws:
         assert isinstance(_register(ws, "same-mac", first), P.Welcome)
-    core.credits.contribute(first_id, 100.0, 0, node_id="same-mac")
+    core.credits.contribute(first_id, 100.0, node_id="same-mac")
     earned = core.credits.summary(first_id)["balance"]
     # Signed out, signed in as someone else: the persistent node id comes back under the new account.
     with client.websocket_connect("/ws/agent") as ws:
@@ -284,7 +284,7 @@ def victim_job(env, request):
     client, core, tiny_model, tiny_dataset = env
     max_flops = getattr(request, "param", 1e15)
     victim, attacker, host = (_account(client, f"{n}@lan.test") for n in ("victim", "attacker", "host"))
-    core.credits.contribute(core.auth.session_user(victim).id, 1e15, 0)
+    core.credits.contribute(core.auth.session_user(victim).id, 1e15)
     honest = _node(client, "honest", host)
     _pass_canary(honest)
     r = client.post(

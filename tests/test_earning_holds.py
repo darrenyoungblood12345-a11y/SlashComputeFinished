@@ -64,7 +64,7 @@ class Pool:
         self.requester, _ = _member(core, "requester")
         self.host, self.host_token = _member(core, "host")
         self.other, self.other_token = _member(core, "other")
-        core.credits.contribute(self.requester.id, BUDGET, 0)
+        core.credits.contribute(self.requester.id, BUDGET)
         self.job = core.submit(LoraFinetuneSpec(
             model=str(tiny_model), dataset_path=str(tiny_dataset), steps=20, batch_size=2,
             microbatches=1, lora_rank=4, min_stages=1))

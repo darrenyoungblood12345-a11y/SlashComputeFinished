@@ -30,7 +30,6 @@ from slashcompute.common.protocol import (
 from slashcompute.common.reliable import is_sequenced
 from slashcompute.community.auth import Auth
 from slashcompute.community.credits import Credits
-from slashcompute.community.grants import Grants
 from slashcompute.coordinator.checkpoints import CheckpointStore
 from slashcompute.coordinator.db import Checkpoint, Database, Job, Node, now
 from slashcompute.coordinator.ledger import Ledger
@@ -81,7 +80,6 @@ class Coordinator:
         self.ledger = Ledger(self.db)
         self.auth = Auth(self.db)
         self.credits = Credits(self.db)
-        self.grants = Grants(self.db, self.credits)
         self.checkpoints = CheckpointStore(cfg.coordinator_dir / "jobs")
         self.scheduler = Scheduler(self)
         self.recovery = Recovery(self)
