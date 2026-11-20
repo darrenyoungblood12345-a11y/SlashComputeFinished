@@ -3,7 +3,7 @@
 Accounts are Google accounts. There is no email-and-password sign-up: typing an address into a
 form proves nothing about who owns it.
 
-Google is the directory. Each pool keeps its own account table (credits, grants and nodes are per
+Google is the directory. Each pool keeps its own account table (credits and nodes are per
 pool), keyed by Google's stable id for the person (`sub`). The same Google account signs in on any
 pool; nothing is shared between pools.
 
@@ -67,7 +67,7 @@ Upgrading a pool that had email-and-password accounts:
 - Every session opened with a password ends at the first start, and the stored passwords are
   blanked. Agents and LLM nodes still running on such a session keep computing on a LAN pool but
   stop earning for an account until their Mac signs in again.
-- The accounts themselves stay, with their credits, grants and nodes. An account is taken over by
+- The accounts themselves stay, with their credits and nodes. An account is taken over by
   the first Google sign-in whose verified email matches it.
 - An account whose email no Google account holds can no longer be signed in to.
 
